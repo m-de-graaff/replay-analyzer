@@ -6,7 +6,7 @@
 //! ```text
 //! "dissect" 00                 magic
 //! u32 format                   7 up to Y8S3, 8 from Y8S4 (chunked zstd layout)
-//! string "UNKNOWN"             u8 length, 7 zero bytes, text
+//! string "UNKNOWN"             u64 length, then the text
 //! u32 0
 //! u32 last frame               number of frames in the time index, minus one
 //! u32 property count           header key/value pairs that follow
@@ -23,8 +23,22 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::cursor::Cursor;
+use crate::error::{Error, Result};
 
 pub const MAGIC: &[u8] = b"dissect";
+
+/// A string in the prelude or header: u64 length, then the bytes. Every
+/// length seen so far is under 256, so the upper seven bytes of the length
+/// look like a run of zeros.
+pub(crate) fn read_string(c: &mut Cursor) -> Result<String> {
+    let at = c.pos();
+    let len = u64::from_le_bytes(c.array()?);
+    let bytes = usize::try_from(len)
+        .ok()
+        .and_then(|len| c.bytes(len).ok())
+        .ok_or(Error::InvalidStringLength(at))?;
+    Ok(String::from_utf8_lossy(bytes).into_owned())
+}
 
 /// What the bytes before the header properties say.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -63,11 +77,7 @@ pub fn read_prelude(c: &mut Cursor) -> Option<FormatInfo> {
         return None;
     }
     let format_version = u32::from_le_bytes(t.array().ok()?);
-    let len = t.u8().ok()? as usize;
-    if t.array::<7>().ok()? != [0; 7] {
-        return None;
-    }
-    let label = String::from_utf8_lossy(t.bytes(len).ok()?).into_owned();
+    let label = read_string(&mut t).ok()?;
     let [zero, last_frame, property_count, zero2] =
         [(); 4].map(|_| t.array().map(u32::from_le_bytes).unwrap_or(u32::MAX));
     if zero != 0 || zero2 != 0 || property_count == 0 || property_count > 10_000 {
@@ -295,6 +305,34 @@ impl Timing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header string as written: u64 length, then the bytes.
+    fn string(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend((s.len() as u64).to_le_bytes());
+        out.extend(s);
+    }
+
+    #[test]
+    fn reads_strings_longer_than_255_bytes() {
+        let mut data = Vec::new();
+        string(&mut data, b"additionaltags");
+        string(&mut data, &[b'x'; 300]);
+        let mut c = Cursor::new(&data, 0);
+        assert_eq!(read_string(&mut c).unwrap(), "additionaltags");
+        assert_eq!(read_string(&mut c).unwrap().len(), 300);
+        assert_eq!(c.pos(), data.len());
+    }
+
+    #[test]
+    fn rejects_a_string_length_past_the_end_of_the_data() {
+        let mut data = u64::MAX.to_le_bytes().to_vec();
+        data.extend(b"short");
+        let mut c = Cursor::new(&data, 0);
+        assert!(matches!(
+            read_string(&mut c),
+            Err(Error::InvalidStringLength(0))
+        ));
+    }
 
     #[test]
     fn parses_game_versions() {

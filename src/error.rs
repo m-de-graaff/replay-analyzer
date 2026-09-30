@@ -9,8 +9,8 @@ pub enum Error {
     InvalidFolder,
     #[error("{0} is an in-progress recording (.tmprec), not a finished replay")]
     TemporaryFile(String),
-    #[error("invalid header string separator at offset {0}")]
-    InvalidStringSeparator(usize),
+    #[error("header string at offset {0} runs past the end of the data")]
+    InvalidStringLength(usize),
     #[error("unexpected end of replay data")]
     UnexpectedEof,
     #[error("header is missing required property `{0}`")]

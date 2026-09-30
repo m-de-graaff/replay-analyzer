@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use crate::cursor::Cursor;
 pub use crate::entities::Relation;
 use crate::error::{Error, Result};
-use crate::format::{self, FormatInfo};
+use crate::format::{self, FormatInfo, read_string};
 use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, version};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -312,8 +312,6 @@ fn rfc3339<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
     s.collect_str(&t.format("%Y-%m-%dT%H:%M:%SZ"))
 }
 
-const STRING_SEPARATOR: [u8; 7] = [0; 7];
-
 /// Parses the header at the start of `data` (which begins with `dissect`).
 /// Returns the header, the prelude, and the offset just past the header.
 pub fn parse(data: &[u8]) -> Result<(Header, FormatInfo, usize)> {
@@ -348,14 +346,6 @@ fn skip_version_block(c: &mut Cursor) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn read_string(c: &mut Cursor) -> Result<String> {
-    let len = c.u8()? as usize;
-    if c.array::<7>()? != STRING_SEPARATOR {
-        return Err(Error::InvalidStringSeparator(c.pos() - 7));
-    }
-    Ok(String::from_utf8_lossy(c.bytes(len)?).into_owned())
 }
 
 fn parse_num<T: FromStr>(key: &str, value: &str) -> Result<T> {

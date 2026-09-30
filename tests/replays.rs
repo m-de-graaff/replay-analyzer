@@ -771,6 +771,106 @@ fn game_named_folders_and_files_agree_with_their_headers() {
     }
 }
 
+/// A game install as the game lays it out: `MatchReplay/Match-.../` round
+/// files, a `DissectTmp` folder next to it, and leftovers in both.
+#[test]
+fn a_library_scan_finds_sessions_copies_and_leftovers() {
+    use replay_analyzer::library::{self, DuplicateKind};
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.join("custom_2.rec").is_file() {
+        return;
+    }
+    let game = std::env::temp_dir().join(format!("ra-library-{}", std::process::id()));
+    let root = game.join("MatchReplay");
+    let a = "Match-2026-09-12_22-00-00-4242";
+    let b = "Match-2026-09-12_23-00-00-4242";
+    for f in [a, b] {
+        std::fs::create_dir_all(root.join(f)).unwrap();
+    }
+    std::fs::create_dir_all(game.join("DissectTmp")).unwrap();
+    std::fs::copy(
+        src.join("custom_1.rec"),
+        root.join(a).join(format!("{a}-R01.rec")),
+    )
+    .unwrap();
+    std::fs::copy(
+        src.join("custom_2.rec"),
+        root.join(a).join(format!("{a}-R02.rec")),
+    )
+    .unwrap();
+    // The same round again in another folder, once byte for byte and once
+    // with its last byte changed (like another player's recording of it).
+    std::fs::copy(
+        src.join("custom_1.rec"),
+        root.join(b).join(format!("{b}-R01.rec")),
+    )
+    .unwrap();
+    let mut other = std::fs::read(src.join("custom_2.rec")).unwrap();
+    *other.last_mut().unwrap() ^= 0xFF;
+    std::fs::write(root.join(b).join(format!("{b}-R02.rec")), other).unwrap();
+    let leftover = "P4242_600_Y2026_M9_D12_H23_M30_FrameDataStream.tmprec";
+    std::fs::write(game.join("DissectTmp").join(leftover), b"x").unwrap();
+    std::fs::write(
+        game.join("P4242_601_Y2026_M9_D12_H23_M30_StaticData.tmprec"),
+        b"",
+    )
+    .unwrap();
+
+    let lib = library::scan(&root, ReadMode::Header);
+    std::fs::remove_dir_all(&game).unwrap();
+    let lib = lib.unwrap();
+
+    assert_eq!(lib.folders.len(), 2);
+    assert!(lib.folders.iter().all(|f| f.error.is_none()));
+    let kinds: Vec<_> = lib.duplicates.iter().map(|d| d.kind).collect();
+    assert_eq!(kinds, [DuplicateKind::SameFile, DuplicateKind::SameRound]);
+    assert!(lib.duplicates.iter().all(|d| d.files.len() == 2));
+    let temps: Vec<_> = lib
+        .temporary
+        .iter()
+        .map(|t| (t.process_id, t.stream_id))
+        .collect();
+    // Sorted by path: DissectTmp's leftover, then the game folder's.
+    assert_eq!(temps, [(Some(4242), Some(600)), (Some(4242), Some(601))]);
+    assert_eq!(lib.temporary[0].size, Some(1));
+    // Both folders come from process 4242. The copies in the second folder
+    // reuse the first folder's ids, so the ids start over: two sessions.
+    assert_eq!(lib.sessions.len(), 2);
+    assert!(lib.sessions.iter().all(|s| s.process_id == 4242));
+    assert_eq!(lib.sessions[0].folders, [a]);
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("temporary")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_real_library_accounts_for_every_round() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let lib = replay_analyzer::library::scan(&root, ReadMode::Header).unwrap();
+    assert!(lib.folders.iter().all(|f| f.error.is_none()));
+    let named: Vec<_> = lib
+        .folders
+        .iter()
+        .filter(|f| f.folder.name.is_some())
+        .collect();
+    let in_sessions: usize = lib.sessions.iter().map(|s| s.folders.len()).sum();
+    assert_eq!(in_sessions, named.len());
+    let rounds: usize = named.iter().map(|f| f.round_list.len()).sum();
+    assert_eq!(lib.sessions.iter().map(|s| s.rounds).sum::<usize>(), rounds);
+    // The game never writes a round twice.
+    assert!(lib.duplicates.is_empty(), "{:?}", lib.duplicates);
+    // Leftover temporary recordings, if any, are named as players reported.
+    for t in &lib.temporary {
+        assert!(t.process_id.is_some() && t.kind.is_some(), "{t:?}");
+    }
+}
+
 #[test]
 fn temporary_recordings_are_refused() {
     let dir = std::env::temp_dir().join(format!("ra-tmprec-{}", std::process::id()));

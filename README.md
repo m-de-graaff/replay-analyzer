@@ -9,6 +9,7 @@ replay-analyzer R01.rec --info          # short header summary
 replay-analyzer R01.rec --partial       # header and players only (faster)
 replay-analyzer R01.rec --census        # also count every packet and field seen
 replay-analyzer MatchReplay/ --list     # every match folder: rounds, gaps, versions, hashes
+replay-analyzer MatchReplay/ --players  # every player across matches: name history, you, queue-mates
 replay-analyzer R01.rec --dump -o raw.bin  # decompressed stream, for format research
 ```
 
@@ -112,7 +113,40 @@ Limits worth knowing:
 
 Y11S3 attacker swaps are linked through the player's state object, because the caster UI id older seasons use is shared by a whole team there.
 
-Y11S3 scoreboard packets still arrive but no longer carry ids that match players, so `scoreboard` reports `missing` there.
+Y11S3 scoreboard packets no longer carry ids that match players; they are linked through each player's scoreboard object instead (see [Players and identity](#players-and-identity)).
+
+## Players and identity
+
+Every player in `players[]` carries:
+
+| Key | What it holds | Versions | How |
+|---|---|---|---|
+| `profileID` | Ubisoft profile id: the stable key for ranks and stats. Can be missing, in older replays. | Y8S1+ | Decoded |
+| `key` | `profileID`, or `name:<username>` without one. Use it to recognise a player across matches; usernames change. | all | Derived |
+| `relation` | `you`, `teammate` or `opponent`, relative to whoever recorded. Absent for spectator recordings. | all | Decoded (Y8S1+), else from the header's recording ids |
+| `party` | `leader` or `member` of the recording player's party. Only the recorder's own party is in the file; custom games put the whole lobby in one party, so no roles are given there. | Y8S1+ | Decoded |
+| `entities` | Hex ids of the objects that carry the player in the packet stream: `controller` (name, operator, team, weapon-ready flag; pick and swap packets write to it), `scoreboard`, `health`, and `movement`, the body the movement stream moves. | Y8S1+ (`movement` Y11S3+) | Decoded |
+| `spawnPosition` | Where the player's body was created, in map coordinates. | Y11S3+ | Decoded |
+
+Kill feed entries name their players' `profileID` and `targetProfileID`. From Y11S3 a kill can also carry `creditedTo`: the scoreboard credits a kill to the teammate who downed the victim when another player finished them, while the feed names the finisher. With those credits counted, the scoreboard's kill and death totals match the kill feed in every test round.
+
+`weaponReady` lists each change of the controller's weapon-ready flag (`ready`, `phase`, `elapsed`). Attackers hold it at `false` through prep, on their drones, until their body spawns; in action it drops for about a second at a time, as on reloads and weapon swaps. The meaning is inferred from that behaviour (`decodeStatus.weaponReady`).
+
+`decodeStatus` adds `profileIds`, `recorder`, `entities`, `movement`, `party` and `weaponReady`. `summary.teams[].players[]` gains `key`, `relation` and `party`, and `summary.recording.party` lists who queued with the recorder.
+
+`--players` reads every match folder under a folder (partially: players, relations and parties) and prints a directory: per player the `key`, every username used with first and last seen, matches with and against you, matches in your party, and `queueMate` (queued with you once, or on your team in two or more matches). `you` lists the recording accounts. A match imported twice (same `matchID`) counts once. The library equivalent is `PlayerDirectory::new(&summaries)`.
+
+How the links are made (details in `src/entities.rs`):
+
+- The stream is a tree of replicated objects. Besides `23`/`22` property records, `1b <parent> <field> <child>` and `1a <field> <child>` records hang child objects off a parent. Each player has one controller object under their team's object, holding the name, operator, profile id and the header `playerid`; the scoreboard, health, inventory and a profile object hang off it.
+- The profile object carries the relation to the recorder (`05c7b949`: 1 opponent, 2 teammate, 3 teammate in the recorder's party, 5 the recorder) and the party role (`af6bb287`: 0, 1 member, 2 leader). Checked on Y8S1 ranked and quick matches (a clan-tagged five-stack, a duo with randoms), Y8S2 and Y9S1.
+- Movement is sent apart from the tree. A player table (count byte, then per player the header `playerid` and, when it changed, the object the player now controls) links each body to a player explicitly, so the link does not depend on player order. The same table records drone and camera switches.
+
+Not found:
+
+- **Platform.** No field varies with platform in the replays available (all PC). The profile object has constant fields (`96ba4a74` = 3 from Y9S1) that could be one, unconfirmed.
+- **Cosmetics.** The controller's operator asset id (`f93911f2`), the header's `heroname` and `roleimage`, and the weapon item ids are the same for every player on the same operator in the test match, so no personal uniform, headgear, skin or charm id has been identified. Pro matches may force defaults; a ranked Y11S3 replay would settle it.
+- **Other players' parties.** Only the recorder's party is recorded. Premades among other players can only be guessed from match history (`--players`).
 
 ## File format notes
 

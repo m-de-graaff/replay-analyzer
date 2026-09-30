@@ -107,17 +107,31 @@ fn expected(path: &Path) -> Value {
 }
 
 /// Fields the expectation files do not carry.
-const EXTENSIONS: &[&str] = &["weapon"];
+const EXTENSIONS: &[&str] = &[
+    "weapon",
+    "key",
+    "relation",
+    "party",
+    "entities",
+    "spawnPosition",
+    "targetProfileID",
+    "creditedTo",
+];
 
-fn strip_extensions(v: Value) -> Value {
+fn strip_extensions(v: Value, extra: &[&str]) -> Value {
     match v {
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .filter(|(k, _)| !EXTENSIONS.contains(&k.as_str()))
-                .map(|(k, v)| (k, strip_extensions(v)))
+                .filter(|(k, _)| !EXTENSIONS.contains(&k.as_str()) && !extra.contains(&k.as_str()))
+                .map(|(k, v)| (k, strip_extensions(v, extra)))
                 .collect(),
         ),
-        Value::Array(items) => Value::Array(items.into_iter().map(strip_extensions).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| strip_extensions(v, extra))
+                .collect(),
+        ),
         v => v,
     }
 }
@@ -126,7 +140,15 @@ fn check(path: &Path, key: &str, got: Value, want: &Value, failures: &mut Vec<St
     let mut diffs = Vec::new();
     diff(
         key,
-        &normalize(strip_extensions(got)),
+        // Feed entries now name their players' profile ids too.
+        &normalize(strip_extensions(
+            got,
+            if key == "matchFeedback" {
+                &["profileID"]
+            } else {
+                &[]
+            },
+        )),
         &want[key],
         &mut diffs,
     );
@@ -474,13 +496,11 @@ fn decode_status_reports_what_can_be_trusted() {
             Status::Skipped
         );
     }
-    // Y11S3 scoreboard packets no longer match players; that must show.
+    // Y11S3 scoreboard packets are linked through each player's scoreboard
+    // object.
     if let Some(round) = y11s3(&dir, "custom_1.rec") {
-        assert_eq!(
-            round.decode.get("scoreboard").unwrap().status,
-            Status::Missing
-        );
-        assert!(!round.decode.trusted);
+        let f = round.decode.get("scoreboard").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 10));
     }
 }
 
@@ -839,4 +859,155 @@ fn match_analytics_add_up() {
     let wp = s.rounds[0].win_probability.unwrap();
     assert_eq!(wp, [0.5, 0.5]);
     assert!(s.rounds[9].win_probability.unwrap()[1] > 0.9);
+}
+
+/// Every Y11S3 player is linked to their own controller, scoreboard, health
+/// and body objects, and has a stable key.
+#[test]
+fn y11s3_players_link_to_their_objects() {
+    let Some(dir) = data_dir() else { return };
+    for name in ["custom_1.rec", "custom_5.rec"] {
+        let Some(round) = y11s3(&dir, name) else {
+            return;
+        };
+        let players = &round.header.players;
+        assert_eq!(players.len(), 10);
+        let mut seen = std::collections::HashSet::new();
+        for p in players {
+            let e = p
+                .entities
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no entities", p.username));
+            assert_eq!(p.key, p.profile_id, "{}", p.username);
+            for id in [Some(e.controller), e.scoreboard, e.health, e.movement] {
+                let id = id.unwrap_or_else(|| panic!("{}: missing object", p.username));
+                assert!(seen.insert(id), "{}: object {id:08x} shared", p.username);
+            }
+            let pos = p.spawn_position.unwrap();
+            assert!(pos.iter().all(|v| v.abs() < 1000.0), "{pos:?}");
+            // Pick packets write to the controller.
+            assert_eq!(p.state_id, Some(e.controller), "{}", p.username);
+        }
+        // A spectator recorded this match: nobody is `you`.
+        assert!(
+            players
+                .iter()
+                .all(|p| p.relation.is_none() && p.party.is_none())
+        );
+        for f in ["entities", "movement", "profileIds", "recorder"] {
+            let f = round.decode.get(f).unwrap();
+            assert_eq!(f.status, replay_analyzer::Status::Decoded, "{f:?}");
+        }
+    }
+}
+
+/// The Y11S3 scoreboard's match totals agree with the kill feed, once kills
+/// the scoreboard credits to a teammate (who downed the victim) are counted
+/// for that teammate.
+#[test]
+fn y11s3_scoreboard_totals_match_the_kill_feed() {
+    use replay_analyzer::{LifeEventType, Match, MatchUpdateType};
+    let Some(dir) = data_dir() else { return };
+    let folder = dir.join("valid/Y11S3");
+    if !folder.is_dir() {
+        return;
+    }
+    let m = Match::open(&folder).unwrap();
+    let mut kills = std::collections::HashMap::<String, u32>::new();
+    let mut deaths = std::collections::HashMap::<String, u32>::new();
+    let mut credited = 0;
+    for r in &m.rounds {
+        for u in &r.match_feedback {
+            if u.kind != MatchUpdateType::Kill {
+                continue;
+            }
+            assert!(!u.profile_id.is_empty() && !u.target_profile_id.is_empty());
+            let who = if u.credited_to.is_empty() {
+                &u.username
+            } else {
+                credited += 1;
+                // Credit goes to a teammate of the finisher, and the victim
+                // was downed first.
+                let team = |n: &str| {
+                    r.header
+                        .players
+                        .iter()
+                        .find(|p| p.username == n)
+                        .map(|p| p.team_index)
+                };
+                assert_eq!(team(&u.credited_to), team(&u.username));
+                assert!(
+                    r.life_events
+                        .iter()
+                        .any(|e| e.kind == LifeEventType::Down && e.username == u.target)
+                );
+                &u.credited_to
+            };
+            *kills.entry(who.clone()).or_default() += 1;
+            *deaths.entry(u.target.clone()).or_default() += 1;
+        }
+        for p in &r.header.players {
+            let sb = r.scoreboard_for(p);
+            let want = |m: &std::collections::HashMap<String, u32>| {
+                Some(m.get(&p.username).copied().unwrap_or(0))
+            };
+            assert_eq!(
+                sb.kills,
+                want(&kills),
+                "round {} {}",
+                r.header.round_number + 1,
+                p.username
+            );
+            assert_eq!(
+                sb.deaths,
+                want(&deaths),
+                "round {} {}",
+                r.header.round_number + 1,
+                p.username
+            );
+        }
+    }
+    assert!(credited > 0);
+}
+
+/// Relations and parties hold together on every replay that has them.
+#[test]
+fn relations_and_parties_are_consistent() {
+    use replay_analyzer::Relation;
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Partial).unwrap();
+        let players = &round.header.players;
+        let you: Vec<_> = players
+            .iter()
+            .filter(|p| p.relation == Some(Relation::You))
+            .collect();
+        if round.header.is_spectator == Some(true) {
+            assert!(you.is_empty(), "{}", path.display());
+            continue;
+        }
+        let Some(you) = you.first() else { continue };
+        assert_eq!(
+            players
+                .iter()
+                .filter(|p| p.relation == Some(Relation::You))
+                .count(),
+            1
+        );
+        for p in players {
+            let same_team = p.team_index == you.team_index;
+            match p.relation {
+                Some(Relation::Teammate) => assert!(same_team, "{}", path.display()),
+                Some(Relation::Opponent) => assert!(!same_team, "{}", path.display()),
+                _ => {}
+            }
+            if p.party.is_some() {
+                assert!(
+                    same_team,
+                    "{}: party member on the other team",
+                    path.display()
+                );
+            }
+        }
+    }
 }

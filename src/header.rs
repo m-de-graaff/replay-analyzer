@@ -7,6 +7,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Serialize, Serializer};
 
 use crate::cursor::Cursor;
+pub use crate::entities::Relation;
 use crate::error::{Error, Result};
 use crate::format::{self, FormatInfo};
 use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, version};
@@ -174,13 +175,120 @@ pub struct Player {
     /// attacker swaps are written to it.
     #[serde(skip)]
     pub state_id: Option<u32>,
+    /// Stable key across matches: the profile id, or `name:<username>` when
+    /// the replay has none (usernames can change, so prefer the profile id).
+    pub key: String,
+    /// How the player relates to whoever recorded: `you`, `teammate` or
+    /// `opponent`. Absent for spectator recordings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<Relation>,
+    /// The player queued with the recorder: `leader` or `member` of their
+    /// party (Y8S1+, not in custom games).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<PartyRole>,
+    /// Ids of the objects that carry this player in the packet stream
+    /// (Y8S1+ full and partial reads).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<PlayerEntities>,
+    /// Where the player's body was created, in map coordinates (Y11S3+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_position: Option<[f32; 3]>,
+}
+
+/// A player's role in the recorder's party.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PartyRole {
+    Leader,
+    Member,
+}
+
+/// Object ids (hex) that link packets to a player.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerEntities {
+    /// Holds the name, operator, team and per-player state such as the
+    /// weapon-ready flag; pick and swap packets write to it.
+    #[serde(serialize_with = "hex_id")]
+    pub controller: u32,
+    /// Receives the player's scoreboard updates.
+    #[serde(serialize_with = "hex_id_opt", skip_serializing_if = "Option::is_none")]
+    pub scoreboard: Option<u32>,
+    /// Receives health and down/dead state.
+    #[serde(serialize_with = "hex_id_opt", skip_serializing_if = "Option::is_none")]
+    pub health: Option<u32>,
+    /// The operator's body the movement stream moves, linked through the
+    /// replay's player table rather than by player order (Y11S3+). The last
+    /// one when the player got a new body during the round.
+    #[serde(serialize_with = "hex_id_opt", skip_serializing_if = "Option::is_none")]
+    pub movement: Option<u32>,
+}
+
+fn hex_id<S: Serializer>(v: &u32, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(&format_args!("{v:08x}"))
+}
+
+fn hex_id_opt<S: Serializer>(v: &Option<u32>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => hex_id(v, s),
+        None => s.serialize_none(),
+    }
+}
+
+impl Player {
+    /// The profile id, or `name:<username>` without one.
+    pub fn stable_key(&self) -> String {
+        if self.profile_id.is_empty() {
+            format!("name:{}", self.username)
+        } else {
+            self.profile_id.clone()
+        }
+    }
 }
 
 impl Header {
+    /// The player who recorded: by the header's `recordingplayerid`, or by
+    /// `recordingprofileid` when the ids do not match.
     pub fn recording_player(&self) -> Option<&Player> {
         self.players
             .iter()
-            .find(|p| p.id == self.recording_player_id)
+            .find(|p| p.id != 0 && p.id == self.recording_player_id)
+            .or_else(|| {
+                let profile = &self.recording_profile_id;
+                (!profile.is_empty())
+                    .then(|| self.players.iter().find(|p| p.profile_id == *profile))
+                    .flatten()
+            })
+            .or_else(|| {
+                self.players
+                    .iter()
+                    .find(|p| p.relation == Some(Relation::You))
+            })
+    }
+
+    /// Fills each player's `key` and `relation`. A relation already set to
+    /// `you` (decoded from the stream) wins over the header's recording ids.
+    pub fn assign_relations(&mut self) {
+        for p in &mut self.players {
+            p.key = p.stable_key();
+        }
+        let spectator = self.is_spectator == Some(true);
+        let recorder = self
+            .recording_player()
+            .map(|p| (p.id, p.username.clone(), p.team_index));
+        for p in &mut self.players {
+            p.relation = match &recorder {
+                _ if spectator => None,
+                Some((id, name, team)) => Some(if p.id == *id && p.username == *name {
+                    Relation::You
+                } else if p.team_index == *team {
+                    Relation::Teammate
+                } else {
+                    Relation::Opponent
+                }),
+                None => None,
+            };
+        }
     }
 }
 
@@ -350,7 +458,7 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
         teams[team ^ 1].role = Some(role.opposite());
     }
 
-    Ok(Header {
+    let mut header = Header {
         game_version: get("version").unwrap_or_default().to_owned(),
         code_version,
         timestamp,
@@ -379,5 +487,7 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
         match_result: get("matchresult").and_then(|v| v.parse().ok()),
         end_time: millis(get("endtime")),
         keys,
-    })
+    };
+    header.assign_relations();
+    Ok(header)
 }

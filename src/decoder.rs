@@ -52,37 +52,37 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y8S1",
         min_build: version::Y8S1,
-        revision: 2,
+        revision: 3,
         changes: "numeric clock; bans, loadouts, health, observation decodable",
     },
     Profile {
         name: "Y8S2",
         min_build: version::Y8S2,
-        revision: 2,
+        revision: 3,
         changes: "players matched by packet id",
     },
     Profile {
         name: "Y9S1",
         min_build: version::Y9S1,
-        revision: 2,
+        revision: 3,
         changes: "new feedback layout, text messages not decoded",
     },
     Profile {
         name: "Y9S1.3",
         min_build: version::Y9S1_UPDATE3,
-        revision: 2,
+        revision: 3,
         changes: "feedback header grew",
     },
     Profile {
         name: "Y9S3",
         min_build: version::Y9S3,
-        revision: 2,
+        revision: 3,
         changes: "caster UI ids link attacker swaps",
     },
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 3,
+        revision: 4,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

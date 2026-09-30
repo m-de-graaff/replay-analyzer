@@ -58,6 +58,16 @@ pub struct MatchUpdate {
     pub username: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub target: String,
+    /// Profile id of `username`, when the replay has one.
+    #[serde(rename = "profileID", skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
+    /// Profile id of `target`.
+    #[serde(rename = "targetProfileID", skip_serializing_if = "String::is_empty")]
+    pub target_profile_id: String,
+    /// Y11S3+: the player the scoreboard credits with this kill, when not
+    /// `username` (a teammate downed the victim, `username` finished them).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub credited_to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headshot: Option<bool>,
     /// Round clock as displayed in game, e.g. `2:41`.
@@ -101,6 +111,9 @@ impl MatchUpdate {
             kind,
             username: String::new(),
             target: String::new(),
+            profile_id: String::new(),
+            target_profile_id: String::new(),
+            credited_to: String::new(),
             headshot: None,
             time: clock.display.clone(),
             time_in_seconds: clock.seconds,

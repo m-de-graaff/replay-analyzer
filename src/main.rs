@@ -37,6 +37,10 @@ struct Cli {
     /// missing rounds, skipped files, versions and file hashes.
     #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census"])]
     list: bool,
+    /// Every player across the match folders under a folder: stable key,
+    /// name history, matches with and against you, and likely queue-mates.
+    #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list"])]
+    players: bool,
     /// Log debug information to stderr.
     #[arg(short, long)]
     debug: bool,
@@ -69,7 +73,11 @@ fn main() -> Result<()> {
         census: cli.census,
     };
 
-    if cli.list {
+    if cli.players {
+        let dir = cli.input.as_ref().filter(|_| is_dir);
+        let dir = dir.context("--players needs a folder")?;
+        write_json(&mut out, &players(dir)?, cli.pretty)?;
+    } else if cli.list {
         let dir = cli.input.as_ref().filter(|_| is_dir);
         let dir = dir.context("--list needs a folder")?;
         write_json(&mut out, &list(dir)?, cli.pretty)?;
@@ -298,6 +306,22 @@ struct ListedFolder<'a> {
     #[serde(flatten)]
     folder: &'a FolderReport,
     round_list: Vec<ListedRound<'a>>,
+}
+
+/// The player directory for every match folder under `root`. Rounds are read
+/// partially: enough for players, relations and parties.
+fn players(root: &std::path::Path) -> Result<replay_analyzer::PlayerDirectory> {
+    let mut summaries = Vec::new();
+    for dir in find_match_folders(root)? {
+        match Match::open_with(&dir, ReadMode::Partial) {
+            Ok(m) => summaries.extend(m.summary()),
+            Err(e) => tracing::warn!(path = %dir.display(), error = %e, "skipping match folder"),
+        }
+    }
+    if summaries.is_empty() {
+        bail!("no folder with .rec files under {}", root.display());
+    }
+    Ok(replay_analyzer::PlayerDirectory::new(&summaries))
 }
 
 /// Header-only summaries of every match folder under `root`.

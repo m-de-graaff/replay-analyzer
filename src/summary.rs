@@ -8,6 +8,8 @@ use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 
 use crate::details::Ban;
+use crate::entities::Relation;
+use crate::header::{PartyRole, Player};
 use crate::outcome::{ReasonSource, scores};
 use crate::round::Round;
 use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition};
@@ -222,6 +224,8 @@ pub struct TeamSummary {
 #[serde(rename_all = "camelCase")]
 pub struct PlayerSummary {
     pub username: String,
+    /// Stable across matches: the profile id, else `name:<username>`.
+    pub key: String,
     /// Ubisoft profile id: the key for ranks and other stats from Ubisoft's
     /// services, which replays do not record.
     #[serde(rename = "profileID", skip_serializing_if = "String::is_empty")]
@@ -229,6 +233,13 @@ pub struct PlayerSummary {
     /// Y11S3+, most likely the clearance level (full and partial reads).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
+    /// `you`, `teammate` or `opponent`; absent for spectator recordings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<Relation>,
+    /// `leader` or `member` of the recording player's party (full and
+    /// partial reads, Y8S1+, not in custom games).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party: Option<PartyRole>,
 }
 
 /// The operators one player played in a round, in order. More than one when
@@ -251,6 +262,10 @@ pub struct Recording {
     /// Y11S3+ `isspectator`; before that, inferred from the recording player
     /// being absent from the player list.
     pub spectator: bool,
+    /// The other players who queued with the recording player (full and
+    /// partial reads, Y8S1+).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub party: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -359,13 +374,22 @@ impl MatchSummary {
                 .players
                 .iter()
                 .filter(|p| p.team_index == t)
-                .map(|p| PlayerSummary {
-                    username: p.username.clone(),
-                    profile_id: p.profile_id.clone(),
-                    level: rounds.iter().find_map(|r| {
-                        let q = r.header.players.iter().find(|q| q.id == p.id)?;
-                        q.level
-                    }),
+                .map(|p| {
+                    let same = |r: &'_ Round| -> Option<Player> {
+                        r.header
+                            .players
+                            .iter()
+                            .find(|q| q.key == p.key || (q.id != 0 && q.id == p.id))
+                            .cloned()
+                    };
+                    PlayerSummary {
+                        username: p.username.clone(),
+                        key: p.key.clone(),
+                        profile_id: p.profile_id.clone(),
+                        level: rounds.iter().find_map(|r| same(r)?.level),
+                        relation: p.relation,
+                        party: rounds.iter().find_map(|r| same(r)?.party),
+                    }
                 })
                 .collect(),
         });
@@ -402,6 +426,12 @@ impl MatchSummary {
             None => (first.timestamp, true),
         };
 
+        let party = teams
+            .iter()
+            .flat_map(|t| &t.players)
+            .filter(|p| p.party.is_some() && p.relation != Some(Relation::You))
+            .map(|p| p.username.clone())
+            .collect();
         let mut teams = teams;
         for (t, team) in teams.iter_mut().enumerate() {
             team.score = final_score[t];
@@ -422,6 +452,7 @@ impl MatchSummary {
                 username: recorder.map(|p| p.username.clone()),
                 profile_id: first.recording_profile_id.clone(),
                 spectator,
+                party,
             },
             your_team,
             result: MatchResult {

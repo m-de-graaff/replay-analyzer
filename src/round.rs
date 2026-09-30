@@ -63,6 +63,19 @@ pub struct Round {
     pub timeline: Timeline,
     /// Who won, how, and who was alive when action started (full reads).
     pub outcome: RoundOutcome,
+    /// Y8S1+: each change of a player's weapon-ready flag, by username.
+    pub weapon_ready: Vec<WeaponReady>,
+}
+
+/// A player's weapon going up (`ready`) or down.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeaponReady {
+    pub username: String,
+    pub ready: bool,
+    pub phase: Phase,
+    #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
+    pub elapsed: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +85,18 @@ pub struct ScoreboardEntry {
     pub assists: u32,
     /// Number of assist updates seen during this round.
     pub assists_from_round: u32,
+    /// Y11S3+: cumulative match kills as shown on the scoreboard.
+    pub kills: Option<u32>,
+    /// Y11S3+: cumulative match deaths as shown on the scoreboard.
+    pub deaths: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScoreField {
+    Score,
+    Assists,
+    Kills,
+    Deaths,
 }
 
 /// How much of the replay to read.
@@ -202,6 +227,8 @@ impl Serialize for Round {
             observation: &'a [ObservationSession],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             loadouts: &'a [Loadout],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            weapon_ready: &'a [WeaponReady],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +246,7 @@ impl Serialize for Round {
             life_events: &self.life_events,
             observation: &self.observation,
             loadouts: &self.loadouts,
+            weapon_ready: &self.weapon_ready,
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
@@ -271,10 +299,13 @@ enum Packet {
     ObservationTool,
     Item,
     DefuserAction,
+    WeaponReady,
+    ScoreboardKills,
+    ScoreboardDeaths,
 }
 
 impl Packet {
-    const COUNT: usize = 17;
+    const COUNT: usize = 20;
 
     fn name(self) -> &'static str {
         match self {
@@ -295,11 +326,14 @@ impl Packet {
             Packet::ObservationTool => "observationTool",
             Packet::Item => "item",
             Packet::DefuserAction => "defuserAction",
+            Packet::WeaponReady => "weaponReady",
+            Packet::ScoreboardKills => "scoreboardKills",
+            Packet::ScoreboardDeaths => "scoreboardDeaths",
         }
     }
 }
 
-const PACKETS: [(Packet, &[u8]); 16] = [
+const PACKETS: [(Packet, &[u8]); 19] = [
     (Packet::Player, &[0x22, 0x07, 0x94, 0x9B, 0xDC]),
     (Packet::AttackerSwap, &[0x22, 0xA9, 0x26, 0x0B, 0xE4]),
     (Packet::Spawn, &[0xAF, 0x98, 0x99, 0xCA]),
@@ -315,6 +349,9 @@ const PACKETS: [(Packet, &[u8]); 16] = [
     (Packet::ObservationTool, &[0x06, 0x6B, 0xC0, 0xA1]),
     (Packet::Item, &[0x0E, 0x9E, 0xBE, 0x88]),
     (Packet::DefuserAction, &DEFUSER_ACTION),
+    (Packet::WeaponReady, &crate::entities::WEAPON_READY),
+    (Packet::ScoreboardKills, &[0x1C, 0xD2, 0xB1, 0x9D]),
+    (Packet::ScoreboardDeaths, &[0xCD, 0x9C, 0x5D, 0x72]),
     (Packet::Time, &[0x1F, 0x07, 0xEF, 0xC9]),
 ];
 const LEGACY_TIME: &[u8] = &[0x1E, 0xF1, 0x11, 0xAB];
@@ -421,6 +458,9 @@ const PLAYER_LEVEL: [u8; 5] = [0x22, 0x3F, 0x0F, 0xDC, 0x1F];
 const PLAYER_NAME: [u8; 8] = [0x75, 0x6D, 0x39, 0xD4, 0x00, 0x00, 0x00, 0x00];
 /// The opening snapshot, where levels are written, fits well within this.
 const SNAPSHOT_BYTES: usize = 4 << 20;
+/// A scoreboard kill credit belongs to the feed entry written within this
+/// many bytes after it.
+const CREDIT_WINDOW: usize = 4096;
 /// A countdown step longer than this many seconds skipped time.
 const CLOCK_GAP: f64 = 2.0;
 /// Y11S3+: what a defuser interaction object is doing: 0 planting,
@@ -467,6 +507,22 @@ struct Parser<'a> {
     clock_gaps: Vec<ClockGap>,
     /// Whether the clock has switched to the defuser timer since the plant.
     defuser_clock: bool,
+    /// Controller object -> username.
+    controllers: HashMap<u32, String>,
+    /// Scoreboard object -> username.
+    scoreboards: HashMap<u32, String>,
+    /// Weapon-ready flag changes: username, value, tick.
+    weapon_samples: Vec<(String, bool, Option<usize>)>,
+    /// Players' objects from the opening snapshot of the object tree.
+    entity_players: Vec<crate::entities::PlayerObjects>,
+    /// Y11S3 scoreboard values by username, and the first assists value
+    /// seen (the total going into the round). Players are only known once
+    /// their pick packet is read, often after their scoreboard's first
+    /// values, so these are handed over at the end.
+    scoreboard_by_name: HashMap<String, (ScoreboardEntry, Option<u32>)>,
+    /// Scoreboard kills just credited, with where: the kill-feed entries
+    /// written right after them are the kills they count.
+    pending_credits: Vec<(String, usize)>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -531,6 +587,12 @@ impl<'a> Parser<'a> {
             warnings: Vec::new(),
             clock_gaps: Vec::new(),
             defuser_clock: false,
+            controllers: HashMap::new(),
+            scoreboards: HashMap::new(),
+            weapon_samples: Vec::new(),
+            entity_players: Vec::new(),
+            scoreboard_by_name: HashMap::new(),
+            pending_credits: Vec::new(),
         }
     }
 
@@ -558,6 +620,7 @@ impl<'a> Parser<'a> {
             ReadMode::Partial => (self.data.len() / 3).max(start),
             ReadMode::Header => start,
         };
+        self.read_entities(start, end);
         let (packets, scanner) = &SCANNERS[usize::from(self.code() < version::Y8S1)];
         // Handlers run in stream order but never depend on each other's cursor.
         for (offset, pattern) in scan(scanner, &self.data[start..end]) {
@@ -575,11 +638,15 @@ impl<'a> Parser<'a> {
             self.derive_team_roles();
         }
         self.read_levels(start, end);
+        self.apply_entities(start, end);
+        self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
         self.place_feedback();
         self.resolve_samples();
+        self.resolve_weapon_ready();
         self.name_defuser_players();
+        self.link_feed_profiles();
         if mode == ReadMode::Full {
             self.round_end();
         }
@@ -800,6 +867,107 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        // Who the players are and which objects carry them.
+        let players = &round.header.players;
+        let with_profile = players.iter().filter(|p| !p.profile_id.is_empty()).count();
+        let f = r.field("profileIds", Status::Decoded, with_profile);
+        if with_profile < players.len() {
+            f.at_most(if with_profile == 0 && !modern {
+                Status::NotInVersion
+            } else {
+                Status::Partial
+            })
+            .warn(format!(
+                "{} of {} players have no profile id; their `key` falls back to the username",
+                players.len() - with_profile,
+                players.len()
+            ));
+        }
+        let you = players
+            .iter()
+            .filter(|p| p.relation == Some(crate::entities::Relation::You))
+            .count();
+        if h.is_spectator == Some(true) {
+            r.field("recorder", Status::Decoded, 0)
+                .warn("spectator recording: no player is `you`, relations are left out");
+        } else {
+            let f = r.field(
+                "recorder",
+                if you == 1 {
+                    Status::Decoded
+                } else {
+                    Status::Missing
+                },
+                you,
+            );
+            if you == 0 {
+                f.warn("the recording player is not among the players (a spectator before Y11S3?)");
+            }
+        }
+        if modern && !header_only {
+            let with = players.iter().filter(|p| p.entities.is_some()).count();
+            let f = r.field("entities", Status::Decoded, with);
+            if with < players.len() {
+                f.at_most(if with == 0 {
+                    Status::Missing
+                } else {
+                    Status::Partial
+                })
+                .warn(format!(
+                    "{} players without a controller object",
+                    players.len() - with
+                ));
+            }
+            let moving = players
+                .iter()
+                .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
+                .count();
+            let f = r.field(
+                "movement",
+                if moving == 0 {
+                    Status::NotInVersion
+                } else if moving < with {
+                    Status::Partial
+                } else {
+                    Status::Decoded
+                },
+                moving,
+            );
+            if moving == 0 {
+                f.warn("no player table linking bodies to players (seen from Y11S3)");
+            }
+            let party = players.iter().filter(|p| p.party.is_some()).count();
+            let f = r.field("party", Status::Decoded, party);
+            if matches!(h.match_type.0, 3 | 4) {
+                f.at_most(Status::Skipped).warn(
+                    "custom game: the whole lobby counts as one party, so no roles are given",
+                );
+            } else if h.is_spectator == Some(true) || you == 0 {
+                f.at_most(Status::Skipped)
+                    .warn("parties are only known relative to the recording player");
+            } else {
+                f.warn("only the recording player's party is recorded; other parties are not");
+            }
+            if !skipped || mode == ReadMode::Partial {
+                let n = round.weapon_ready.len();
+                let f = r.field(
+                    "weaponReady",
+                    if n == 0 {
+                        Status::Missing
+                    } else {
+                        Status::Inferred
+                    },
+                    n,
+                );
+                f.warn(
+                    "the controller flag reads as weapon-ready: attackers hold 0 through prep until their body spawns, and it drops briefly (median about 1 s) during action, as on reloads and swaps",
+                );
+                if mode == ReadMode::Partial {
+                    f.warn("partial read: later changes not read");
+                }
+            }
+        }
+
         let levels = round
             .header
             .players
@@ -964,6 +1132,9 @@ impl<'a> Parser<'a> {
             Packet::ObservationTool => self.read_observation_tool(c),
             Packet::Item => self.read_item(c),
             Packet::DefuserAction => self.read_defuser_action(c),
+            Packet::WeaponReady => self.read_weapon_ready(c),
+            Packet::ScoreboardKills => self.read_scoreboard_object(c, ScoreField::Kills),
+            Packet::ScoreboardDeaths => self.read_scoreboard_object(c, ScoreField::Deaths),
         }
     }
 
@@ -1323,6 +1494,12 @@ impl<'a> Parser<'a> {
         });
         if !duplicate {
             let mut u = self.update(MatchUpdateType::Kill, &username);
+            // Y11S3: the scoreboard credits the kill right before the feed
+            // entry, sometimes to a teammate (who downed the victim) rather
+            // than the player the feed names.
+            if let Some(credited) = self.take_credit(&username, c.pos()) {
+                u.credited_to = credited;
+            }
             u.target = target;
             u.headshot = Some(headshot);
             u.weapon = weapon;
@@ -1770,7 +1947,232 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Y8S1+: finds every player's objects in the opening snapshot, so
+    /// packets written to them (scoreboard, weapon-ready flag) can be
+    /// attributed while the stream is read.
+    fn read_entities(&mut self, start: usize, end: usize) {
+        if self.code() < version::Y8S1 {
+            return;
+        }
+        self.entity_players = crate::entities::players(&self.data[start..end]);
+        for o in &self.entity_players {
+            self.controllers.insert(o.controller, o.username.clone());
+            if let Some(sb) = o.scoreboard {
+                self.scoreboards.insert(sb, o.username.clone());
+            }
+        }
+    }
+
+    /// Hands each player their objects, who they are to the recorder, their
+    /// party role, and (Y11S3+) the body the movement stream moves.
+    fn apply_entities(&mut self, start: usize, end: usize) {
+        use crate::entities::Relation;
+        let objects = std::mem::take(&mut self.entity_players);
+        let header = &mut self.round.header;
+        let custom = matches!(header.match_type.0, 3 | 4);
+        let spectator = header.is_spectator == Some(true);
+        let find = |players: &[Player], o: &crate::entities::PlayerObjects| {
+            players
+                .iter()
+                .position(|p| o.player_id != 0 && p.id == o.player_id)
+                .or_else(|| players.iter().position(|p| p.username == o.username))
+        };
+        for o in &objects {
+            let Some(i) = find(&header.players, o) else {
+                continue;
+            };
+            let p = &mut header.players[i];
+            if p.profile_id.is_empty() {
+                p.profile_id = o.profile_id.clone();
+            }
+            p.entities = Some(crate::header::PlayerEntities {
+                controller: o.controller,
+                scoreboard: o.scoreboard,
+                health: o.health,
+                movement: None,
+            });
+            p.relation = (!spectator && o.relation == Some(5)).then_some(Relation::You);
+        }
+        header.assign_relations();
+        // Party roles are those of the recorder's party: only players the
+        // profile marks as the recorder or a teammate in their party.
+        if !spectator && !custom {
+            for o in &objects {
+                let Some(i) = find(&header.players, o) else {
+                    continue;
+                };
+                let p = &mut header.players[i];
+                let with_you = matches!(o.relation, Some(3 | 5))
+                    && matches!(p.relation, Some(Relation::You | Relation::Teammate));
+                p.party = match o.party_role {
+                    Some(2) if with_you => Some(crate::header::PartyRole::Leader),
+                    Some(1) if with_you => Some(crate::header::PartyRole::Member),
+                    _ => None,
+                };
+            }
+        }
+        if objects.is_empty() {
+            return;
+        }
+        // Bodies from the player table, in the order each player got them.
+        let body = &self.data[start..end];
+        let ids: Vec<u64> = header.players.iter().map(|p| p.id).collect();
+        let mut bodies: HashMap<u64, Vec<u32>> = HashMap::new();
+        for change in crate::entities::possessions(body, &ids) {
+            if let Some(b) = change.body {
+                let list = bodies.entry(change.player_id).or_default();
+                if list.last() != Some(&b) {
+                    list.push(b);
+                }
+            }
+        }
+        let first: Vec<u32> = bodies.values().filter_map(|l| l.first().copied()).collect();
+        let spawns = crate::entities::spawn_positions(body, &first);
+        for p in &mut header.players {
+            let Some(list) = bodies.get(&p.id) else {
+                continue;
+            };
+            if let Some(e) = p.entities.as_mut() {
+                e.movement = list.last().copied();
+            }
+            p.spawn_position = list.first().and_then(|b| spawns.get(b).copied());
+        }
+    }
+
+    fn read_weapon_ready(&mut self, c: &mut Cursor) -> Result<()> {
+        let Some(object) = property_object(c) else {
+            return Ok(());
+        };
+        let Some(name) = self.controllers.get(&object).cloned() else {
+            return Ok(());
+        };
+        if c.u8()? != 1 {
+            return Ok(());
+        }
+        let ready = match c.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Ok(()),
+        };
+        self.weapon_samples.push((name, ready, self.clock.tick));
+        Ok(())
+    }
+
+    /// Places weapon-ready changes on the timeline, dropping repeats.
+    fn resolve_weapon_ready(&mut self) {
+        let mut last: HashMap<&str, bool> = HashMap::new();
+        let timeline = &self.round.timeline;
+        for (name, ready, tick) in &self.weapon_samples {
+            if last.insert(name, *ready) == Some(*ready) {
+                continue;
+            }
+            let at = timeline.at(*tick);
+            self.round.weapon_ready.push(WeaponReady {
+                username: name.clone(),
+                ready: *ready,
+                phase: at.phase,
+                elapsed: at.elapsed,
+            });
+        }
+    }
+
+    /// Adds the profile ids of the players a feed entry names.
+    fn link_feed_profiles(&mut self) {
+        let players = &self.round.header.players;
+        let profile = |name: &str| {
+            players
+                .iter()
+                .find(|p| !name.is_empty() && p.username == name)
+                .map(|p| p.profile_id.clone())
+                .unwrap_or_default()
+        };
+        for u in &mut self.round.match_feedback {
+            u.profile_id = profile(&u.username);
+            u.target_profile_id = profile(&u.target);
+        }
+    }
+
+    /// The player whose scoreboard object the property at `c` belongs to
+    /// (Y11S3+).
+    fn scoreboard_owner(&self, c: &Cursor) -> Option<String> {
+        self.scoreboards.get(&property_object(c)?).cloned()
+    }
+
+    /// Y11S3+: a value written to a player's scoreboard object. Values are
+    /// match totals; the first assists value seen is the total going into
+    /// the round.
+    fn read_scoreboard_object(&mut self, c: &mut Cursor, field: ScoreField) -> Result<()> {
+        let Some(name) = self.scoreboard_owner(c) else {
+            return Ok(());
+        };
+        let v = c.u32()?;
+        let (e, base) = self.scoreboard_by_name.entry(name.clone()).or_default();
+        match field {
+            ScoreField::Score => e.score = v,
+            ScoreField::Assists => {
+                let base = *base.get_or_insert(v);
+                e.assists = v;
+                e.assists_from_round = v.saturating_sub(base);
+            }
+            ScoreField::Kills => {
+                if e.kills.is_some_and(|k| v > k) {
+                    self.pending_credits.push((name, c.pos()));
+                }
+                e.kills = Some(v);
+            }
+            ScoreField::Deaths => e.deaths = Some(v),
+        }
+        Ok(())
+    }
+
+    /// The teammate the scoreboard credited with the kill `killer` is named
+    /// for in the feed, when that is not `killer`. Credits older than
+    /// `CREDIT_WINDOW` bytes are dropped; a credit to the killer is used up
+    /// first.
+    fn take_credit(&mut self, killer: &str, at: usize) -> Option<String> {
+        self.pending_credits
+            .retain(|(_, from)| at.saturating_sub(*from) < CREDIT_WINDOW);
+        if let Some(i) = self.pending_credits.iter().position(|(n, _)| n == killer) {
+            self.pending_credits.remove(i);
+            return None;
+        }
+        let team = |name: &str| {
+            let p = self
+                .round
+                .header
+                .players
+                .iter()
+                .find(|p| p.username == name)?;
+            Some(p.team_index)
+        };
+        let killer_team = team(killer)?;
+        let i = self
+            .pending_credits
+            .iter()
+            .position(|(n, _)| team(n) == Some(killer_team))?;
+        Some(self.pending_credits.remove(i).0)
+    }
+
+    /// Files the Y11S3 scoreboard values under each player's packet id.
+    fn finish_scoreboard(&mut self) {
+        for (name, (entry, _)) in std::mem::take(&mut self.scoreboard_by_name) {
+            if let Some(id) = self
+                .round
+                .header
+                .players
+                .iter()
+                .find(|p| p.username == name)
+                .and_then(|p| p.dissect_id)
+            {
+                self.round.scoreboard.insert(id, entry);
+            }
+        }
+    }
+
     fn read_scoreboard_score(&mut self, c: &mut Cursor) -> Result<()> {
+        if self.scoreboard_owner(c).is_some() {
+            return self.read_scoreboard_object(c, ScoreField::Score);
+        }
         let score = c.u32()?;
         if score == 0 {
             return Ok(());
@@ -1784,6 +2186,9 @@ impl<'a> Parser<'a> {
     }
 
     fn read_scoreboard_assists(&mut self, c: &mut Cursor) -> Result<()> {
+        if self.scoreboard_owner(c).is_some() {
+            return self.read_scoreboard_object(c, ScoreField::Assists);
+        }
         let assists = c.u32()?;
         if assists == 0 {
             return Ok(());

@@ -197,14 +197,27 @@ pub struct Timing {
     pub duration: f64,
     /// Typical time between frames.
     pub median_interval: f64,
-    /// Frames per second, from the median interval.
+    /// Frames per second, from the median interval. Spectator recordings
+    /// index a fixed ~29.4 frames a second; a player's recording follows
+    /// their frame rate, often hundreds a second.
     pub sample_rate: f64,
+    /// Frames per second over the whole recording.
+    pub mean_rate: f64,
+    /// Records per second in the state stream: how often the game sent
+    /// updates, whatever the frame rate (Y8S4+ full and partial reads).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_rate: Option<f64>,
     /// Frames whose timestamp went backwards.
     pub backwards: usize,
     /// Frame intervals much longer than usual.
     pub gaps: Vec<Gap>,
     /// Longest stretch without a frame.
     pub max_interval: f64,
+    /// Stretches without a movement record, which the game writes at every
+    /// update: the recording missed data there even if frames were indexed
+    /// (Y8S4+ full and partial reads).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub holes: Vec<Hole>,
     /// Places where the in-game clock skipped seconds.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clock_gaps: Vec<ClockGap>,
@@ -258,6 +271,16 @@ pub struct Gap {
     pub seconds: f64,
 }
 
+/// A stretch without movement records.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Hole {
+    /// Seconds since the recording started, at the last record before the
+    /// hole.
+    pub at: f64,
+    pub seconds: f64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClockGap {
@@ -285,6 +308,9 @@ impl Timing {
             return timing;
         }
         timing.duration = t[t.len() - 1] - t[0];
+        if timing.duration > 0.0 {
+            timing.mean_rate = (t.len() - 1) as f64 / timing.duration;
+        }
         let mut intervals: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
         timing.backwards = intervals.iter().filter(|&&d| d < 0.0).count();
         timing.max_interval = intervals.iter().copied().fold(0.0, f64::max);
@@ -376,6 +402,8 @@ mod tests {
         let timing = Timing::from_index(&idx);
         assert_eq!(timing.frames, 100);
         assert!((timing.sample_rate - 30.0).abs() < 0.01);
+        // The gap drags the mean rate down; the median ignores it.
+        assert!(timing.mean_rate < 20.0, "{}", timing.mean_rate);
         assert_eq!(timing.gaps.len(), 1);
         assert_eq!(timing.gaps[0].frame, 50);
         assert!((timing.gaps[0].seconds - (2.0 + 1.0 / 30.0)).abs() < 1e-9);

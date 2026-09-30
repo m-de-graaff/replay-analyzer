@@ -95,10 +95,16 @@ pub struct MatchUpdate {
     /// across the prep, action and defuser timers.
     #[serde(serialize_with = "whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
     /// Index of the clock tick the event was read at; resolved into `time`,
     /// `phase` and `elapsed` once the whole round is read.
     #[serde(skip)]
     pub tick: Option<usize>,
+    /// Where in the decompressed data the event was read.
+    #[serde(skip)]
+    pub offset: Option<usize>,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -124,7 +130,9 @@ impl MatchUpdate {
             team: None,
             phase: Phase::default(),
             elapsed: 0.0,
+            recording_time: None,
             tick: clock.tick,
+            offset: None,
         }
     }
 

@@ -40,6 +40,12 @@ pub struct PhaseSpan {
     pub start: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub end: f64,
+    /// Seconds since the recording started when the phase started and ended,
+    /// to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_start: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_end: Option<f64>,
 }
 
 /// The resolved clock track of a round.
@@ -52,6 +58,8 @@ pub struct Timeline {
     pub plant_start: Option<usize>,
     /// Tick where the round was decided.
     pub end_start: Option<usize>,
+    /// Seconds since the recording started at each tick, when known.
+    pub recording: Vec<Option<f64>>,
 }
 
 impl Timeline {
@@ -117,6 +125,7 @@ impl Timeline {
             action_start,
             plant_start,
             end_start,
+            recording: Vec::new(),
         }
     }
 
@@ -139,15 +148,18 @@ impl Timeline {
     /// The phases in order, with when each started and ended.
     pub fn spans(&self) -> Vec<PhaseSpan> {
         let mut spans: Vec<PhaseSpan> = Vec::new();
-        for t in &self.ticks {
+        for (i, t) in self.ticks.iter().enumerate() {
+            let recording = self.recording.get(i).copied().flatten();
             match spans.last_mut() {
                 Some(s) if s.phase == t.phase => {
                     s.end = t.elapsed;
                     s.end_time = display_clock(t.seconds);
+                    s.recording_end = recording.or(s.recording_end);
                 }
                 _ => {
                     if let Some(s) = spans.last_mut() {
                         s.end = t.elapsed;
+                        s.recording_end = recording.or(s.recording_end);
                     }
                     spans.push(PhaseSpan {
                         phase: t.phase,
@@ -155,6 +167,8 @@ impl Timeline {
                         end_time: display_clock(t.seconds),
                         start: t.elapsed,
                         end: t.elapsed,
+                        recording_start: recording,
+                        recording_end: recording,
                     });
                 }
             }

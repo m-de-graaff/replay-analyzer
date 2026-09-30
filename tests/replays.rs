@@ -574,9 +574,15 @@ fn y11s3_container_maps_every_byte() {
         assert_eq!(c.frames.len(), round.zstd_frames);
         let data = replay_analyzer::decompressed_bytes(&raw).unwrap();
         assert_eq!(data.len() as u64, c.raw_bytes);
-        // Listing a folder finds the same map without decompressing.
+        // Listing a folder finds the same map without decompressing; only
+        // the record counts need the decompressed data.
         let fast = Round::from_bytes(&raw, ReadMode::Header).unwrap();
-        assert_eq!(fast.container.as_ref(), Some(c));
+        let mut without_records = c.clone();
+        for s in &mut without_records.streams {
+            assert!(s.records.is_some(), "{}: {}", path.display(), s.hash);
+            (s.records, s.record_bytes) = (None, None);
+        }
+        assert_eq!(fast.container, Some(without_records));
         assert_eq!(
             round.decode.get("container").unwrap().status,
             replay_analyzer::Status::Decoded
@@ -588,6 +594,80 @@ fn y11s3_container_maps_every_byte() {
     ids.sort_unstable();
     for w in ids.windows(2) {
         assert_eq!(w[1].0, w[0].0 + 1 + w[0].1, "{ids:?}");
+    }
+}
+
+#[test]
+fn y11s3_events_are_placed_on_the_recording_clock() {
+    use replay_analyzer::{MatchUpdateType, Phase};
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Full).unwrap();
+        if round.container.is_none() {
+            continue;
+        }
+        let name = path.display();
+        let t = round.timing.as_ref().unwrap();
+        // The game sends updates about 28 times a second, whatever the frame
+        // rate of the recording.
+        let rate = t.data_rate.expect("state stream records");
+        assert!((25.0..32.0).contains(&rate), "{name}: {rate}");
+        assert!(t.holes.is_empty(), "{name}: {:?}", t.holes);
+        let c = round.container.as_ref().unwrap();
+        for stream in ["state", "movement"] {
+            let s = c.streams.iter().find(|s| s.name == Some(stream)).unwrap();
+            assert!(
+                s.records.unwrap() > 1000,
+                "{name}: {stream} {:?}",
+                s.records
+            );
+        }
+
+        let feed = &round.match_feedback;
+        let times: Vec<f64> = feed.iter().map(|u| u.recording_time.unwrap()).collect();
+        assert!(
+            times.iter().all(|&s| (0.0..=t.duration).contains(&s)),
+            "{name}"
+        );
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "{name}: {times:?}");
+        assert!(
+            round.health.iter().all(|h| h.recording_time.is_some()),
+            "{name}"
+        );
+
+        // The round clock and the frame index measure the same seconds, so a
+        // kill's recording time minus its whole seconds since prep started
+        // stays within a second across the round.
+        let offsets: Vec<f64> = feed
+            .iter()
+            .filter(|u| u.kind == MatchUpdateType::Kill && u.phase == Phase::Action)
+            .map(|u| u.recording_time.unwrap() - u.elapsed)
+            .collect();
+        let (lo, hi) = offsets
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), &o| (lo.min(o), hi.max(o)));
+        assert!(offsets.is_empty() || hi - lo < 1.0, "{name}: {offsets:?}");
+
+        let spans = round.timeline.spans();
+        let action = spans.iter().find(|s| s.phase == Phase::Action).unwrap();
+        let prep = spans.iter().find(|s| s.phase == Phase::Prep).unwrap();
+        assert_eq!(prep.recording_end, action.recording_start, "{name}");
+        let action_start = action.recording_start.unwrap();
+        assert!(
+            (40.0..50.0).contains(&action_start),
+            "{name}: {action_start}"
+        );
+        // A plant completes when its countdown reaches zero; the clock
+        // switches to the defuser timer an update or two later (34-69 ms in
+        // the test rounds), not in the same frame.
+        let plant = feed
+            .iter()
+            .find(|u| u.kind == MatchUpdateType::DefuserPlantComplete);
+        let planted = spans.iter().find(|s| s.phase == Phase::Planted);
+        if let (Some(plant), Some(planted)) = (plant, planted) {
+            let lag = planted.recording_start.unwrap() - plant.recording_time.unwrap();
+            assert!(lag > 0.0 && lag < 0.5, "{name}: {lag}");
+        }
     }
 }
 

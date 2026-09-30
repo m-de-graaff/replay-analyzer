@@ -63,6 +63,9 @@ pub struct HealthUpdate {
     /// Seconds since the prep phase started; see `Round::phases`.
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -85,6 +88,9 @@ pub struct LifeEvent {
     pub phase: Phase,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
 }
 
 /// A stretch of time a player spent looking through an observation device.
@@ -104,6 +110,10 @@ pub struct ObservationSession {
     /// Seconds since the prep phase started, when the session started.
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, when the session started, to the
+    /// frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub seconds: f64,
 }

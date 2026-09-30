@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::census::{self, Census, PacketCount};
-use crate::container::{Container, DirectoryState};
+use crate::container::{self, Container, DirectoryState};
 use crate::cursor::Cursor;
 use crate::decoder::ParserInfo;
 use crate::decompress::{self, Decompressed};
@@ -19,9 +19,10 @@ use crate::details::{
 use crate::error::{Error, Result};
 use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
-use crate::format::{self, ClockGap, FormatInfo, GameVersion, Layout, Timing};
+use crate::format::{self, ClockGap, FormatInfo, GameVersion, Hole, Layout, Timing};
 use crate::header::{Header, Player};
 use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
+use crate::records::RecordMap;
 use crate::report::{DecodeReport, Status};
 use crate::stats::PlayerRoundStats;
 use crate::timeline::Timeline;
@@ -169,11 +170,14 @@ impl Round {
         parser.round.zstd_frames = zstd_frames;
         parser.round.container = container;
         parser.round.timing = frame_index.as_ref().map(Timing::from_index);
-        if let Some(index) = frame_index.filter(|i| i.out_of_order > 0) {
-            parser.round.decode.warnings.push(format!(
-                "{} frame index entries out of order",
-                index.out_of_order
-            ));
+        if let Some(index) = frame_index {
+            if index.out_of_order > 0 {
+                parser.round.decode.warnings.push(format!(
+                    "{} frame index entries out of order",
+                    index.out_of_order
+                ));
+            }
+            parser.frame_times = index.times;
         }
         Ok(parser.run(body_start, options))
     }
@@ -531,6 +535,15 @@ struct Parser<'a> {
     /// Scoreboard kills just credited, with where: the kill-feed entries
     /// written right after them are the kills they count.
     pending_credits: Vec<(String, usize)>,
+    /// Offset in `data` of the packet being read. Events keep it, so they can
+    /// be placed on the recording's clock once the round is read.
+    packet_at: usize,
+    /// Offset of the packet that first showed each clock reading.
+    reading_offsets: Vec<usize>,
+    /// Snapshots and frame records (Y8S4+).
+    records: Option<RecordMap>,
+    /// Seconds since the recording started, per frame.
+    frame_times: Vec<f64>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -552,6 +565,8 @@ struct Interaction {
     /// has moved on (for a plant, after the clock switched to the defuser
     /// timer).
     last_tick: Option<usize>,
+    /// Offset of that countdown value's packet.
+    last_offset: Option<usize>,
 }
 
 /// A per-player object property, resolved to a player after the stream is read.
@@ -559,6 +574,7 @@ struct Sample {
     object: u32,
     value: SampleValue,
     tick: Option<usize>,
+    offset: usize,
 }
 
 enum SampleValue {
@@ -601,6 +617,10 @@ impl<'a> Parser<'a> {
             entity_players: Vec::new(),
             scoreboard_by_name: HashMap::new(),
             pending_credits: Vec::new(),
+            packet_at: 0,
+            reading_offsets: Vec::new(),
+            records: None,
+            frame_times: Vec::new(),
         }
     }
 
@@ -628,12 +648,18 @@ impl<'a> Parser<'a> {
             ReadMode::Partial => (self.data.len() / 3).max(start),
             ReadMode::Header => start,
         };
+        self.records = self
+            .round
+            .container
+            .as_ref()
+            .and_then(|c| RecordMap::parse(self.data, c.streams.len()));
         self.read_entities(start, end);
         let (packets, scanner) = &SCANNERS[usize::from(self.code() < version::Y8S1)];
         // Handlers run in stream order but never depend on each other's cursor.
         for (offset, pattern) in scan(scanner, &self.data[start..end]) {
             let packet = packets[pattern];
             let mut c = Cursor::new(self.data, start + offset);
+            self.packet_at = start + offset;
             self.packet_counts[packet as usize].0 += 1;
             if let Err(e) = self.dispatch(packet, &mut c) {
                 tracing::debug!(?packet, offset = start + offset, error = %e, "skipping packet");
@@ -650,6 +676,11 @@ impl<'a> Parser<'a> {
         self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
+        self.round.timeline.recording = self
+            .reading_offsets
+            .iter()
+            .map(|&o| self.recording_time(o))
+            .collect();
         self.place_feedback();
         self.resolve_samples();
         self.resolve_weapon_ready();
@@ -658,6 +689,7 @@ impl<'a> Parser<'a> {
         if mode == ReadMode::Full {
             self.round_end();
         }
+        self.measure_records();
         if options.census {
             self.round.census = Some(census::build(
                 &self.data[start..],
@@ -789,6 +821,12 @@ impl<'a> Parser<'a> {
                     c.streams.len(),
                 );
                 f.warnings.extend(c.warnings.iter().cloned());
+                if c.complete && !header_only && self.records.is_none() {
+                    f.at_most(Status::Partial).warn(
+                        "the decompressed data does not split into snapshots and frame records: \
+                         events have no recordingTime",
+                    );
+                }
             }
             None if fmt.layout == Layout::Stream => {
                 r.field("container", Status::NotInVersion, 0)
@@ -1154,6 +1192,21 @@ impl<'a> Parser<'a> {
                 f.at_most(Status::Partial)
                     .warn(format!("{} jumps in the in-game clock", t.clock_gaps.len()));
             }
+            if !t.holes.is_empty() {
+                let longest = t.holes.iter().map(|h| h.seconds).fold(0.0, f64::max);
+                f.at_most(Status::Partial).warn(format!(
+                    "{} holes in the movement stream, the longest {longest:.1} s",
+                    t.holes.len()
+                ));
+            }
+            let movement = self.records.as_ref().is_some_and(|m| {
+                m.streams
+                    .iter()
+                    .any(|s| container::stream_name(s.name_hash) == Some("movement"))
+            });
+            if self.records.is_some() && !movement {
+                f.warn("no movement stream, so holes were not looked for");
+            }
         }
         let clock = if modern {
             Packet::Time
@@ -1228,6 +1281,7 @@ impl<'a> Parser<'a> {
     fn update(&self, kind: MatchUpdateType, username: &str) -> MatchUpdate {
         let mut u = MatchUpdate::new(kind, &self.clock);
         u.username = username.to_owned();
+        u.offset = Some(self.packet_at);
         u
     }
 
@@ -1455,6 +1509,7 @@ impl<'a> Parser<'a> {
         }
         if self.readings.last() != Some(&clock.seconds) {
             self.readings.push(clock.seconds);
+            self.reading_offsets.push(self.packet_at);
         }
         clock.tick = Some(self.readings.len() - 1);
         // The countdown drops one second at a time. Expected jumps: up at a
@@ -1540,6 +1595,7 @@ impl<'a> Parser<'a> {
             MatchUpdateType::Other
         };
         let mut u = MatchUpdate::new(kind, &self.clock);
+        u.offset = Some(self.packet_at);
         if kind == MatchUpdateType::Other {
             u.message = msg;
         } else {
@@ -1601,6 +1657,7 @@ impl<'a> Parser<'a> {
             {
                 i.remaining = remaining;
                 i.last_tick = self.clock.tick;
+                i.last_offset = Some(self.packet_at);
             }
             return Ok(());
         }
@@ -1665,6 +1722,7 @@ impl<'a> Parser<'a> {
                 active: Some(kind),
                 remaining: f64::INFINITY,
                 last_tick: None,
+                last_offset: None,
             },
         );
         self.finish_interaction(previous);
@@ -1693,6 +1751,7 @@ impl<'a> Parser<'a> {
         let mut u = self.update(kind, "");
         u.team = self.side_team(kind);
         u.tick = i.last_tick.or(u.tick);
+        u.offset = i.last_offset.or(u.offset);
         self.push(u);
     }
 
@@ -1824,6 +1883,7 @@ impl<'a> Parser<'a> {
             object,
             value,
             tick: self.clock.tick,
+            offset: self.packet_at,
         });
     }
 
@@ -1877,10 +1937,73 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn recording_time(&self, offset: usize) -> Option<f64> {
+        recording_time(self.records.as_ref(), &self.frame_times, offset)
+    }
+
+    /// Record counts per stream, the rate the game sent updates at, and holes
+    /// in the movement stream, which has a record at every update.
+    fn measure_records(&mut self) {
+        let Some(map) = &self.records else { return };
+        if let Some(c) = self.round.container.as_mut() {
+            for s in &mut c.streams {
+                if let Some(sub) = map.streams.iter().find(|x| x.name_hash == s.name_hash) {
+                    s.records = Some(sub.frames.len() as u32);
+                    s.record_bytes = Some(sub.bytes);
+                }
+            }
+        }
+        let times = &self.frame_times;
+        let Some(timing) = self.round.timing.as_mut() else {
+            return;
+        };
+        for sub in &map.streams {
+            // Frame 0 holds the record every stream starts with.
+            let t: Vec<f64> = sub
+                .frames
+                .iter()
+                .filter(|&&f| f > 0)
+                .filter_map(|&f| times.get(f as usize).copied())
+                .collect();
+            if t.len() < MIN_RECORDS {
+                continue;
+            }
+            let span = t[t.len() - 1] - t[0];
+            match container::stream_name(sub.name_hash) {
+                Some("state") if span > 0.0 => {
+                    timing.data_rate = Some(((t.len() - 1) as f64 / span * 100.0).round() / 100.0);
+                }
+                Some("movement") => {
+                    let mut intervals: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+                    intervals.sort_by(f64::total_cmp);
+                    let limit = (intervals[intervals.len() / 2] * HOLE_FACTOR).max(MIN_HOLE);
+                    timing.holes = t
+                        .windows(2)
+                        .filter(|w| w[1] - w[0] > limit)
+                        .map(|w| Hole {
+                            at: (w[0] * 1000.0).round() / 1000.0,
+                            seconds: ((w[1] - w[0]) * 1000.0).round() / 1000.0,
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Puts every feed entry on the round's timeline: phase, seconds since
     /// prep, and the clock it happened at (the last live second for events
     /// the game logged after resetting the clock at round end).
     fn place_feedback(&mut self) {
+        let times: Vec<Option<f64>> = self
+            .round
+            .match_feedback
+            .iter()
+            .map(|u| u.offset.and_then(|o| self.recording_time(o)))
+            .collect();
+        for (u, t) in self.round.match_feedback.iter_mut().zip(times) {
+            u.recording_time = t;
+        }
         let Round {
             timeline,
             match_feedback,
@@ -1914,6 +2037,8 @@ impl<'a> Parser<'a> {
         // Observer object -> (index of its open session, elapsed at start).
         let mut open: HashMap<u32, (usize, f64)> = HashMap::new();
         let before_action = &mut self.health_before_action;
+        let (records, frame_times) = (self.records.as_ref(), &self.frame_times);
+        let recorded = |offset: usize| recording_time(records, frame_times, offset);
         let round = &mut self.round;
         let timeline = &round.timeline;
         for s in &self.samples {
@@ -1940,6 +2065,7 @@ impl<'a> Parser<'a> {
                             time_in_seconds: at.seconds,
                             phase: at.phase,
                             elapsed: at.elapsed,
+                            recording_time: recorded(s.offset),
                         });
                     }
                 }
@@ -1961,6 +2087,7 @@ impl<'a> Parser<'a> {
                         time_in_seconds: at.seconds,
                         phase: at.phase,
                         elapsed: at.elapsed,
+                        recording_time: recorded(s.offset),
                     });
                 }
                 SampleValue::Tool(tool, device_owner) => {
@@ -1984,6 +2111,7 @@ impl<'a> Parser<'a> {
                             time,
                             time_in_seconds: at.seconds,
                             elapsed: at.elapsed,
+                            recording_time: recorded(s.offset),
                             seconds: 0.0,
                         });
                     }
@@ -2459,6 +2587,24 @@ impl<'a> Parser<'a> {
 /// The object a property belongs to, with the cursor just past its 4-byte
 /// hash: either the object header right before it, or the header that starts
 /// the property chain it continues.
+/// Seconds since the recording started for the packet at `offset`, to the
+/// frame, in milliseconds. `None` for packets in a snapshot, or without frame
+/// records.
+fn recording_time(records: Option<&RecordMap>, frame_times: &[f64], offset: usize) -> Option<f64> {
+    let frame = records?.frame_at(offset)?;
+    let t = *frame_times.get(frame as usize)?;
+    Some((t * 1000.0).round() / 1000.0)
+}
+
+/// Fewer records than this say nothing about a stream's rate.
+const MIN_RECORDS: usize = 100;
+/// Movement records further apart than this, and than `HOLE_FACTOR` times
+/// their median distance (35 ms), leave a hole. The movement stream has a
+/// record at every update; the most seen between two is 69 ms. Other streams
+/// go quiet for seconds when nothing changes.
+const MIN_HOLE: f64 = 0.5;
+const HOLE_FACTOR: f64 = 10.0;
+
 fn property_object(c: &Cursor) -> Option<u32> {
     let head = c.behind(13);
     if head.len() == 13 && head[0] == 0x23 && head[5..9] == [0; 4] {

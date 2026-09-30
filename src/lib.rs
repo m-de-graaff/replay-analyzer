@@ -24,6 +24,7 @@ pub mod header;
 pub mod identity;
 pub mod matches;
 pub mod outcome;
+pub mod records;
 pub mod report;
 pub mod round;
 pub mod stats;

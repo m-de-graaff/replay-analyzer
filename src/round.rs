@@ -693,9 +693,12 @@ impl<'a> Parser<'a> {
         if options.census {
             self.round.census = Some(census::build(
                 &self.data[start..],
+                start,
                 &self.round.header,
                 self.packet_census(),
                 &known_fields(self.code() < version::Y8S1),
+                self.records.as_ref(),
+                self.round.container.as_ref(),
             ));
         }
         self.finish_report(mode);

@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::container::{self, Container};
 use crate::header::{Header, KNOWN_KEYS};
+use crate::records::{Located, RecordMap};
 
 /// How often one known packet marker was found and what came of it.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -46,6 +48,10 @@ pub struct FieldCount {
     pub sizes: Vec<u8>,
     /// How many times it started an object rather than continuing one.
     pub object_starts: u32,
+    /// Where it was seen most: a stream's name (`state`), its hash when
+    /// unnamed, or `snapshot` for the streams' opening snapshots (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -77,6 +83,11 @@ pub struct Census {
     pub rare_hashes: usize,
     /// Known fields never seen.
     pub fields_not_seen: Vec<&'static str>,
+    /// Streams whose role is unknown, by hash (Y8S4+); record counts are in
+    /// `replay.container.streams`. A new hash after a patch is a new stream.
+    pub unknown_streams: Vec<String>,
+    /// Streams with a known role that this replay does not have (Y8S4+).
+    pub streams_not_seen: Vec<&'static str>,
 }
 
 /// Hashes seen fewer times than this are treated as noise.
@@ -87,14 +98,24 @@ struct Tally {
     count: u32,
     object_starts: u32,
     sizes: Vec<u8>,
+    /// Occurrences per place, by the label `tally_fields` was given.
+    places: Vec<(u16, u32)>,
 }
 
 impl Tally {
-    fn add(&mut self, size: u8, object_start: bool) {
+    fn add(&mut self, size: u8, object_start: bool, place: u16) {
         self.count += 1;
         self.object_starts += u32::from(object_start);
         if self.sizes.len() < 8 && !self.sizes.contains(&size) {
             self.sizes.push(size);
+        }
+        self.count_place(place, 1);
+    }
+
+    fn count_place(&mut self, place: u16, n: u32) {
+        match self.places.iter_mut().find(|p| p.0 == place) {
+            Some(p) => p.1 += n,
+            None => self.places.push((place, n)),
         }
     }
 
@@ -106,11 +127,32 @@ impl Tally {
                 self.sizes.push(s);
             }
         }
+        for (place, n) in other.places {
+            self.count_place(place, n);
+        }
+    }
+
+    /// The place seen most; the first seen wins a tie.
+    fn main_place(&self) -> Option<u16> {
+        let mut best: Option<(u16, u32)> = None;
+        for &(place, n) in &self.places {
+            if best.is_none_or(|b| n > b.1) {
+                best = Some((place, n));
+            }
+        }
+        best.map(|b| b.0)
     }
 }
 
-/// Counts property hashes in `body`.
-fn tally_fields(body: &[u8]) -> HashMap<[u8; 4], Tally> {
+/// `place` labels: none known, a snapshot, or the main stream's streams from
+/// `FIRST_STREAM` on.
+const NO_PLACE: u16 = 0;
+const SNAPSHOT: u16 = 1;
+const FIRST_STREAM: u16 = 2;
+
+/// Counts property hashes in `body`; `place` labels where an offset in
+/// `body` belongs.
+fn tally_fields(body: &[u8], place: &(dyn Fn(usize) -> u16 + Sync)) -> HashMap<[u8; 4], Tally> {
     const CHUNK: usize = 4 << 20;
     let continues = |at: usize| matches!(body.get(at), Some(0x22 | 0x23));
     (0..body.len().div_ceil(CHUNK))
@@ -137,7 +179,9 @@ fn tally_fields(body: &[u8]) -> HashMap<[u8; 4], Tally> {
                     continue;
                 }
                 let hash = head[..4].try_into().expect("4 bytes");
-                out.entry(hash).or_default().add(size, object_start);
+                out.entry(hash)
+                    .or_default()
+                    .add(size, object_start, place(at));
             }
             out
         })
@@ -150,12 +194,16 @@ fn tally_fields(body: &[u8]) -> HashMap<[u8; 4], Tally> {
 }
 
 /// Builds the census. `known_fields` names the property hashes the parser
-/// reads for this replay's version.
+/// reads for this replay's version. `body` starts `body_start` bytes into the
+/// data that `records` maps (Y8S4+).
 pub fn build(
     body: &[u8],
+    body_start: usize,
     header: &Header,
     packets: Vec<PacketCount>,
     known_fields: &[(&'static str, [u8; 4])],
+    records: Option<&RecordMap>,
+    streams: Option<&Container>,
 ) -> Census {
     let packets_not_seen = packets
         .iter()
@@ -178,7 +226,25 @@ pub fn build(
         .map(|k| k.key.clone())
         .collect();
 
-    let tally = tally_fields(body);
+    let place = |at: usize| match records.and_then(|m| m.locate(body_start + at)) {
+        None => NO_PLACE,
+        Some(Located::Snapshot(_)) => SNAPSHOT,
+        Some(Located::Record(i, _)) => FIRST_STREAM + i as u16,
+    };
+    let place_name = |place: u16| -> Option<String> {
+        match place {
+            NO_PLACE => None,
+            SNAPSHOT => Some("snapshot".to_owned()),
+            p => {
+                let hash = records?
+                    .streams
+                    .get(usize::from(p - FIRST_STREAM))?
+                    .name_hash;
+                Some(container::stream_name(hash).map_or_else(|| hex(&hash), str::to_owned))
+            }
+        }
+    };
+    let tally = tally_fields(body, &place);
     let name_of = |hash: &[u8; 4]| known_fields.iter().find(|f| &f.1 == hash).map(|f| f.0);
     let rare_hashes = tally.values().filter(|t| t.count < MIN_FIELD_COUNT).count();
     let mut fields: Vec<FieldCount> = tally
@@ -193,6 +259,7 @@ pub fn build(
                 count: t.count,
                 sizes,
                 object_starts: t.object_starts,
+                stream: t.main_place().and_then(place_name),
             }
         })
         .collect();
@@ -204,6 +271,21 @@ pub fn build(
         .map(|f| f.0)
         .collect();
 
+    let listed = streams.map_or(&[][..], |c| c.streams.as_slice());
+    let unknown_streams = listed
+        .iter()
+        .filter(|s| s.name.is_none())
+        .map(|s| s.hash.clone())
+        .collect();
+    let streams_not_seen = match streams {
+        Some(_) => container::STREAM_NAMES
+            .iter()
+            .filter(|(hash, _)| !listed.iter().any(|s| s.name_hash == *hash))
+            .map(|n| n.1)
+            .collect(),
+        None => Vec::new(),
+    };
+
     Census {
         packets,
         packets_not_seen,
@@ -214,6 +296,8 @@ pub fn build(
         fields,
         rare_hashes,
         fields_not_seen,
+        unknown_streams,
+        streams_not_seen,
     }
 }
 
@@ -237,7 +321,7 @@ mod tests {
         body.push(0x23); // next object
         // Not followed by a property: ignored.
         body.extend([0x99, 0x22, 0x55, 0x55, 0x55, 0x55, 1, 9, 0x00]);
-        let t = tally_fields(&body);
+        let t = tally_fields(&body, &|_| NO_PLACE);
         assert_eq!(t[&[0xAA, 0xBB, 0xCC, 0xDD]].count, 1);
         assert_eq!(t[&[0xAA, 0xBB, 0xCC, 0xDD]].object_starts, 1);
         assert_eq!(t[&[0x11, 0x22, 0x33, 0x44]].count, 2);

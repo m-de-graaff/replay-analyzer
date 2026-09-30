@@ -536,6 +536,19 @@ fn census_counts_known_and_unknown_fields() {
         );
         assert!(c.fields.iter().any(|f| f.known == Some("health")));
         assert!(c.unknown_fields > 50, "{}", path.display());
+        // Every stream is there; two have known roles, the rest are listed
+        // as unknown so a new one after a patch stands out.
+        assert!(c.streams_not_seen.is_empty(), "{:?}", c.streams_not_seen);
+        let listed = round.container.as_ref().map_or(0, |c| c.streams.len());
+        assert_eq!(c.unknown_streams.len(), listed - 2, "{}", path.display());
+        // Fields say where they live: health updates in the state stream,
+        // picks in the opening snapshots.
+        let stream_of = |name: &str| {
+            let f = c.fields.iter().find(|f| f.known == Some(name)).unwrap();
+            f.stream.clone()
+        };
+        assert_eq!(stream_of("health").as_deref(), Some("state"));
+        assert_eq!(stream_of("player").as_deref(), Some("snapshot"));
         let time = c.packets.iter().find(|p| p.name.ends_with("ime")).unwrap();
         assert!(time.seen > 100);
     }

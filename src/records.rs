@@ -30,7 +30,19 @@ pub struct SubStream {
 struct Span {
     start: usize,
     end: usize,
+    /// Index into `RecordMap::streams`.
+    stream: u32,
     frame: u32,
+}
+
+/// Where an offset in the decompressed data belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Located {
+    /// The opening snapshot of the stream at this index of the stream list.
+    Snapshot(usize),
+    /// A record of this stream (index into `RecordMap::streams`) at this
+    /// frame.
+    Record(usize, u32),
 }
 
 /// The decompressed data split into snapshots and frame records.
@@ -79,7 +91,7 @@ impl RecordMap {
             return None;
         }
         pos += 16;
-        for _ in 0..n {
+        for stream in 0..n as u32 {
             let name_hash: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
             let count = u32_at(pos + 13)?;
             pos += 21;
@@ -98,7 +110,12 @@ impl RecordMap {
                 }
                 s.frames.push(frame);
                 s.bytes += size as u64;
-                map.spans.push(Span { start, end, frame });
+                map.spans.push(Span {
+                    start,
+                    end,
+                    stream,
+                    frame,
+                });
                 pos = end;
             }
             map.streams.push(s);
@@ -113,9 +130,25 @@ impl RecordMap {
     /// The frame whose record holds `offset`. `None` in a snapshot or
     /// between records.
     pub fn frame_at(&self, offset: usize) -> Option<u32> {
+        match self.locate(offset)? {
+            Located::Record(_, frame) => Some(frame),
+            Located::Snapshot(_) => None,
+        }
+    }
+
+    /// The snapshot or record holding `offset`. `None` in the main stream's
+    /// headers.
+    pub fn locate(&self, offset: usize) -> Option<Located> {
+        if offset < self.main_start {
+            let i = self.snapshots.partition_point(|s| s.0 <= offset);
+            let (start, end) = *self.snapshots.get(i.checked_sub(1)?)?;
+            return (start..end)
+                .contains(&offset)
+                .then_some(Located::Snapshot(i - 1));
+        }
         let i = self.spans.partition_point(|s| s.start <= offset);
         let span = self.spans.get(i.checked_sub(1)?)?;
-        (offset < span.end).then_some(span.frame)
+        (offset < span.end).then_some(Located::Record(span.stream as usize, span.frame))
     }
 }
 
@@ -188,6 +221,11 @@ mod tests {
             None,
             "snapshots have no frame"
         );
+        assert_eq!(
+            map.locate(find(&d, b"second one") + 2),
+            Some(Located::Snapshot(1))
+        );
+        assert_eq!(map.locate(find(&d, b"moved")), Some(Located::Record(1, 4)));
     }
 
     #[test]

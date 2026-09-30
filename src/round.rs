@@ -2608,9 +2608,20 @@ impl<'a> Parser<'a> {
 /// The object a property belongs to, with the cursor just past its 4-byte
 /// hash: either the object header right before it, or the header that starts
 /// the property chain it continues.
+fn property_object(c: &Cursor) -> Option<u32> {
+    let head = c.behind(13);
+    if head.len() == 13 && head[0] == 0x23 && head[5..9] == [0; 4] {
+        return Some(u32::from_le_bytes(head[1..5].try_into().expect("4 bytes")));
+    }
+    if c.behind(5).first() != Some(&0x22) {
+        return None;
+    }
+    owning_object(c.behind(5 + 256), 5)
+}
+
 /// Seconds since the recording started for the packet at `offset`, to the
-/// frame, in milliseconds. `None` for packets in a snapshot, or without frame
-/// records.
+/// frame and rounded to the millisecond. `None` for packets in a snapshot, or
+/// without frame records.
 fn recording_time(records: Option<&RecordMap>, frame_times: &[f64], offset: usize) -> Option<f64> {
     let frame = records?.frame_at(offset)?;
     let t = *frame_times.get(frame as usize)?;
@@ -2625,17 +2636,6 @@ const MIN_RECORDS: usize = 100;
 /// go quiet for seconds when nothing changes.
 const MIN_HOLE: f64 = 0.5;
 const HOLE_FACTOR: f64 = 10.0;
-
-fn property_object(c: &Cursor) -> Option<u32> {
-    let head = c.behind(13);
-    if head.len() == 13 && head[0] == 0x23 && head[5..9] == [0; 4] {
-        return Some(u32::from_le_bytes(head[1..5].try_into().expect("4 bytes")));
-    }
-    if c.behind(5).first() != Some(&0x22) {
-        return None;
-    }
-    owning_object(c.behind(5 + 256), 5)
-}
 
 /// The state object id in `23 <id> 00000000 63CC188F`, which follows the
 /// operator in a Y11S3 pick packet.

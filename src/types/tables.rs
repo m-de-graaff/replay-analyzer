@@ -1,4 +1,4 @@
-// Generated from r6-dissect's header.go and operator_roles.go, plus operators
+// Operator, map and role lookup tables, plus operators
 // identified from Y11S3 replays (marked below).
 
 use super::TeamRole::{self, Attack, Defense};

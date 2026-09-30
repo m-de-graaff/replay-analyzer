@@ -1,6 +1,5 @@
-//! Compares parser output against the expected JSON shipped with r6-dissect's
-//! test replays. Data is read from `R6_TEST_DATA`, else `test_recordings/`,
-//! else `.opensrc/r6-dissect`. Each holds `valid/**/*.rec` (with `.rec.json`
+//! Tests against real replays. Data is read from `R6_TEST_DATA`, else
+//! `test_recordings/`. Each holds `valid/**/*.rec` (optionally with `.rec.json`
 //! expectations) and `invalid/*.rec`. Tests are skipped when none exists.
 
 use std::path::{Path, PathBuf};
@@ -12,10 +11,7 @@ fn data_dir() -> Option<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let candidates = match std::env::var_os("R6_TEST_DATA") {
         Some(dir) => vec![PathBuf::from(dir)],
-        None => vec![
-            root.join("test_recordings"),
-            root.join(".opensrc/r6-dissect/dissect/test/data/replays"),
-        ],
+        None => vec![root.join("test_recordings")],
     };
     let found = candidates
         .iter()
@@ -44,9 +40,9 @@ fn replays(dir: &Path, kind: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Go decodes missing keys as zero values, so drop zero values on both sides.
-/// `{name, id}` values compare by id only, as r6-dissect's own tests do: some
-/// fixtures carry names from before an id was given one.
+/// Missing keys and zero values are equivalent, so drop zero values on both
+/// sides. `{name, id}` values compare by id only: some expectation files carry
+/// names from before an id was given one.
 fn normalize(v: Value) -> Value {
     match v {
         Value::Object(map)
@@ -110,7 +106,7 @@ fn expected(path: &Path) -> Value {
     normalize(serde_json::from_str(&text).unwrap())
 }
 
-/// Fields this parser adds that r6-dissect does not report.
+/// Fields the expectation files do not carry.
 const EXTENSIONS: &[&str] = &["weapon"];
 
 fn strip_extensions(v: Value) -> Value {
@@ -140,7 +136,7 @@ fn check(path: &Path, key: &str, got: Value, want: &Value, failures: &mut Vec<St
 }
 
 #[test]
-fn full_read_matches_r6_dissect() {
+fn full_read_matches_expected_json() {
     let Some(dir) = data_dir() else { return };
     let mut failures = Vec::new();
     for path in with_expectations(&dir) {

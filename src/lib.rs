@@ -1,7 +1,5 @@
 //! Parser for Rainbow Six Siege match replays (`.rec` files).
 //!
-//! A Rust port of [r6-dissect](https://github.com/redraskal/r6-dissect).
-//!
 //! ```no_run
 //! use replay_analyzer::{ReadMode, Round};
 //!

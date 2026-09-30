@@ -729,7 +729,7 @@ impl<'a> Parser<'a> {
             self.push(u);
             self.last_defuser = Some(i);
         }
-        // TODO (from r6-dissect): 0.00 can appear without the defuser being disabled.
+        // TODO: 0.00 can appear without the defuser being disabled.
         if !timer.starts_with("0.00") {
             return Ok(());
         }

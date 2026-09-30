@@ -12,7 +12,7 @@ use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 use tables::{MAPS, OPERATORS, ROLE_IMAGES};
 
-/// Serializes as `{"name": ..., "id": ...}`, the shape r6-dissect emits.
+/// Serializes as `{"name": ..., "id": ...}`.
 fn serialize_named<S: Serializer>(s: S, name: &str, id: u64) -> Result<S::Ok, S::Error> {
     let mut st = s.serialize_struct("Named", 2)?;
     st.serialize_field("name", name)?;

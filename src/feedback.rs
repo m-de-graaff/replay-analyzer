@@ -2,7 +2,7 @@ use serde::{Serialize, Serializer};
 
 use crate::types::Operator;
 
-/// What happened in a [`MatchUpdate`]. Discriminants match r6-dissect.
+/// What happened in a [`MatchUpdate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MatchUpdateType {
     Kill = 0,
@@ -67,7 +67,7 @@ pub struct MatchUpdate {
     pub message: String,
     #[serde(skip_serializing_if = "Operator::is_empty")]
     pub operator: Operator,
-    /// The weapon or gadget id behind a kill. Not reported by r6-dissect.
+    /// The weapon or gadget id behind a kill.
     #[serde(skip_serializing_if = "is_zero")]
     pub weapon: u64,
 }
@@ -105,7 +105,7 @@ impl MatchUpdate {
     }
 }
 
-/// Emits `28` rather than `28.0`, matching Go's encoder.
+/// Emits `28` rather than `28.0`.
 pub(crate) fn whole_number_as_int<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         s.serialize_i64(*v as i64)

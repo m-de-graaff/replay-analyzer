@@ -1,6 +1,6 @@
 # replay-analyzer
 
-A Rust port of [r6-dissect](https://github.com/redraskal/r6-dissect): it parses Rainbow Six Siege match replays (`.rec` files) into JSON.
+Parses Rainbow Six Siege match replays (`.rec` files) into JSON.
 
 ```sh
 replay-analyzer R01.rec                 # one round as JSON
@@ -24,18 +24,14 @@ for kill in round.kills_and_deaths() {
 let game = Match::open("Match-2024-05-04/")?;
 ```
 
-## Compared with r6-dissect
+## Design
 
-The JSON output is the same as r6-dissect's (checked against its test replays and the Go binary). The differences:
-
-- **Faster.** Packet markers are found with one SIMD Aho-Corasick pass, split across cores. Y8S4+ zstd frames are decompressed in parallel, and match folders parse all rounds at once. On the test replays a single round is about 3× faster and a 5-round folder about 4× faster.
+- **Fast.** Packet markers are found with one SIMD Aho-Corasick pass, split across cores. Y8S4+ zstd frames are decompressed in parallel, and match folders parse all rounds at once. See [Benchmarks](#benchmarks).
 - **Robust.** A malformed packet is logged and skipped instead of aborting the whole read or panicking. Unknown operators, maps and modes keep their raw id instead of crashing role lookups.
-- **Correct marker search.** The Go byte-matcher could miss a marker that followed a partial match, or one that crossed a worker boundary. This port uses exact substring search.
-- **Scope.** Excel export and the custom-listener API are not ported.
 
-## Beyond r6-dissect
+## Output
 
-Round JSON also carries data r6-dissect does not extract. It sits in its own keys, so the r6-dissect fields are unchanged apart from `weapon` on kills.
+Besides the header, players, kill feed and scoreboard, round JSON carries:
 
 | Key | What it holds | Versions |
 |---|---|---|
@@ -55,6 +51,20 @@ Limits worth knowing:
 
 Y11S3 attacker swaps are linked through the player's state object, because the caster UI id older seasons use is shared by a whole team there.
 
+## Benchmarks
+
+`cargo bench` runs [Criterion](https://github.com/bheisler/criterion.rs) over the Y11S3 replays in `test_recordings/valid/Y11S3`. Single-round benches parse an ~8.7 MiB round already in memory; the match bench reads a 10-round folder (~81 MiB) from disk.
+
+| Bench | What it does | Time | Throughput |
+|---|---|---|---|
+| `round/decompress` | zstd frames to the raw stream | 76 ms | 115 MiB/s |
+| `round/header` | header and players only | 58 ms | 151 MiB/s |
+| `round/partial` | `ReadMode::Partial` | 72 ms | 121 MiB/s |
+| `round/full` | `ReadMode::Full`, every packet | 141 ms | 62 MiB/s |
+| `match/folder_10_rounds` | `Match::open` on 10 rounds | 823 ms | 98 MiB/s |
+
+Measured on an Intel Core Ultra 7 255H (16 threads), Windows 11, Rust 1.97.1, release profile. Numbers are medians; expect run-to-run variation of a few percent.
+
 ## Tests
 
-`cargo test` compares output against the expected JSON next to each replay in `test_recordings/valid/` (falling back to `.opensrc/r6-dissect`; override with `R6_TEST_DATA`), and checks that everything in `test_recordings/invalid/` is rejected. It also re-packs a replay into the Y8S4+ chunked layout to cover that path. Replay tests are skipped when the data is missing.
+`cargo test` checks the replays in `test_recordings/valid/` against facts known from the game, compares output against a `.rec.json` expectation where one sits next to a replay, and checks that everything in `test_recordings/invalid/` is rejected. It also re-packs a replay into the Y8S4+ chunked layout to cover that path. Set `R6_TEST_DATA` to test against another folder. Replay tests are skipped when the data is missing.

@@ -1,4 +1,4 @@
-//! Round data beyond what r6-dissect reports: bans, damage, observation tools.
+//! Round data beyond the scoreboard and kill feed: bans, damage, observation tools.
 
 use serde::Serialize;
 

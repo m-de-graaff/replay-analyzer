@@ -1,0 +1,21 @@
+.opensrc/
+
+
+# Added by cargo
+
+/target
+
+# Local debug output
+dbg.txt
+*.log
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*

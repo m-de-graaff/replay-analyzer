@@ -728,6 +728,49 @@ fn a_file_the_game_did_not_finish_is_reported_incomplete() {
     );
 }
 
+/// A `MatchReplay` folder as the game writes it, from `R6_MATCH_REPLAY`.
+/// Its contents change as matches are played, so tests on it check what
+/// must hold for any such folder.
+fn match_replay_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("R6_MATCH_REPLAY")?);
+    dir.is_dir().then_some(dir)
+}
+
+#[test]
+fn game_named_folders_and_files_agree_with_their_headers() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let folders = replay_analyzer::matches::find_match_folders(&root).unwrap();
+    assert!(!folders.is_empty());
+    for dir in folders {
+        let m = replay_analyzer::Match::open_with(&dir, ReadMode::Header).unwrap();
+        let f = m.folder.as_ref().unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(f.name.is_some(), "{name} is not a game folder name");
+        // Every warning is about the match, never about names or ids.
+        for w in &f.warnings {
+            assert!(
+                !w.contains("named for another") && !w.contains("according to its header"),
+                "{name}: {w}"
+            );
+        }
+        assert!(f.skipped.is_empty(), "{name}: {:?}", f.skipped);
+        for r in &m.rounds {
+            let file = Path::new(&r.file.as_ref().unwrap().file_name);
+            let round = replay_analyzer::file::round_from_file_name(file);
+            assert_eq!(round, Some(r.header.round_number + 1), "{}", file.display());
+            let owner = replay_analyzer::file::match_of_file_name(file);
+            assert_eq!(owner, Some(name.as_str()), "{}", file.display());
+            let c = r.container.as_ref().unwrap();
+            let listed = f.incomplete.iter().any(|i| Path::new(i) == file);
+            assert_eq!(!c.complete, listed, "{}", file.display());
+            assert!(c.recording_id.is_some(), "{}", file.display());
+        }
+    }
+}
+
 #[test]
 fn temporary_recordings_are_refused() {
     let dir = std::env::temp_dir().join(format!("ra-tmprec-{}", std::process::id()));

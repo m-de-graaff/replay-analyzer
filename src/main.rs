@@ -258,6 +258,12 @@ fn print_summary(s: &replay_analyzer::MatchSummary) {
 }
 
 fn print_folder(f: &FolderReport) {
+    if let Some(n) = &f.name {
+        println!(
+            "Folder:           created {} (local time), game process {}",
+            n.local_time, n.process_id
+        );
+    }
     println!(
         "Rounds:           {:?} of {} files{}",
         f.rounds,

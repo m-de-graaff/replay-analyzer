@@ -12,6 +12,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 use zstd::zstd_safe;
 
+use crate::container::{self, Container};
 use crate::error::{Error, Result};
 use crate::format::{self, FormatInfo, FrameIndex, Layout};
 use crate::header;
@@ -30,6 +31,8 @@ pub struct Decompressed {
     pub zstd_frames: usize,
     /// Frame timestamps, when the index was found.
     pub frame_index: Option<FrameIndex>,
+    /// Streams and blocks of a Y8S4+ file.
+    pub container: Option<Container>,
 }
 
 pub fn decompress(raw: &[u8]) -> Result<Decompressed> {
@@ -48,17 +51,31 @@ pub fn decompress(raw: &[u8]) -> Result<Decompressed> {
             format,
             zstd_frames: frames.len(),
             frame_index,
+            container: None,
         })
     } else if raw.starts_with(DISSECT_MAGIC) {
         let (header, mut format, header_end) = header::parse(raw)?;
         format.layout = Layout::Chunked;
-        let frames = locate_frames(raw, header_end);
+        let (frame_index, mut container) =
+            chunked_container(raw, header_end, format.declared_frames);
+        // A complete map knows exactly where every block is. Otherwise fall
+        // back to finding zstd frames by their magic, as before the container
+        // was understood.
+        let frames = match &container {
+            Some(c) if c.complete => c.frames.clone(),
+            _ => locate_frames(raw, header_end),
+        };
+        if let Some(c) = container
+            .as_mut()
+            .filter(|c| !c.complete && c.frames.len() != frames.len())
+        {
+            c.warnings.push(format!(
+                "{} zstd frames found by scanning, {} by walking the blocks",
+                frames.len(),
+                c.frames.len()
+            ));
+        }
         let data = decompress_frames(raw, &frames)?;
-        // The index sits uncompressed between the header and the first frame.
-        let index_end = frames.first().map_or(raw.len(), |f| f.0);
-        let frame_index = raw
-            .get(header_end..index_end)
-            .and_then(|b| format::read_frame_index(b, format.declared_frames));
         Ok(Decompressed {
             data,
             header,
@@ -66,10 +83,27 @@ pub fn decompress(raw: &[u8]) -> Result<Decompressed> {
             format,
             zstd_frames: frames.len(),
             frame_index,
+            container,
         })
     } else {
         Err(Error::InvalidFile)
     }
+}
+
+/// The uncompressed frame index after the header of a Y8S4+ file, and the
+/// container after it.
+fn chunked_container(
+    raw: &[u8],
+    header_end: usize,
+    declared_frames: u32,
+) -> (Option<FrameIndex>, Option<Container>) {
+    let frame_index = raw
+        .get(header_end..)
+        .and_then(|b| format::read_frame_index(b, declared_frames));
+    let container = frame_index
+        .as_ref()
+        .map(|i| container::map(raw, header_end + i.len));
+    (frame_index, container)
 }
 
 /// Like [`decompress`], but for Y8S4+ replays only the uncompressed header and
@@ -80,10 +114,7 @@ pub fn header_only(raw: &[u8]) -> Result<Decompressed> {
     }
     let (header, mut format, header_end) = header::parse(raw)?;
     format.layout = Layout::Chunked;
-    let first_frame = memmem::find(&raw[header_end..], &ZSTD_MAGIC).map(|i| header_end + i);
-    let frame_index = first_frame
-        .and_then(|end| raw.get(header_end..end))
-        .and_then(|b| format::read_frame_index(b, format.declared_frames));
+    let (frame_index, container) = chunked_container(raw, header_end, format.declared_frames);
     Ok(Decompressed {
         data: Vec::new(),
         header,
@@ -91,6 +122,7 @@ pub fn header_only(raw: &[u8]) -> Result<Decompressed> {
         format,
         zstd_frames: 0,
         frame_index,
+        container,
     })
 }
 

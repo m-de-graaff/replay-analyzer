@@ -542,6 +542,113 @@ fn census_counts_known_and_unknown_fields() {
 }
 
 #[test]
+fn y11s3_container_maps_every_byte() {
+    use replay_analyzer::DirectoryState;
+    let Some(dir) = data_dir() else { return };
+    let mut ids = Vec::new();
+    for path in replays(&dir, "valid") {
+        let raw = std::fs::read(&path).unwrap();
+        if !raw.starts_with(b"dissect") {
+            continue;
+        }
+        let round = Round::from_bytes(&raw, ReadMode::Full).unwrap();
+        let c = round
+            .container
+            .as_ref()
+            .expect("Y8S4+ files have a container");
+        assert!(c.complete, "{}: {:?}", path.display(), c.warnings);
+        assert!(
+            c.warnings.is_empty(),
+            "{}: {:?}",
+            path.display(),
+            c.warnings
+        );
+        assert_eq!(c.directory, DirectoryState::Valid);
+        assert_eq!(c.streams.len(), 10, "{}", path.display());
+        let named: Vec<_> = c.streams.iter().filter_map(|s| s.name).collect();
+        assert!(
+            named.contains(&"state") && named.contains(&"movement"),
+            "{named:?}"
+        );
+        // Every block was decompressed, and nothing else.
+        assert_eq!(c.frames.len(), round.zstd_frames);
+        let data = replay_analyzer::decompressed_bytes(&raw).unwrap();
+        assert_eq!(data.len() as u64, c.raw_bytes);
+        // Listing a folder finds the same map without decompressing.
+        let fast = Round::from_bytes(&raw, ReadMode::Header).unwrap();
+        assert_eq!(fast.container.as_ref(), Some(c));
+        assert_eq!(
+            round.decode.get("container").unwrap().status,
+            replay_analyzer::Status::Decoded
+        );
+        ids.push((c.recording_id.unwrap(), c.streams.len() as u32));
+    }
+    // The test rounds were recorded one after another by one game session:
+    // each takes its main id and ten stream ids from the same counter.
+    ids.sort_unstable();
+    for w in ids.windows(2) {
+        assert_eq!(w[1].0, w[0].0 + 1 + w[0].1, "{ids:?}");
+    }
+}
+
+/// Real files the game failed to finish end on a block header whose packed
+/// size is 0xFFFFFFFF, right after the snapshots. Build one from a test round.
+fn unfinished_copy(raw: &[u8]) -> Vec<u8> {
+    let round = Round::from_bytes(raw, ReadMode::Header).unwrap();
+    let c = round.container.unwrap();
+    // The main stream's descriptor is 56 bytes before its data.
+    let cut = c.main.unwrap().offset as usize - 56;
+    let mut out = raw[..cut].to_vec();
+    out.extend(b"200VRPMC");
+    out.extend(10_822_076u32.to_le_bytes());
+    out.extend(u32::MAX.to_le_bytes());
+    out
+}
+
+#[test]
+fn a_file_the_game_did_not_finish_is_reported_incomplete() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    let path = dir.join("valid/Y11S3/custom_1.rec");
+    if !path.is_file() {
+        return;
+    }
+    let raw = unfinished_copy(&std::fs::read(&path).unwrap());
+    for mode in [ReadMode::Header, ReadMode::Full] {
+        let round = Round::from_bytes(&raw, mode).unwrap();
+        let c = round.container.as_ref().unwrap();
+        assert!(!c.complete);
+        assert!(c.main.is_none());
+        assert!(c.streams.iter().all(|s| s.snapshot.is_some()));
+        assert_eq!(
+            round.decode.get("container").unwrap().status,
+            Status::Partial
+        );
+        assert!(
+            round
+                .decode
+                .warnings
+                .iter()
+                .any(|w| w.contains("before the main stream")),
+            "{:?}",
+            round.decode.warnings
+        );
+        assert!(!round.decode.trusted);
+    }
+    // A full read still gets the header and players from the snapshots, and
+    // says why the kill feed is empty.
+    let round = Round::from_bytes(&raw, ReadMode::Full).unwrap();
+    assert_eq!(round.header.players.len(), 10);
+    let kills = round.decode.get("kills").unwrap();
+    assert_eq!(kills.status, Status::Missing);
+    assert!(
+        kills.warnings.iter().any(|w| w.contains("incomplete")),
+        "{:?}",
+        kills.warnings
+    );
+}
+
+#[test]
 fn temporary_recordings_are_refused() {
     let dir = std::env::temp_dir().join(format!("ra-tmprec-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

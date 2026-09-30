@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::census::{self, Census, PacketCount};
+use crate::container::{Container, DirectoryState};
 use crate::cursor::Cursor;
 use crate::decoder::ParserInfo;
 use crate::decompress::{self, Decompressed};
@@ -18,7 +19,7 @@ use crate::details::{
 use crate::error::{Error, Result};
 use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
-use crate::format::{ClockGap, FormatInfo, GameVersion, Timing};
+use crate::format::{self, ClockGap, FormatInfo, GameVersion, Layout, Timing};
 use crate::header::{Header, Player};
 use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
 use crate::report::{DecodeReport, Status};
@@ -53,6 +54,8 @@ pub struct Round {
     pub parser: ParserInfo,
     /// Number of zstd frames in the file.
     pub zstd_frames: usize,
+    /// Streams and compressed blocks (Y8S4+), and whether the file is whole.
+    pub container: Option<Container>,
     /// Recording rate and holes, from the frame index and the clock.
     pub timing: Option<Timing>,
     /// Trust level of each output field.
@@ -159,10 +162,12 @@ impl Round {
             format,
             zstd_frames,
             frame_index,
+            container,
         } = read(raw)?;
         let mut parser = Parser::new(&data, header);
         parser.round.format = format;
         parser.round.zstd_frames = zstd_frames;
+        parser.round.container = container;
         parser.round.timing = frame_index.as_ref().map(Timing::from_index);
         if let Some(index) = frame_index.filter(|i| i.out_of_order > 0) {
             parser.round.decode.warnings.push(format!(
@@ -266,6 +271,8 @@ pub struct ReplayInfo<'a> {
     pub version: &'a GameVersion,
     pub parser: &'a ParserInfo,
     pub zstd_frames: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<&'a Container>,
 }
 
 impl Round {
@@ -276,6 +283,7 @@ impl Round {
             version: &self.version,
             parser: &self.parser,
             zstd_frames: self.zstd_frames,
+            container: self.container.as_ref(),
         }
     }
 }
@@ -738,6 +746,59 @@ impl<'a> Parser<'a> {
                 crate::decoder::NEWEST_TESTED_BUILD
             ));
         }
+        let fmt = &round.format;
+        if fmt.prelude_decoded {
+            if !format::KNOWN_FORMAT_VERSIONS.contains(&fmt.format_version) {
+                f.at_most(Status::Partial).warn(format!(
+                    "format version {} is not one seen so far ({:?})",
+                    fmt.format_version,
+                    format::KNOWN_FORMAT_VERSIONS
+                ));
+            }
+            if fmt.label != format::KNOWN_LABEL {
+                f.warn(format!(
+                    "prelude label {:?} instead of {:?}",
+                    fmt.label,
+                    format::KNOWN_LABEL
+                ));
+            }
+            let expected = if fmt.format_version >= 8 {
+                Layout::Chunked
+            } else {
+                Layout::Stream
+            };
+            if fmt.layout != expected {
+                f.warn(format!(
+                    "format version {} in the {:?} layout",
+                    fmt.format_version, fmt.layout
+                ));
+            }
+        }
+
+        match &round.container {
+            Some(c) => {
+                let clean =
+                    c.complete && c.directory == DirectoryState::Valid && c.warnings.is_empty();
+                let f = r.field(
+                    "container",
+                    if clean {
+                        Status::Decoded
+                    } else {
+                        Status::Partial
+                    },
+                    c.streams.len(),
+                );
+                f.warnings.extend(c.warnings.iter().cloned());
+            }
+            None if fmt.layout == Layout::Stream => {
+                r.field("container", Status::NotInVersion, 0)
+                    .warn("one zstd stream (before Y8S4): streams are not mapped");
+            }
+            None => {
+                r.field("container", Status::Missing, 0)
+                    .warn("no frame index, so the stream list could not be found");
+            }
+        }
 
         let with_op = h.players.iter().filter(|p| !p.operator.is_empty()).count();
         let f = r.field("players", Status::Decoded, h.players.len());
@@ -1101,6 +1162,27 @@ impl<'a> Parser<'a> {
         };
         if !skipped && self.packet_counts[clock as usize].0 == 0 {
             f.at_most(Status::Partial).warn("no clock packets found");
+        }
+        if let Some(c) = round.container.as_ref().filter(|c| !c.complete) {
+            let at = c.truncated_at.unwrap_or_default();
+            let why = if c.main.is_none() {
+                format!(
+                    "the file stops at byte {at}, before the main stream that holds every \
+                     frame record: only the opening snapshots were written"
+                )
+            } else {
+                format!(
+                    "the file stops at byte {at}, inside the main stream: later frames are missing"
+                )
+            };
+            for f in &mut r.fields {
+                if matches!(f.status, Status::Missing | Status::Partial)
+                    && !matches!(f.field, "header" | "container" | "timing")
+                {
+                    f.warn("the file is incomplete (see warnings)");
+                }
+            }
+            r.warnings.push(why);
         }
         r.finish();
         self.round.decode = r;

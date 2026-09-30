@@ -10,6 +10,7 @@
 
 pub mod analytics;
 pub mod census;
+pub mod container;
 mod cursor;
 pub mod decoder;
 mod decompress;
@@ -32,6 +33,7 @@ pub mod types;
 
 pub use analytics::MatchAnalytics;
 pub use census::Census;
+pub use container::{Container, DirectoryState, StreamInfo};
 pub use decoder::ParserInfo;
 pub use details::{
     Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,

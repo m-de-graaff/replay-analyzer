@@ -27,6 +27,11 @@ use crate::error::{Error, Result};
 
 pub const MAGIC: &[u8] = b"dissect";
 
+/// Container format versions seen: 7 up to Y8S3, 8 from Y8S4.
+pub const KNOWN_FORMAT_VERSIONS: [u32; 2] = [7, 8];
+/// The text after the format version in every replay seen.
+pub const KNOWN_LABEL: &str = "UNKNOWN";
+
 /// A string in the prelude or header: u64 length, then the bytes. Every
 /// length seen so far is under 256, so the upper seven bytes of the length
 /// look like a run of zeros.
@@ -151,6 +156,8 @@ pub struct FrameIndex {
     pub times: Vec<f64>,
     /// Frame entries whose index did not match their position.
     pub out_of_order: usize,
+    /// Bytes the index takes up; the stream list follows it (Y8S4+).
+    pub len: usize,
 }
 
 /// Reads the index at `bytes`. `expected` is the frame count from the
@@ -165,6 +172,7 @@ pub fn read_frame_index(bytes: &[u8], expected: u32) -> Option<FrameIndex> {
     let mut index = FrameIndex {
         times: Vec::with_capacity(n as usize),
         out_of_order: 0,
+        len: 12 + 12 * n as usize,
     };
     for i in 0..n {
         let idx = u32::from_le_bytes(c.array().ok()?);

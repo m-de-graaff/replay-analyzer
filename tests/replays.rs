@@ -699,6 +699,36 @@ fn unfinished_copy(raw: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn a_file_cut_inside_a_block_reads_up_to_the_cut() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    let path = dir.join("valid/Y11S3/custom_1.rec");
+    if !path.is_file() {
+        return;
+    }
+    let raw = std::fs::read(&path).unwrap();
+    // Three megabytes in: inside the main stream, in the middle of a block.
+    let round = Round::from_bytes(&raw[..3_000_000], ReadMode::Full).unwrap();
+    let c = round.container.as_ref().unwrap();
+    assert!(!c.complete);
+    assert!(c.main.is_some());
+    assert!(
+        round
+            .decode
+            .warnings
+            .iter()
+            .any(|w| w.contains("inside the main stream")),
+        "{:?}",
+        round.decode.warnings
+    );
+    assert_eq!(
+        round.decode.get("container").unwrap().status,
+        Status::Partial
+    );
+    assert_eq!(round.header.players.len(), 10);
+}
+
+#[test]
 fn a_file_the_game_did_not_finish_is_reported_incomplete() {
     use replay_analyzer::Status;
     let Some(dir) = data_dir() else { return };

@@ -95,6 +95,11 @@ impl RecordMap {
             let name_hash: [u8; 4] = data.get(pos..pos + 4)?.try_into().ok()?;
             let count = u32_at(pos + 13)?;
             pos += 21;
+            // Every record takes at least its 12-byte header; a count the
+            // rest of the data cannot hold is not a count.
+            if count as usize > data.len().saturating_sub(pos) / 12 {
+                return None;
+            }
             let mut s = SubStream {
                 name_hash,
                 bytes: 0,
@@ -252,6 +257,15 @@ mod tests {
     fn the_main_stream_must_hold_every_listed_stream() {
         // Fits to the last byte, but has records for one of two streams.
         let d = body_with(&STREAMS[..1]);
+        assert!(RecordMap::parse(&d, 2).is_none());
+    }
+
+    #[test]
+    fn a_record_count_the_data_cannot_hold_is_rejected() {
+        let mut d = body();
+        // The first stream's count, 13 bytes into its header.
+        let at = find(&d, &[1, 2, 3, 4]) + 13;
+        d[at..at + 4].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
         assert!(RecordMap::parse(&d, 2).is_none());
     }
 

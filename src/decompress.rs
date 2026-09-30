@@ -63,7 +63,18 @@ pub fn decompress(raw: &[u8]) -> Result<Decompressed> {
         // was understood.
         let frames = match &container {
             Some(c) if c.complete => c.frames.clone(),
-            _ => locate_frames(raw, header_end),
+            Some(_) => {
+                // The walk found the file ends early. A last frame the end
+                // cuts off is left out, so the rest still reads.
+                let mut frames = locate_frames(raw, header_end);
+                if frames.last().is_some_and(|&(from, _)| {
+                    zstd_safe::find_frame_compressed_size(&raw[from..]).is_err()
+                }) {
+                    frames.pop();
+                }
+                frames
+            }
+            None => locate_frames(raw, header_end),
         };
         if let Some(c) = container
             .as_mut()
@@ -97,8 +108,17 @@ fn chunked_container(
     header_end: usize,
     declared_frames: u32,
 ) -> (Option<FrameIndex>, Option<Container>) {
+    // Without a frame count from the prelude, only where the compressed data
+    // starts bounds the index.
+    let end = match declared_frames {
+        0 => raw
+            .get(header_end..)
+            .and_then(|rest| memmem::find(rest, &ZSTD_MAGIC))
+            .map_or(raw.len(), |i| header_end + i),
+        _ => raw.len(),
+    };
     let frame_index = raw
-        .get(header_end..)
+        .get(header_end..end)
         .and_then(|b| format::read_frame_index(b, declared_frames));
     let container = frame_index
         .as_ref()
@@ -174,4 +194,33 @@ fn decompress_frame(frame: &[u8]) -> Result<Vec<u8>> {
         .single_frame();
     decoder.read_to_end(&mut out).map_err(Error::Decompress)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An index claiming `claimed` frames but holding `real`, then a zstd
+    /// frame and zeros enough to look like more entries.
+    fn file_with_index(claimed: u32, real: u32) -> Vec<u8> {
+        let mut raw = b"header".to_vec();
+        raw.extend([0; 8]);
+        raw.extend(claimed.to_le_bytes());
+        for i in 0..real {
+            raw.extend(i.to_le_bytes());
+            raw.extend((f64::from(i) / 30.0).to_le_bytes());
+        }
+        raw.extend(zstd::bulk::compress(b"body", 1).unwrap());
+        raw.extend(vec![0; 20_000]);
+        raw
+    }
+
+    #[test]
+    fn without_a_frame_count_the_index_ends_where_compressed_data_starts() {
+        // 1000 entries do not fit before the zstd frame, so this is no index.
+        let raw = file_with_index(1000, 3);
+        assert!(chunked_container(&raw, 6, 0).0.is_none());
+        let raw = file_with_index(3, 3);
+        assert_eq!(chunked_container(&raw, 6, 0).0.unwrap().times.len(), 3);
+    }
 }

@@ -138,6 +138,8 @@ pub enum DirectoryState {
     Damaged,
     /// The file ends before it.
     Missing,
+    /// Not read: the stream list before it was not recognised.
+    NotRead,
 }
 
 struct Reader<'a> {
@@ -207,6 +209,7 @@ pub fn map(raw: &[u8], list_start: usize) -> Container {
     r.pos += 12;
     let n = r.u32().unwrap_or(0);
     if n == 0 || n > MAX_STREAMS {
+        c.directory = DirectoryState::NotRead;
         c.warnings
             .push(format!("stream list claims {n} streams; not mapped"));
         return c;
@@ -364,6 +367,12 @@ pub fn map(raw: &[u8], list_start: usize) -> Container {
         r.pos = end;
     }
 
+    // A walk that reached the end without every stream's data means the file
+    // ends early, right there.
+    if c.truncated_at.is_none() && (c.main.is_none() || runs.len() < c.streams.len()) {
+        c.truncated_at = Some(raw.len() as u64);
+    }
+
     // Snapshots come in stream-list order.
     if runs.len() > c.streams.len() {
         c.warnings.push(format!(
@@ -402,7 +411,7 @@ pub fn map(raw: &[u8], list_start: usize) -> Container {
     c.recording_id = main_id.or_else(|| first_id.and_then(|i| i.checked_sub(1)));
     let mut ids: Vec<u32> = c.streams.iter().map(|s| s.id).collect();
     ids.sort_unstable();
-    let consecutive = ids.windows(2).all(|w| w[1] == w[0] + 1);
+    let consecutive = ids.windows(2).all(|w| w[0].checked_add(1) == Some(w[1]));
     if !consecutive || (main_id.is_some() && first_id.map(|i| i.wrapping_sub(1)) != main_id) {
         c.warnings.push(format!(
             "stream ids {ids:?} do not follow main stream id {main_id:?} one by one"
@@ -591,6 +600,21 @@ mod tests {
     }
 
     #[test]
+    fn a_file_ending_after_its_snapshots_says_where_it_ends() {
+        let (raw, list_start) = Builder::new().build();
+        let full = map(&raw, list_start);
+        let cut = full.main.unwrap().offset as usize - DESCRIPTOR;
+        let c = map(&raw[..cut], list_start);
+        assert!(!c.complete);
+        assert_eq!(c.truncated_at, Some(cut as u64));
+        assert!(
+            c.warnings.iter().any(|w| w.contains("main stream")),
+            "{:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
     fn a_file_cut_inside_a_block_is_incomplete() {
         let (raw, list_start) = Builder::new().build();
         let c = map(&raw[..raw.len() - 5], list_start);
@@ -605,7 +629,23 @@ mod tests {
         let c = map(&raw, list_start);
         assert!(!c.complete);
         assert!(c.streams.is_empty());
+        assert_eq!(c.directory, DirectoryState::NotRead);
         assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn garbage_stream_ids_are_reported_not_overflowed() {
+        let mut b = Builder::new();
+        b.streams[0].0 = u32::MAX;
+        b.streams[1].0 = u32::MAX;
+        b.main_id = u32::MAX;
+        let (raw, list_start) = b.build();
+        let c = map(&raw, list_start);
+        assert!(
+            c.warnings.iter().any(|w| w.contains("stream ids")),
+            "{:?}",
+            c.warnings
+        );
     }
 
     #[test]

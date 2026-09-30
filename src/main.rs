@@ -41,6 +41,11 @@ struct Cli {
     /// name history, matches with and against you, and likely queue-mates.
     #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list"])]
     players: bool,
+    /// Print the decoder profiles and tested builds: a stored round whose
+    /// `(decoder, decoderRevision)` differs from its build's profile here
+    /// would decode differently now.
+    #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list", "players"])]
+    decoders: bool,
     /// Log debug information to stderr.
     #[arg(short, long)]
     debug: bool,
@@ -73,7 +78,9 @@ fn main() -> Result<()> {
         census: cli.census,
     };
 
-    if cli.players {
+    if cli.decoders {
+        write_json(&mut out, &replay_analyzer::decoder::table(), cli.pretty)?;
+    } else if cli.players {
         let dir = cli.input.as_ref().filter(|_| is_dir);
         let dir = dir.context("--players needs a folder")?;
         write_json(&mut out, &players(dir)?, cli.pretty)?;

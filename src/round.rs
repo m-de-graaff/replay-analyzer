@@ -845,11 +845,18 @@ impl<'a> Parser<'a> {
                 .warn("header only: names from the header, no operators");
         } else if h.players.is_empty() {
             f.at_most(Status::Missing);
-        } else if with_op < h.players.len() || h.players.len() != 10 {
-            f.at_most(Status::Partial).warn(format!(
-                "{} players, {with_op} with an operator",
-                h.players.len()
-            ));
+        } else {
+            let seats = h.max_players_per_team.map_or(10, |n| 2 * n as usize);
+            let n = h.players.len();
+            if with_op < n || n > seats {
+                f.at_most(Status::Partial)
+                    .warn(format!("{n} players, {with_op} with an operator"));
+            } else if n < seats {
+                // Every player listed was read; the round just had fewer.
+                f.warn(format!(
+                    "{n} players in a round for {seats}: a player left or never joined"
+                ));
+            }
         }
         for w in self.failures(&[Packet::Player, Packet::AttackerSwap]) {
             f.at_most(Status::Partial).warn(w);
@@ -1021,11 +1028,18 @@ impl<'a> Parser<'a> {
                 .iter()
                 .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
                 .count();
+            // A player's own recording leaves their body out of the player
+            // table; spectator recordings link every body.
+            let own_body_missing = players.iter().any(|p| {
+                p.relation == Some(crate::entities::Relation::You)
+                    && p.entities.as_ref().is_some_and(|e| e.movement.is_none())
+            });
+            let expected = with - usize::from(own_body_missing);
             let f = r.field(
                 "movement",
                 if moving == 0 {
                     Status::NotInVersion
-                } else if moving < with {
+                } else if moving < expected {
                     Status::Partial
                 } else {
                     Status::Decoded
@@ -1034,6 +1048,10 @@ impl<'a> Parser<'a> {
             );
             if moving == 0 {
                 f.warn("no player table linking bodies to players (seen from Y11S3)");
+            } else if own_body_missing {
+                f.warn(
+                    "the recording player's own body is not linked: their own recordings leave it out of the player table",
+                );
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
@@ -1159,7 +1177,7 @@ impl<'a> Parser<'a> {
             })
             .count();
         if unnamed > 0 {
-            r.field("defuserPlayers", Status::Partial, unnamed).warn(
+            r.field("defuserPlayers", Status::NotInVersion, unnamed).warn(
                 "Y11S3+ defuser events record the side, not the player; named only when one player of that side was alive",
             );
         }
@@ -2654,6 +2672,79 @@ fn owning_object(before: &[u8], marker_len: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::PlayerEntities;
+    use crate::types::Operator;
+
+    /// A player's own recording of a 5v5 round: `players` players, each
+    /// with an operator and a controller, and every body linked but the
+    /// recorder's (player 0), as the game writes it.
+    fn own_recording(players: usize) -> Header {
+        let mut h = Header {
+            code_version: version::Y9S4,
+            is_spectator: Some(false),
+            max_players_per_team: Some(5),
+            ..Header::default()
+        };
+        for i in 0..players {
+            h.players.push(Player {
+                id: i as u64 + 1,
+                username: format!("p{i}"),
+                team_index: usize::from(i >= 5),
+                operator: Operator(92270642500),
+                relation: Some(if i == 0 {
+                    crate::entities::Relation::You
+                } else {
+                    crate::entities::Relation::Teammate
+                }),
+                entities: Some(PlayerEntities {
+                    controller: 0xF000_0000 + i as u32,
+                    movement: (i != 0).then_some(0xF100_0000 + i as u32),
+                    ..PlayerEntities::default()
+                }),
+                ..Player::default()
+            });
+        }
+        h
+    }
+
+    fn report(header: Header) -> DecodeReport {
+        let mut p = Parser::new(&[], header);
+        p.finish_report(ReadMode::Full);
+        p.round.decode
+    }
+
+    #[test]
+    fn the_recorders_own_body_is_not_counted_against_movement() {
+        let r = report(own_recording(10));
+        let f = r.get("movement").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 9));
+        assert!(f.warnings.iter().any(|w| w.contains("own body")), "{f:?}");
+        // Another player's missing body still is.
+        let mut h = own_recording(10);
+        h.players[3].entities.as_mut().unwrap().movement = None;
+        assert_eq!(report(h).get("movement").unwrap().status, Status::Partial);
+    }
+
+    #[test]
+    fn a_round_short_of_players_is_decoded_when_every_player_is() {
+        let f = report(own_recording(9)).get("players").cloned().unwrap();
+        assert_eq!(f.status, Status::Decoded);
+        assert!(f.warnings.iter().any(|w| w.contains("left")), "{f:?}");
+        let mut h = own_recording(10);
+        h.players[4].operator = Operator::default();
+        assert_eq!(report(h).get("players").unwrap().status, Status::Partial);
+    }
+
+    #[test]
+    fn unnamed_defuser_players_are_not_in_the_version() {
+        let mut p = Parser::new(&[], own_recording(10));
+        let mut u = p.update(MatchUpdateType::DefuserPlantStart, "");
+        u.team = Some(0);
+        p.push(u);
+        p.finish_report(ReadMode::Full);
+        let f = p.round.decode.get("defuserPlayers").unwrap();
+        assert_eq!((f.status, f.count), (Status::NotInVersion, 1));
+    }
 
     /// `scan` relies on markers never overlapping: no marker may contain
     /// another, or end with the start of another.

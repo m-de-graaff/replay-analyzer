@@ -8,6 +8,7 @@ use serde::{Serialize, Serializer};
 
 use crate::cursor::Cursor;
 use crate::error::{Error, Result};
+use crate::format::{self, FormatInfo};
 use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, version};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -42,7 +43,87 @@ pub struct Header {
     pub playlist_category: i64,
     #[serde(rename = "matchID")]
     pub match_id: String,
+    /// When the recording started, UTC (Y11S3+ `starttime`). `timestamp` is
+    /// the recording PC's local time.
+    #[serde(
+        serialize_with = "rfc3339_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start_time: Option<DateTime<Utc>>,
+    /// Whether a spectator recorded the match (Y11S3+ `isspectator`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_spectator: Option<bool>,
+    /// Y11S3+ `maxnbplayersperteam`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_players_per_team: Option<u32>,
+    /// Y11S3+ `matchresult`, written only on the round that decides the
+    /// match. Its value matched the winning team's index in the one sample
+    /// seen, so it is kept raw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_result: Option<u32>,
+    /// When the recording stopped, UTC (Y11S3+ `endtime`).
+    #[serde(
+        serialize_with = "rfc3339_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end_time: Option<DateTime<Utc>>,
+    /// Every header key read, with how often it appeared.
+    #[serde(skip)]
+    pub keys: Vec<(String, u32)>,
 }
+
+/// Header keys this parser uses. Others are kept only in the census.
+pub const KNOWN_KEYS: &[&str] = &[
+    "version",
+    "code",
+    "datetime",
+    "matchtype",
+    "worldid",
+    "recordingplayerid",
+    "recordingprofileid",
+    "additionaltags",
+    "gamemodeid",
+    "roundspermatch",
+    "roundspermatchovertime",
+    "roundnumber",
+    "overtimeroundnumber",
+    "teamname0",
+    "teamname1",
+    "teamscore0",
+    "teamscore1",
+    "startingteamscore0",
+    "startingteamscore1",
+    "gmsetting",
+    "playlistcategory",
+    "id",
+    "endtime",
+    "starttime",
+    "isspectator",
+    "maxnbplayersperteam",
+    "matchresult",
+    "profileid",
+    "playerid",
+    "playername",
+    "team",
+    "heroname",
+    "alliance",
+    "roleimage",
+    "rolename",
+    "roleportrait",
+];
+
+/// Keys that describe one player; a run of them follows each `playerid`.
+const PLAYER_KEYS: &[&str] = &[
+    "playerid",
+    "profileid",
+    "playername",
+    "team",
+    "heroname",
+    "alliance",
+    "roleimage",
+    "rolename",
+    "roleportrait",
+];
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +160,10 @@ pub struct Player {
     pub role_portrait: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub spawn: String,
+    /// Y11S3+, from the round's opening snapshot. Most likely the clearance
+    /// level; see `decodeStatus.levels`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<u32>,
     /// The 4-byte id packets use to refer to this player.
     #[serde(skip)]
     pub dissect_id: Option<[u8; 4]>,
@@ -103,6 +188,18 @@ fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
 
+/// A Unix time in milliseconds.
+fn millis(value: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(value?.parse().ok()?)
+}
+
+fn rfc3339_opt<S: Serializer>(t: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => rfc3339(t, s),
+        None => s.serialize_none(),
+    }
+}
+
 fn rfc3339<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
     s.collect_str(&t.format("%Y-%m-%dT%H:%M:%SZ"))
 }
@@ -110,19 +207,25 @@ fn rfc3339<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 const STRING_SEPARATOR: [u8; 7] = [0; 7];
 
 /// Parses the header at the start of `data` (which begins with `dissect`).
-/// Returns the header and the offset just past it.
-pub fn parse(data: &[u8]) -> Result<(Header, usize)> {
+/// Returns the header, the prelude, and the offset just past the header.
+pub fn parse(data: &[u8]) -> Result<(Header, FormatInfo, usize)> {
     let mut c = Cursor::new(data, 0);
-    if c.bytes(7).map_err(|_| Error::InvalidFile)? != b"dissect" {
+    if !data.starts_with(format::MAGIC) {
         return Err(Error::InvalidFile);
     }
-    skip_version_block(&mut c)?;
-    let header = read_properties(&mut c)?;
-    Ok((header, c.pos()))
+    let prelude = format::read_prelude(&mut c);
+    if prelude.is_none() {
+        tracing::warn!("unrecognised prelude; scanning for the header properties");
+        c.skip(7)?;
+        skip_version_block(&mut c)?;
+    }
+    let count = prelude.as_ref().map(|p| p.property_count);
+    let header = read_properties(&mut c, count)?;
+    Ok((header, prelude.unwrap_or_default(), c.pos()))
 }
 
-/// The meaning of the bytes after the magic is unknown. The properties start
-/// after the second run of seven zero bytes.
+/// Fallback for an unrecognised prelude: the properties start after the
+/// second run of seven zero bytes.
 fn skip_version_block(c: &mut Cursor) -> Result<()> {
     let (mut zeros, mut runs) = (0, 0);
     while runs < 2 {
@@ -154,21 +257,34 @@ fn parse_num<T: FromStr>(key: &str, value: &str) -> Result<T> {
     })
 }
 
-fn read_properties(c: &mut Cursor) -> Result<Header> {
+/// Reads `count` properties, or up to `teamscore1` (the last one before
+/// Y11S3) when the count is unknown.
+fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
     let mut props: HashMap<String, String> = HashMap::new();
     let mut gm_settings = Vec::new();
     let mut players = Vec::new();
     // `Some` while inside a run of player properties.
     let mut player: Option<Player> = None;
+    let mut keys: Vec<(String, u32)> = Vec::new();
+    let mut read = 0;
 
-    // The last property in the header is always `teamscore1`.
-    while !props.contains_key("teamscore1") {
+    while match count {
+        Some(n) => read < n,
+        None => !props.contains_key("teamscore1"),
+    } {
         let key = read_string(c)?;
         let value = read_string(c)?;
+        read += 1;
+        match keys.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => keys.push((key.clone(), 1)),
+        }
 
         if key == "playerid" {
             players.extend(player.replace(Player::default()));
-        } else if key == "playlistcategory" || key == "id" {
+        } else if !PLAYER_KEYS.contains(&key.as_str()) {
+            // Y11S3 writes the players first, then the match properties;
+            // older builds end the player run with `playlistcategory` or `id`.
             players.extend(player.take());
         }
 
@@ -183,6 +299,7 @@ fn read_properties(c: &mut Cursor) -> Result<Header> {
         match key.as_str() {
             "playerid" => p.id = parse_num(&key, &value)?,
             "playername" => p.username = value,
+            "profileid" => p.profile_id = value,
             "team" => p.team_index = parse_num(&key, &value)?,
             "heroname" => p.hero_name = parse_num(&key, &value)?,
             "alliance" => p.alliance = parse_num(&key, &value)?,
@@ -222,6 +339,17 @@ fn read_properties(c: &mut Cursor) -> Result<Header> {
         }
     }
 
+    // Sides from the operator icons in the header; full reads refine these
+    // from the pick packets.
+    let side = players.iter().filter(|p| p.team_index < 2).find_map(|p| {
+        let op = Operator::from_role_image(u64::try_from(p.role_image).ok()?)?;
+        Some((p.team_index, op.role()?))
+    });
+    if let Some((team, role)) = side {
+        teams[team].role = Some(role);
+        teams[team ^ 1].role = Some(role.opposite());
+    }
+
     Ok(Header {
         game_version: get("version").unwrap_or_default().to_owned(),
         code_version,
@@ -245,5 +373,11 @@ fn read_properties(c: &mut Cursor) -> Result<Header> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         match_id: get("id").unwrap_or_default().to_owned(),
+        start_time: millis(get("starttime")),
+        is_spectator: get("isspectator").map(|v| v == "1"),
+        max_players_per_team: get("maxnbplayersperteam").and_then(|v| v.parse().ok()),
+        match_result: get("matchresult").and_then(|v| v.parse().ok()),
+        end_time: millis(get("endtime")),
+        keys,
     })
 }

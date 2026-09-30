@@ -1,5 +1,6 @@
 use serde::{Serialize, Serializer};
 
+use crate::details::Phase;
 use crate::types::Operator;
 
 /// What happened in a [`MatchUpdate`].
@@ -65,11 +66,29 @@ pub struct MatchUpdate {
     pub time_in_seconds: f64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
+    /// The operator swapped to, for `OperatorSwap`.
     #[serde(skip_serializing_if = "Operator::is_empty")]
     pub operator: Operator,
+    /// The operator swapped from, for `OperatorSwap`.
+    #[serde(skip_serializing_if = "Operator::is_empty")]
+    pub previous_operator: Operator,
     /// The weapon or gadget id behind a kill.
     #[serde(skip_serializing_if = "is_zero")]
     pub weapon: u64,
+    /// Team the event belongs to when no player is named: Y11S3 defuser
+    /// events carry the side (plant: attackers, disable: defenders) but not
+    /// the player.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<usize>,
+    pub phase: Phase,
+    /// Seconds since the prep phase started: one clock for the whole round,
+    /// across the prep, action and defuser timers.
+    #[serde(serialize_with = "whole_number_as_int")]
+    pub elapsed: f64,
+    /// Index of the clock tick the event was read at; resolved into `time`,
+    /// `phase` and `elapsed` once the whole round is read.
+    #[serde(skip)]
+    pub tick: Option<usize>,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -87,7 +106,12 @@ impl MatchUpdate {
             time_in_seconds: clock.seconds,
             message: String::new(),
             operator: Operator::default(),
+            previous_operator: Operator::default(),
             weapon: 0,
+            team: None,
+            phase: Phase::default(),
+            elapsed: 0.0,
+            tick: clock.tick,
         }
     }
 
@@ -119,4 +143,12 @@ pub(crate) fn whole_number_as_int<S: Serializer>(v: &f64, s: S) -> Result<S::Ok,
 pub struct Clock {
     pub seconds: f64,
     pub display: String,
+    /// Index of this reading in the round's clock track.
+    pub tick: Option<usize>,
+}
+
+/// `m:ss` for a whole number of seconds.
+pub fn display_clock(seconds: f64) -> String {
+    let t = seconds.max(0.0) as u32;
+    format!("{}:{:02}", t / 60, t % 60)
 }

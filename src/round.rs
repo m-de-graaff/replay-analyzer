@@ -8,15 +8,22 @@ use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::census::{self, Census, PacketCount};
 use crate::cursor::Cursor;
+use crate::decoder::ParserInfo;
 use crate::decompress::{self, Decompressed};
 use crate::details::{
     Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
 };
 use crate::error::{Error, Result};
-use crate::feedback::{Clock, MatchUpdate, MatchUpdateType};
+use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
+use crate::file::{self, FileInfo};
+use crate::format::{ClockGap, FormatInfo, GameVersion, Timing};
 use crate::header::{Header, Player};
+use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
+use crate::report::{DecodeReport, Status};
 use crate::stats::PlayerRoundStats;
+use crate::timeline::Timeline;
 use crate::types::{ObservationTool, Operator, TeamRole, WinCondition, version};
 
 /// A fully parsed round.
@@ -36,6 +43,26 @@ pub struct Round {
     pub observation: Vec<ObservationSession>,
     /// What each player carried, once per operator they played.
     pub loadouts: Vec<Loadout>,
+    /// The file the round was read from, when read from disk.
+    pub file: Option<FileInfo>,
+    /// Container layout and prelude.
+    pub format: FormatInfo,
+    /// Season and build, from the header.
+    pub version: GameVersion,
+    /// Parser and decoder that produced this round.
+    pub parser: ParserInfo,
+    /// Number of zstd frames in the file.
+    pub zstd_frames: usize,
+    /// Recording rate and holes, from the frame index and the clock.
+    pub timing: Option<Timing>,
+    /// Trust level of each output field.
+    pub decode: DecodeReport,
+    /// Counts of every packet and field seen (only with `ReadOptions::census`).
+    pub census: Option<Census>,
+    /// The round clock resolved into phases and seconds since prep started.
+    pub timeline: Timeline,
+    /// Who won, how, and who was alive when action started (full reads).
+    pub outcome: RoundOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,25 +83,75 @@ pub enum ReadMode {
     /// Only the first third of the replay: enough for the header and player
     /// list, much faster. Attacker operator swaps and the result are missing.
     Partial,
+    /// Only the header and frame index. Y8S4+ replays are not decompressed,
+    /// so this is the fast way to list and group many files. Players have no
+    /// operators and no packet data is read.
+    Header,
+}
+
+/// What to read, beyond the round itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub mode: ReadMode,
+    /// Also count every packet marker and property hash in the stream.
+    pub census: bool,
+}
+
+impl From<ReadMode> for ReadOptions {
+    fn from(mode: ReadMode) -> Self {
+        ReadOptions {
+            mode,
+            census: false,
+        }
+    }
 }
 
 impl Round {
-    pub fn open(path: impl AsRef<Path>, mode: ReadMode) -> Result<Self> {
-        Self::from_bytes(&std::fs::read(path)?, mode)
+    /// Reads a finished round file. In-progress `.tmprec` recordings are
+    /// refused.
+    pub fn open(path: impl AsRef<Path>, options: impl Into<ReadOptions>) -> Result<Self> {
+        let path = path.as_ref();
+        if file::is_temporary(path) {
+            return Err(Error::TemporaryFile(path.display().to_string()));
+        }
+        let raw = std::fs::read(path)?;
+        let mut round = Self::from_bytes(&raw, options)?;
+        round.file = Some(FileInfo::new(path, &raw));
+        Ok(round)
     }
 
-    pub fn from_bytes(raw: &[u8], mode: ReadMode) -> Result<Self> {
+    pub fn from_bytes(raw: &[u8], options: impl Into<ReadOptions>) -> Result<Self> {
+        let options = options.into();
+        let read = if options.mode == ReadMode::Header {
+            decompress::header_only
+        } else {
+            decompress::decompress
+        };
         let Decompressed {
             data,
             header,
             body_start,
-        } = decompress::decompress(raw)?;
-        Ok(Parser::new(&data, header).run(body_start, mode))
+            format,
+            zstd_frames,
+            frame_index,
+        } = read(raw)?;
+        let mut parser = Parser::new(&data, header);
+        parser.round.format = format;
+        parser.round.zstd_frames = zstd_frames;
+        parser.round.timing = frame_index.as_ref().map(Timing::from_index);
+        if let Some(index) = frame_index.filter(|i| i.out_of_order > 0) {
+            parser.round.decode.warnings.push(format!(
+                "{} frame index entries out of order",
+                index.out_of_order
+            ));
+        }
+        Ok(parser.run(body_start, options))
     }
 
-    /// Parses only the header, without scanning packets.
+    /// Parses only the header, without scanning packets. Y8S4+ replays are
+    /// not decompressed at all.
     pub fn header_only(raw: &[u8]) -> Result<Header> {
-        Ok(decompress::decompress(raw)?.header)
+        Ok(decompress::header_only(raw)?.header)
     }
 
     pub fn player_index_by_id(&self, id: [u8; 4]) -> Option<usize> {
@@ -112,6 +189,7 @@ impl Serialize for Round {
         struct Output<'a> {
             #[serde(flatten)]
             header: &'a Header,
+            round: RoundInfo,
             match_feedback: &'a [MatchUpdate],
             stats: Vec<PlayerRoundStats>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -124,9 +202,16 @@ impl Serialize for Round {
             observation: &'a [ObservationSession],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             loadouts: &'a [Loadout],
+            replay: ReplayInfo<'a>,
+            decode_status: &'a DecodeReport,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timing: Option<&'a Timing>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            census: Option<&'a Census>,
         }
         Output {
             header: &self.header,
+            round: self.info(),
             match_feedback: &self.match_feedback,
             stats: self.player_stats(),
             bans: &self.bans,
@@ -134,8 +219,36 @@ impl Serialize for Round {
             life_events: &self.life_events,
             observation: &self.observation,
             loadouts: &self.loadouts,
+            replay: self.replay_info(),
+            decode_status: &self.decode,
+            timing: self.timing.as_ref(),
+            census: self.census.as_ref(),
         }
         .serialize(s)
+    }
+}
+
+/// Where a round came from and what read it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayInfo<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<&'a FileInfo>,
+    pub format: &'a FormatInfo,
+    pub version: &'a GameVersion,
+    pub parser: &'a ParserInfo,
+    pub zstd_frames: usize,
+}
+
+impl Round {
+    pub fn replay_info(&self) -> ReplayInfo<'_> {
+        ReplayInfo {
+            file: self.file.as_ref(),
+            format: &self.format,
+            version: &self.version,
+            parser: &self.parser,
+            zstd_frames: self.zstd_frames,
+        }
     }
 }
 
@@ -157,9 +270,36 @@ enum Packet {
     ObservedOwner,
     ObservationTool,
     Item,
+    DefuserAction,
 }
 
-const PACKETS: [(Packet, &[u8]); 15] = [
+impl Packet {
+    const COUNT: usize = 17;
+
+    fn name(self) -> &'static str {
+        match self {
+            Packet::Player => "player",
+            Packet::AttackerSwap => "attackerSwap",
+            Packet::Spawn => "spawn",
+            Packet::Time => "time",
+            Packet::LegacyTime => "legacyTime",
+            Packet::Feedback => "feedback",
+            Packet::DefuserTimer => "defuserTimer",
+            Packet::ScoreboardScore => "scoreboardScore",
+            Packet::ScoreboardAssists => "scoreboardAssists",
+            Packet::RoleImage => "roleImage",
+            Packet::Health => "health",
+            Packet::LifeState => "lifeState",
+            Packet::Observer => "observer",
+            Packet::ObservedOwner => "observedOwner",
+            Packet::ObservationTool => "observationTool",
+            Packet::Item => "item",
+            Packet::DefuserAction => "defuserAction",
+        }
+    }
+}
+
+const PACKETS: [(Packet, &[u8]); 16] = [
     (Packet::Player, &[0x22, 0x07, 0x94, 0x9B, 0xDC]),
     (Packet::AttackerSwap, &[0x22, 0xA9, 0x26, 0x0B, 0xE4]),
     (Packet::Spawn, &[0xAF, 0x98, 0x99, 0xCA]),
@@ -174,9 +314,44 @@ const PACKETS: [(Packet, &[u8]); 15] = [
     (Packet::ObservedOwner, &[0x5B, 0xE8, 0x47, 0x28]),
     (Packet::ObservationTool, &[0x06, 0x6B, 0xC0, 0xA1]),
     (Packet::Item, &[0x0E, 0x9E, 0xBE, 0x88]),
+    (Packet::DefuserAction, &DEFUSER_ACTION),
     (Packet::Time, &[0x1F, 0x07, 0xEF, 0xC9]),
 ];
 const LEGACY_TIME: &[u8] = &[0x1E, 0xF1, 0x11, 0xAB];
+
+/// Every property hash the parser reads in a replay of this age, for the
+/// census.
+fn known_fields(legacy: bool) -> Vec<(&'static str, [u8; 4])> {
+    let hash = |m: &[u8]| -> [u8; 4] {
+        let m = if m.len() == 5 && m[0] == 0x22 {
+            &m[1..]
+        } else {
+            &m[..4]
+        };
+        m.try_into().expect("4 bytes")
+    };
+    let time = if legacy {
+        (Packet::LegacyTime, LEGACY_TIME)
+    } else {
+        PACKETS[PACKETS.len() - 1]
+    };
+    let mut out: Vec<_> = PACKETS[..PACKETS.len() - 1]
+        .iter()
+        .chain([&time])
+        .map(|(p, m)| (p.name(), hash(m)))
+        .collect();
+    out.extend([
+        ("profileId", hash(PROFILE_ID_INDICATOR)),
+        ("uiId", hash(UI_ID_INDICATOR)),
+        ("currentSite", hash(&CURRENT_SITE)),
+        ("killer", hash(&KILL_INDICATOR)),
+        ("killWeapon", hash(&KILL_WEAPON)),
+        ("playerState", STATE_PROPERTY),
+        ("itemIcon", hash(&ITEM_ICON)),
+        ("banRole", hash(BAN_ROLE)),
+    ]);
+    out
+}
 
 /// One multi-pattern automaton per clock format, built once.
 static SCANNERS: LazyLock<[(Vec<Packet>, AhoCorasick); 2]> = LazyLock::new(|| {
@@ -236,6 +411,25 @@ const BAN_ROLE: &[u8] = &[0x18, 0xFF, 0xCA, 0x5E];
 /// How far after an icon to look for a ban slot's side. Older replays put one
 /// more object in between; player icons are thousands of bytes from a ban.
 const BAN_WINDOW: usize = 160;
+/// Y11S3+: the team that owns a ban slot, 1-based, written right after its
+/// side.
+const BAN_TEAM: [u8; 5] = [0x22, 0x2E, 0x61, 0xA2, 0xA9];
+/// Y11S3+: a player's level as decimal text, on the object carrying their
+/// name. Written once in the round's opening snapshot.
+const PLAYER_LEVEL: [u8; 5] = [0x22, 0x3F, 0x0F, 0xDC, 0x1F];
+/// Name property on the same object, just before the level.
+const PLAYER_NAME: [u8; 8] = [0x75, 0x6D, 0x39, 0xD4, 0x00, 0x00, 0x00, 0x00];
+/// The opening snapshot, where levels are written, fits well within this.
+const SNAPSHOT_BYTES: usize = 4 << 20;
+/// A countdown step longer than this many seconds skipped time.
+const CLOCK_GAP: f64 = 2.0;
+/// Y11S3+: what a defuser interaction object is doing: 0 planting,
+/// 1 disabling, 2 idle. Written on the object that also carries the
+/// countdown text (`DefuserTimer`), which runs from 7.000 down to 0.
+const DEFUSER_ACTION: [u8; 4] = [0xE5, 0x8C, 0x06, 0xE9];
+/// A countdown that stopped at or below this many seconds finished: at ~30
+/// samples a second the last sample written is 0.000 to 0.07.
+const DEFUSER_DONE: f64 = 0.1;
 
 struct Parser<'a> {
     data: &'a [u8],
@@ -244,7 +438,15 @@ struct Parser<'a> {
     last_defuser: Option<usize>,
     planted: bool,
     players_read: u32,
-    timeline: Timeline,
+    /// Distinct clock readings in stream order; events keep an index into it.
+    readings: Vec<f64>,
+    /// Tick at which the plant completed.
+    plant_tick: Option<usize>,
+    /// Y11S3+ defuser interaction objects: what each is doing and the last
+    /// countdown value it showed.
+    interactions: HashMap<u32, Interaction>,
+    /// Last health each player showed before action started.
+    health_before_action: HashMap<String, u32>,
     /// `players_read` -> username of the player picked at that count.
     pick_slots: HashMap<u32, String>,
     /// Object id -> `players_read` when the object first appeared. Players'
@@ -257,6 +459,14 @@ struct Parser<'a> {
     /// Items sent since the last pick or swap, which they belong to.
     pending_items: Vec<Item>,
     seen_items: std::collections::HashSet<u32>,
+    /// `(seen, failed)` per packet kind.
+    packet_counts: [(u32, u32); Packet::COUNT],
+    /// First error per packet kind.
+    packet_errors: [Option<String>; Packet::COUNT],
+    warnings: Vec<String>,
+    clock_gaps: Vec<ClockGap>,
+    /// Whether the clock has switched to the defuser timer since the plant.
+    defuser_clock: bool,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -267,42 +477,24 @@ struct Item {
     icon: u64,
 }
 
-/// Round time that keeps counting across the prep -> action clock reset.
-#[derive(Default)]
-struct Timeline {
-    last: Option<f64>,
-    elapsed: f64,
-    phase: Phase,
-}
-
-impl Timeline {
-    /// Action phases start well above the 45 second prep phase.
-    const ACTION_START: f64 = 50.0;
-
-    fn tick(&mut self, seconds: f64) {
-        match self.last {
-            Some(last) if seconds < last => self.elapsed += last - seconds,
-            Some(last) if seconds > last + 1.0 => {
-                self.phase = if seconds > Self::ACTION_START {
-                    Phase::Action
-                } else {
-                    Phase::Prep
-                };
-            }
-            None if seconds > Self::ACTION_START => self.phase = Phase::Action,
-            _ => {}
-        }
-        self.last = Some(seconds);
-    }
+/// A Y11S3+ defuser interaction in progress.
+#[derive(Clone, Copy, Default)]
+struct Interaction {
+    /// `DefuserPlantStart` or `DefuserDisableStart` while one runs.
+    active: Option<MatchUpdateType>,
+    remaining: f64,
+    /// Clock tick of the last countdown value: when a finished plant or
+    /// disable actually finished. The object goes idle only after the game
+    /// has moved on (for a plant, after the clock switched to the defuser
+    /// timer).
+    last_tick: Option<usize>,
 }
 
 /// A per-player object property, resolved to a player after the stream is read.
 struct Sample {
     object: u32,
     value: SampleValue,
-    clock: Clock,
-    elapsed: f64,
-    phase: Phase,
+    tick: Option<usize>,
 }
 
 enum SampleValue {
@@ -323,7 +515,10 @@ impl<'a> Parser<'a> {
             last_defuser: None,
             planted: false,
             players_read: 0,
-            timeline: Timeline::default(),
+            readings: Vec::new(),
+            plant_tick: None,
+            interactions: HashMap::new(),
+            health_before_action: HashMap::new(),
             pick_slots: HashMap::new(),
             health_objects: HashMap::new(),
             observers: HashMap::new(),
@@ -331,7 +526,17 @@ impl<'a> Parser<'a> {
             samples: Vec::new(),
             pending_items: Vec::new(),
             seen_items: Default::default(),
+            packet_counts: [(0, 0); Packet::COUNT],
+            packet_errors: Default::default(),
+            warnings: Vec::new(),
+            clock_gaps: Vec::new(),
+            defuser_clock: false,
         }
+    }
+
+    fn warn(&mut self, message: String) {
+        tracing::warn!("{message}");
+        self.warnings.push(message);
     }
 
     fn code(&self) -> u32 {
@@ -342,28 +547,395 @@ impl<'a> Parser<'a> {
         &mut self.round.header.players
     }
 
-    fn run(mut self, start: usize, mode: ReadMode) -> Round {
+    fn run(mut self, start: usize, options: ReadOptions) -> Round {
+        let mode = options.mode;
+        if mode == ReadMode::Header {
+            self.finish_report(mode);
+            return self.round;
+        }
         let end = match mode {
             ReadMode::Full => self.data.len(),
             ReadMode::Partial => (self.data.len() / 3).max(start),
+            ReadMode::Header => start,
         };
         let (packets, scanner) = &SCANNERS[usize::from(self.code() < version::Y8S1)];
         // Handlers run in stream order but never depend on each other's cursor.
         for (offset, pattern) in scan(scanner, &self.data[start..end]) {
             let packet = packets[pattern];
             let mut c = Cursor::new(self.data, start + offset);
+            self.packet_counts[packet as usize].0 += 1;
             if let Err(e) = self.dispatch(packet, &mut c) {
                 tracing::debug!(?packet, offset = start + offset, error = %e, "skipping packet");
+                self.packet_counts[packet as usize].1 += 1;
+                self.packet_errors[packet as usize]
+                    .get_or_insert_with(|| format!("at {}: {e}", start + offset));
             }
         }
         if self.players_read < 10 {
             self.derive_team_roles();
         }
+        self.read_levels(start, end);
+        self.finish_interactions();
+        self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
+        self.place_feedback();
+        self.resolve_samples();
+        self.name_defuser_players();
         if mode == ReadMode::Full {
             self.round_end();
         }
-        self.resolve_samples();
+        if options.census {
+            self.round.census = Some(census::build(
+                &self.data[start..],
+                &self.round.header,
+                self.packet_census(),
+                &known_fields(self.code() < version::Y8S1),
+            ));
+        }
+        self.finish_report(mode);
         self.round
+    }
+
+    fn packet_census(&self) -> Vec<PacketCount> {
+        let legacy = self.code() < version::Y8S1;
+        let all = PACKETS
+            .iter()
+            .copied()
+            .chain([(Packet::LegacyTime, LEGACY_TIME)]);
+        all.filter(|(p, _)| match p {
+            Packet::Time => !legacy,
+            Packet::LegacyTime => legacy,
+            _ => true,
+        })
+        .map(|(p, marker)| {
+            let (seen, failed) = self.packet_counts[p as usize];
+            PacketCount {
+                name: p.name(),
+                marker: census::hex(marker),
+                seen,
+                failed,
+            }
+        })
+        .collect()
+    }
+
+    /// "3 of 40 health packets failed to decode (first ...)" for each of
+    /// `packets` that had failures.
+    fn failures(&self, packets: &[Packet]) -> Vec<String> {
+        packets
+            .iter()
+            .filter(|p| self.packet_counts[**p as usize].1 > 0)
+            .map(|p| {
+                let (seen, failed) = self.packet_counts[*p as usize];
+                let first = self.packet_errors[*p as usize].as_deref().unwrap_or("?");
+                format!(
+                    "{failed} of {seen} {} packets failed to decode (first {first})",
+                    p.name()
+                )
+            })
+            .collect()
+    }
+
+    /// Fills in version, parser and how far each output field can be trusted.
+    fn finish_report(&mut self, mode: ReadMode) {
+        let code = self.code();
+        self.round.version = GameVersion::parse(&self.round.header.game_version, code);
+        self.round.parser = ParserInfo::for_build(code);
+        if let Some(t) = self.round.timing.as_mut() {
+            t.clock_gaps = std::mem::take(&mut self.clock_gaps);
+            let h = &self.round.header;
+            if let Some(w) = t.calibrate(h.timestamp, h.start_time, h.end_time) {
+                self.round.decode.warnings.push(w);
+            }
+        }
+        let mut r = DecodeReport {
+            warnings: std::mem::take(&mut self.round.decode.warnings),
+            ..DecodeReport::default()
+        };
+        let skipped = mode != ReadMode::Full;
+        let header_only = mode == ReadMode::Header;
+        let modern = code >= version::Y8S1;
+        let round = &self.round;
+        let h = &round.header;
+
+        let f = r.field("header", Status::Decoded, h.keys.len());
+        if !round.format.prelude_decoded {
+            f.at_most(Status::Partial)
+                .warn("prelude not recognised; header found by scanning");
+        }
+        if round.version.season.is_none() {
+            f.warn(format!("version {:?} is not in YxSy form", h.game_version));
+        }
+        if round.parser.untested_build {
+            f.warn(format!(
+                "build {code} is newer than any tested build ({})",
+                crate::decoder::NEWEST_TESTED_BUILD
+            ));
+        }
+
+        let with_op = h.players.iter().filter(|p| !p.operator.is_empty()).count();
+        let f = r.field("players", Status::Decoded, h.players.len());
+        if header_only {
+            f.at_most(Status::Skipped)
+                .warn("header only: names from the header, no operators");
+        } else if h.players.is_empty() {
+            f.at_most(Status::Missing);
+        } else if with_op < h.players.len() || h.players.len() != 10 {
+            f.at_most(Status::Partial).warn(format!(
+                "{} players, {with_op} with an operator",
+                h.players.len()
+            ));
+        }
+        for w in self.failures(&[Packet::Player, Packet::AttackerSwap]) {
+            f.at_most(Status::Partial).warn(w);
+        }
+        f.warnings.extend(self.warnings.iter().cloned());
+        if mode == ReadMode::Partial {
+            f.warn("partial read: attacker swaps not read");
+        }
+
+        let roles = h.teams.iter().filter(|t| t.role.is_some()).count();
+        let f = r.field("teamRoles", Status::Inferred, roles);
+        if header_only {
+            f.at_most(Status::Skipped);
+        } else if roles < 2 {
+            f.at_most(Status::Missing)
+                .warn("no player with an operator of known side");
+        }
+
+        let is_bomb = h.game_mode.name().is_some_and(|n| n.contains("Bomb"));
+        let f = r.field("site", Status::Decoded, usize::from(!h.site.is_empty()));
+        if header_only {
+            f.at_most(Status::Skipped);
+        } else if h.site.is_empty() {
+            f.at_most(if is_bomb {
+                Status::Missing
+            } else {
+                Status::NotInVersion
+            });
+        }
+
+        // Fields filled from packets. `expected`: absent data is a problem
+        // rather than just an uneventful round.
+        let mut from_packets = |name: &'static str,
+                                count: usize,
+                                since_y8s1: bool,
+                                expected: bool,
+                                packets: &[Packet]| {
+            let status = if skipped {
+                Status::Skipped
+            } else if since_y8s1 && !modern {
+                Status::NotInVersion
+            } else if count == 0 && expected {
+                Status::Missing
+            } else {
+                Status::Decoded
+            };
+            let f = r.field(name, status, count);
+            if matches!(status, Status::Decoded | Status::Missing) {
+                for w in self.failures(packets) {
+                    f.at_most(Status::Partial).warn(w);
+                }
+            }
+        };
+        let fb = &round.match_feedback;
+        let count_kinds =
+            |kinds: &[MatchUpdateType]| fb.iter().filter(|u| kinds.contains(&u.kind)).count();
+        from_packets(
+            "kills",
+            count_kinds(&[MatchUpdateType::Kill, MatchUpdateType::Death]),
+            false,
+            true,
+            &[Packet::Feedback],
+        );
+        from_packets(
+            "defuser",
+            count_kinds(&[
+                MatchUpdateType::DefuserPlantStart,
+                MatchUpdateType::DefuserPlantComplete,
+                MatchUpdateType::DefuserDisableStart,
+                MatchUpdateType::DefuserDisableComplete,
+            ]),
+            false,
+            false,
+            &[Packet::DefuserTimer],
+        );
+        from_packets(
+            "operatorSwaps",
+            count_kinds(&[MatchUpdateType::OperatorSwap]),
+            false,
+            false,
+            &[Packet::AttackerSwap],
+        );
+        from_packets(
+            "scoreboard",
+            round.scoreboard.len(),
+            false,
+            true,
+            &[Packet::ScoreboardScore, Packet::ScoreboardAssists],
+        );
+        from_packets("bans", round.bans.len(), true, false, &[Packet::RoleImage]);
+        from_packets(
+            "loadouts",
+            round.loadouts.len(),
+            true,
+            true,
+            &[Packet::Item],
+        );
+        from_packets("health", round.health.len(), true, true, &[Packet::Health]);
+        from_packets(
+            "lifeEvents",
+            round.life_events.len(),
+            true,
+            false,
+            &[Packet::LifeState],
+        );
+        from_packets(
+            "observation",
+            round.observation.len(),
+            true,
+            false,
+            &[
+                Packet::Observer,
+                Packet::ObservedOwner,
+                Packet::ObservationTool,
+            ],
+        );
+        let levels = round
+            .header
+            .players
+            .iter()
+            .filter(|p| p.level.is_some())
+            .count();
+        if levels > 0 {
+            r.field("levels", Status::Inferred, levels).warn(
+                "probably the clearance level: stable across rounds and distinct per player, but not checked against Ubisoft's stats",
+            );
+        }
+        if code >= version::Y9S1 && !skipped {
+            r.field("feedbackMessages", Status::NotInVersion, 0)
+                .warn("text feed messages (leaves, objective found) are not decoded from Y9S1");
+        }
+
+        let won = h.teams.iter().filter(|t| t.won).count();
+        let status = match () {
+            _ if skipped => Status::Skipped,
+            _ if won != 1 => Status::Missing,
+            _ if code >= version::Y9S4 => Status::Decoded,
+            _ => Status::Inferred,
+        };
+        let f = r.field("result", status, won);
+        if won > 1 {
+            f.at_most(Status::Partial)
+                .warn("more than one team marked as winner");
+        }
+        let has_condition = h.teams.iter().any(|t| t.win_condition.is_some());
+        let f = r.field(
+            "winCondition",
+            if skipped {
+                Status::Skipped
+            } else {
+                Status::Inferred
+            },
+            usize::from(has_condition),
+        );
+        if !skipped {
+            if !has_condition {
+                f.at_most(Status::Missing)
+                    .warn("no plant, disable, wipe or time-out fits the result");
+            }
+            match round.outcome.reason_source {
+                crate::outcome::ReasonSource::Confirmed => f.warn(
+                    "from the kill feed and defuser events; winner agrees with the header score",
+                ),
+                crate::outcome::ReasonSource::Header => f
+                    .at_most(Status::Partial)
+                    .warn("the header's winner disagrees with the events; see round.warnings"),
+                _ => f.warn("from the kill feed and defuser events"),
+            };
+            for w in &round.outcome.warnings {
+                f.warn(w.clone());
+            }
+        }
+
+        let spans = round.timeline.spans();
+        let f = r.field(
+            "phases",
+            if skipped {
+                Status::Skipped
+            } else if spans.is_empty() {
+                Status::Missing
+            } else {
+                Status::Inferred
+            },
+            spans.len(),
+        );
+        if !skipped && round.timeline.action_start.is_none() {
+            f.at_most(Status::Partial)
+                .warn("the clock never switched to the action phase");
+        }
+        let f = r.field(
+            "playersAtStart",
+            if skipped {
+                Status::Skipped
+            } else {
+                Status::Inferred
+            },
+            round.outcome.players_at_start.iter().sum(),
+        );
+        if !skipped {
+            f.warn("alive when action started: no death in prep and health above zero");
+        }
+        let unnamed = fb
+            .iter()
+            .filter(|u| {
+                u.team.is_some() && u.username.is_empty() && u.kind != MatchUpdateType::OperatorSwap
+            })
+            .count();
+        if unnamed > 0 {
+            r.field("defuserPlayers", Status::Partial, unnamed).warn(
+                "Y11S3+ defuser events record the side, not the player; named only when one player of that side was alive",
+            );
+        }
+
+        let f = r.field(
+            "timing",
+            if round.timing.is_some() {
+                Status::Decoded
+            } else {
+                Status::Missing
+            },
+            round.timing.as_ref().map_or(0, |t| t.frames),
+        );
+        if let Some(t) = &round.timing {
+            if round.format.prelude_decoded && t.frames != round.format.declared_frames as usize {
+                f.at_most(Status::Partial).warn(format!(
+                    "prelude declares {} frames, index has {}",
+                    round.format.declared_frames, t.frames
+                ));
+            }
+            if !t.gaps.is_empty() {
+                f.at_most(Status::Partial)
+                    .warn(format!("{} gaps in the frame index", t.gaps.len()));
+            }
+            if t.backwards > 0 {
+                f.at_most(Status::Partial)
+                    .warn(format!("{} frames go back in time", t.backwards));
+            }
+            if !t.clock_gaps.is_empty() {
+                f.at_most(Status::Partial)
+                    .warn(format!("{} jumps in the in-game clock", t.clock_gaps.len()));
+            }
+        }
+        let clock = if modern {
+            Packet::Time
+        } else {
+            Packet::LegacyTime
+        };
+        if !skipped && self.packet_counts[clock as usize].0 == 0 {
+            f.at_most(Status::Partial).warn("no clock packets found");
+        }
+        r.finish();
+        self.round.decode = r;
     }
 
     fn dispatch(&mut self, packet: Packet, c: &mut Cursor) -> Result<()> {
@@ -391,6 +963,7 @@ impl<'a> Parser<'a> {
             Packet::ObservedOwner => self.read_observed_owner(c),
             Packet::ObservationTool => self.read_observation_tool(c),
             Packet::Item => self.read_item(c),
+            Packet::DefuserAction => self.read_defuser_action(c),
         }
     }
 
@@ -425,7 +998,7 @@ impl<'a> Parser<'a> {
         }
         let state_id = state_object_after(c.peek(200));
         if c.u8()? != 0x22 {
-            tracing::warn!(%operator, "invalid player packet");
+            self.warn(format!("invalid player packet for {username} ({operator})"));
             return Ok(());
         }
         c.seek(if code <= version::Y7S2 {
@@ -506,14 +1079,19 @@ impl<'a> Parser<'a> {
     /// operators picked.
     fn derive_team_roles(&mut self) {
         let header = &mut self.round.header;
+        let warnings = &mut self.warnings;
         header.players.retain(|p| {
             if p.operator.is_empty() {
                 tracing::warn!(username = %p.username, "operator id was 0, removing player");
+                warnings.push(format!("{}: operator id was 0, player removed", p.username));
             }
             !p.operator.is_empty()
         });
-        if header.players.len() > 10 {
-            tracing::warn!(players = header.players.len(), "more than 10 players");
+        // 5v5 unless the header says otherwise (Y11S3+ `maxnbplayersperteam`).
+        let max = 2 * header.max_players_per_team.unwrap_or(5) as usize;
+        if header.players.len() > max {
+            tracing::warn!(players = header.players.len(), max, "too many players");
+            warnings.push(format!("{} players, more than {max}", header.players.len()));
         }
         let known = header
             .players
@@ -560,13 +1138,17 @@ impl<'a> Parser<'a> {
         };
         if let Some(i) = index {
             let username = self.round.header.players[i].username.clone();
+            let previous = self.round.header.players[i].operator;
+            // The same pick can be written again; that is no swap.
+            if previous == operator {
+                return Ok(());
+            }
             self.take_loadout(c.pos(), &username, operator);
             self.players()[i].operator = operator;
-            let mut u = self.update(
-                MatchUpdateType::OperatorSwap,
-                &self.round.header.players[i].username,
-            );
+            let mut u = self.update(MatchUpdateType::OperatorSwap, &username);
             u.operator = operator;
+            u.previous_operator = previous;
+            u.team = Some(self.round.header.players[i].team_index);
             self.push(u);
         }
         Ok(())
@@ -600,13 +1182,47 @@ impl<'a> Parser<'a> {
     }
 
     fn read_time(&mut self, c: &mut Cursor) -> Result<()> {
-        let t = c.u32()?;
-        self.timeline.tick(f64::from(t));
-        self.clock = Clock {
-            seconds: f64::from(t),
-            display: format!("{}:{:02}", t / 60, t % 60),
-        };
+        let t = f64::from(c.u32()?);
+        self.set_clock(Clock {
+            seconds: t,
+            display: display_clock(t),
+            tick: None,
+        });
         Ok(())
+    }
+
+    /// Moves the clock, noting any seconds it skipped while counting down.
+    fn set_clock(&mut self, mut clock: Clock) {
+        let prev = self.clock.seconds;
+        let started = !self.readings.is_empty();
+        // The opening snapshot can hold a stale 0:00 before prep starts.
+        if !started && clock.seconds == 0.0 {
+            self.clock = clock;
+            return;
+        }
+        if self.readings.last() != Some(&clock.seconds) {
+            self.readings.push(clock.seconds);
+        }
+        clock.tick = Some(self.readings.len() - 1);
+        // The countdown drops one second at a time. Expected jumps: up at a
+        // new phase, down to 0:00 when the round ends, and down to the
+        // defuser timer once after a plant.
+        // Y11S3+ plants are confirmed only once the object goes idle, after
+        // the clock has switched; a countdown at zero is as good.
+        let planting_done = self.interactions.values().any(|i| {
+            i.active == Some(MatchUpdateType::DefuserPlantStart) && i.remaining <= DEFUSER_DONE
+        });
+        let defuser_reset = (self.planted || planting_done) && !self.defuser_clock;
+        if defuser_reset && clock.seconds < prev {
+            self.defuser_clock = true;
+        } else if started && clock.seconds > 0.0 && clock.seconds < prev - CLOCK_GAP {
+            self.clock_gaps.push(ClockGap {
+                from: self.clock.display.clone(),
+                to: clock.display.clone(),
+                missing: prev - clock.seconds - 1.0,
+            });
+        }
+        self.clock = clock;
     }
 
     /// Pre-Y8S1 replays store the clock as text: `m:ss` or fractional seconds.
@@ -627,11 +1243,11 @@ impl<'a> Parser<'a> {
                 f64::from(m * 60 + s)
             }
         };
-        self.timeline.tick(seconds);
-        self.clock = Clock {
+        self.set_clock(Clock {
             seconds,
             display: text,
-        };
+            tick: None,
+        });
         Ok(())
     }
 
@@ -716,6 +1332,19 @@ impl<'a> Parser<'a> {
     }
 
     fn read_defuser_timer(&mut self, c: &mut Cursor) -> Result<()> {
+        // Y11S3+: the countdown of an interaction object.
+        if let Some(object) = property_object(c)
+            && self.interactions.contains_key(&object)
+        {
+            let timer = c.string()?;
+            if let Ok(remaining) = timer.parse::<f64>()
+                && let Some(i) = self.interactions.get_mut(&object)
+            {
+                i.remaining = remaining;
+                i.last_tick = self.clock.tick;
+            }
+            return Ok(());
+        }
         let timer = c.string()?;
         c.skip(34)?;
         let id = c.array::<4>()?;
@@ -737,6 +1366,7 @@ impl<'a> Parser<'a> {
             MatchUpdateType::DefuserDisableComplete
         } else {
             self.planted = true;
+            self.plant_tick = self.clock.tick;
             MatchUpdateType::DefuserPlantComplete
         };
         let username = self
@@ -747,6 +1377,87 @@ impl<'a> Parser<'a> {
         let u = self.update(kind, &username);
         self.push(u);
         Ok(())
+    }
+
+    /// Y11S3+: a defuser interaction object starts or stops planting or
+    /// disabling. The replay does not say who holds it, only what it does.
+    fn read_defuser_action(&mut self, c: &mut Cursor) -> Result<()> {
+        let Some(object) = property_object(c) else {
+            return Ok(());
+        };
+        let action = c.u32()?;
+        let entry = self.interactions.entry(object).or_default();
+        let kind = match action {
+            0 => MatchUpdateType::DefuserPlantStart,
+            1 => MatchUpdateType::DefuserDisableStart,
+            2 => {
+                let done = std::mem::take(entry);
+                self.finish_interaction(done);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if entry.active == Some(kind) {
+            return Ok(());
+        }
+        let previous = std::mem::replace(
+            entry,
+            Interaction {
+                active: Some(kind),
+                remaining: f64::INFINITY,
+                last_tick: None,
+            },
+        );
+        self.finish_interaction(previous);
+        let mut u = self.update(kind, "");
+        u.team = self.side_team(kind);
+        self.push(u);
+        Ok(())
+    }
+
+    /// Reports a plant or disable that ran down to zero as completed.
+    fn finish_interaction(&mut self, i: Interaction) {
+        let Some(started) = i.active else { return };
+        if i.remaining > DEFUSER_DONE {
+            return;
+        }
+        let kind = if started == MatchUpdateType::DefuserPlantStart {
+            if self.planted {
+                return;
+            }
+            self.planted = true;
+            self.plant_tick = i.last_tick.or(self.clock.tick);
+            MatchUpdateType::DefuserPlantComplete
+        } else {
+            MatchUpdateType::DefuserDisableComplete
+        };
+        let mut u = self.update(kind, "");
+        u.team = self.side_team(kind);
+        u.tick = i.last_tick.or(u.tick);
+        self.push(u);
+    }
+
+    /// Interactions still running when the recording stops.
+    fn finish_interactions(&mut self) {
+        let open: Vec<Interaction> = self.interactions.drain().map(|(_, i)| i).collect();
+        for i in open {
+            self.finish_interaction(i);
+        }
+    }
+
+    /// The team that plants (attack) or disables (defense).
+    fn side_team(&self, kind: MatchUpdateType) -> Option<usize> {
+        let side = match kind {
+            MatchUpdateType::DefuserPlantStart | MatchUpdateType::DefuserPlantComplete => {
+                TeamRole::Attack
+            }
+            _ => TeamRole::Defense,
+        };
+        self.round
+            .header
+            .teams
+            .iter()
+            .position(|t| t.role == Some(side))
     }
 
     /// An operator icon. Most belong to players; the ones followed by a side
@@ -767,16 +1478,47 @@ impl<'a> Parser<'a> {
             2 => TeamRole::Defense,
             _ => return Ok(()),
         };
+        let team = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
+            c.skip(BAN_TEAM.len())?;
+            match c.u32()? {
+                t @ 1..=2 => Some(t as usize - 1),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if !self.round.bans.iter().any(|b| b.icon == icon) {
             let operator = Operator::from_role_image(icon);
-            tracing::debug!(icon, ?operator, ?role, "ban");
+            tracing::debug!(icon, ?operator, ?role, ?team, "ban");
             self.round.bans.push(Ban {
                 operator,
                 role,
+                team,
                 icon,
             });
         }
         Ok(())
+    }
+
+    /// Y11S3+ player levels from the opening snapshot: each follows the
+    /// player's name on the same object.
+    fn read_levels(&mut self, start: usize, end: usize) {
+        let data = &self.data[start..end.min(start + SNAPSHOT_BYTES)];
+        for at in memchr::memmem::find_iter(data, &PLAYER_LEVEL) {
+            let mut c = Cursor::new(data, at + PLAYER_LEVEL.len());
+            let Some(level) = c.string().ok().and_then(|v| v.parse::<u32>().ok()) else {
+                continue;
+            };
+            let before = &data[at.saturating_sub(96)..at];
+            let Some(name_at) = memchr::memmem::rfind(before, &PLAYER_NAME) else {
+                continue;
+            };
+            let mut c = Cursor::new(before, name_at + PLAYER_NAME.len());
+            let Ok(name) = c.string() else { continue };
+            if let Some(p) = self.players().iter_mut().find(|p| p.username == name) {
+                p.level.get_or_insert(level);
+            }
+        }
     }
 
     fn read_item(&mut self, c: &mut Cursor) -> Result<()> {
@@ -822,9 +1564,7 @@ impl<'a> Parser<'a> {
         self.samples.push(Sample {
             object,
             value,
-            clock: self.clock.clone(),
-            elapsed: self.timeline.elapsed,
-            phase: self.timeline.phase,
+            tick: self.clock.tick,
         });
     }
 
@@ -878,6 +1618,29 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Puts every feed entry on the round's timeline: phase, seconds since
+    /// prep, and the clock it happened at (the last live second for events
+    /// the game logged after resetting the clock at round end).
+    fn place_feedback(&mut self) {
+        let Round {
+            timeline,
+            match_feedback,
+            ..
+        } = &mut self.round;
+        // Events stamped with an earlier tick (a finished plant) move back
+        // into place; the sort is stable, so stream order holds otherwise.
+        match_feedback.sort_by_key(|u| u.tick);
+        for u in match_feedback {
+            let at = timeline.at(u.tick);
+            u.phase = at.phase;
+            u.elapsed = at.elapsed;
+            if u.tick.is_some() && at.seconds != u.time_in_seconds {
+                u.time_in_seconds = at.seconds;
+                u.time = display_clock(at.seconds);
+            }
+        }
+    }
+
     /// Turns the per-object samples into per-player health changes, downs and
     /// observation sessions.
     fn resolve_samples(&mut self) {
@@ -891,24 +1654,33 @@ impl<'a> Parser<'a> {
         let mut life: HashMap<u32, u32> = HashMap::new();
         // Observer object -> (index of its open session, elapsed at start).
         let mut open: HashMap<u32, (usize, f64)> = HashMap::new();
+        let before_action = &mut self.health_before_action;
         let round = &mut self.round;
+        let timeline = &round.timeline;
         for s in &self.samples {
+            let at = timeline.at(s.tick);
+            let time = display_clock(at.seconds);
             match &s.value {
                 SampleValue::Health(value) => {
                     let Some(username) = owner(&self.health_objects, s.object, 1) else {
                         continue;
                     };
                     let prev = health.insert(s.object, *value);
+                    if at.phase == Phase::Prep {
+                        before_action.insert(username.clone(), *value);
+                    }
                     // Prep phase sets up (or resets leftover) health; rising
                     // from zero is a spawn or a revive, not healing.
-                    let live = s.phase == Phase::Action;
+                    let live = at.phase.is_live();
                     if let Some(prev) = prev.filter(|&p| live && p > 0 && p != *value) {
                         round.health.push(HealthUpdate {
                             username,
                             health: *value,
                             change: *value as i32 - prev as i32,
-                            time: s.clock.display.clone(),
-                            time_in_seconds: s.clock.seconds,
+                            time,
+                            time_in_seconds: at.seconds,
+                            phase: at.phase,
+                            elapsed: at.elapsed,
                         });
                     }
                 }
@@ -926,8 +1698,10 @@ impl<'a> Parser<'a> {
                     round.life_events.push(LifeEvent {
                         kind,
                         username,
-                        time: s.clock.display.clone(),
-                        time_in_seconds: s.clock.seconds,
+                        time,
+                        time_in_seconds: at.seconds,
+                        phase: at.phase,
+                        elapsed: at.elapsed,
                     });
                 }
                 SampleValue::Tool(tool, device_owner) => {
@@ -939,25 +1713,60 @@ impl<'a> Parser<'a> {
                         continue;
                     }
                     if let Some((i, start)) = open.remove(&s.object) {
-                        round.observation[i].seconds = s.elapsed - start;
+                        round.observation[i].seconds = at.elapsed - start;
                     }
                     if tool.0 != 0 {
-                        open.insert(s.object, (round.observation.len(), s.elapsed));
+                        open.insert(s.object, (round.observation.len(), at.elapsed));
                         round.observation.push(ObservationSession {
                             username,
                             owner: device_owner.clone(),
                             tool: *tool,
-                            phase: s.phase,
-                            time: s.clock.display.clone(),
-                            time_in_seconds: s.clock.seconds,
+                            phase: at.phase,
+                            time,
+                            time_in_seconds: at.seconds,
+                            elapsed: at.elapsed,
                             seconds: 0.0,
                         });
                     }
                 }
             }
         }
+        let end = round.timeline.duration();
         for (i, start) in open.into_values() {
-            round.observation[i].seconds = self.timeline.elapsed - start;
+            round.observation[i].seconds = end - start;
+        }
+    }
+
+    /// Y11S3 defuser events carry only the side. Names the player when just
+    /// one player of that side was alive at the time.
+    fn name_defuser_players(&mut self) {
+        let round = &mut self.round;
+        let deaths: Vec<(String, f64)> = round
+            .match_feedback
+            .iter()
+            .filter_map(|u| Some((u.victim()?.to_owned(), u.elapsed)))
+            .collect();
+        let players = &round.header.players;
+        for u in &mut round.match_feedback {
+            let defuser = matches!(
+                u.kind,
+                MatchUpdateType::DefuserPlantStart
+                    | MatchUpdateType::DefuserPlantComplete
+                    | MatchUpdateType::DefuserDisableStart
+                    | MatchUpdateType::DefuserDisableComplete
+            );
+            let Some(team) = u.team.filter(|_| defuser && u.username.is_empty()) else {
+                continue;
+            };
+            let mut alive = players.iter().filter(|p| {
+                p.team_index == team
+                    && !deaths
+                        .iter()
+                        .any(|(name, at)| *name == p.username && *at < u.elapsed)
+            });
+            if let (Some(only), None) = (alive.next(), alive.next()) {
+                u.username = only.username.clone();
+            }
         }
     }
 
@@ -989,10 +1798,15 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Decides which team won and how.
+    /// Decides which team won and how, cross-checking the header's score
+    /// (Y9S4+) against the kill feed and defuser events, and counts who was
+    /// alive when action started.
     fn round_end(&mut self) {
         let round = &mut self.round;
         let header = &mut round.header;
+        let feed = &round.match_feedback;
+        let mut outcome = RoundOutcome::default();
+
         let team_of = |name: &str| {
             header
                 .players
@@ -1001,61 +1815,157 @@ impl<'a> Parser<'a> {
                 .map(|p| p.team_index)
                 .filter(|&t| t < 2)
         };
-
-        let mut sizes = [0usize; 2];
+        let prep_deaths: Vec<&str> = feed
+            .iter()
+            .filter(|u| u.phase == Phase::Prep)
+            .filter_map(MatchUpdate::victim)
+            .collect();
+        let mut roster = [0usize; 2];
         for p in header.players.iter().filter(|p| p.team_index < 2) {
-            sizes[p.team_index] += 1;
-        }
-        let roles = [header.teams[0].role, header.teams[1].role];
-        let mut deaths = [0usize; 2];
-        let mut planter_team = None;
-
-        let explicit_scores = header.code_version >= version::Y9S4;
-        if explicit_scores {
-            let team0_won = header.teams[0].starting_score < header.teams[0].score;
-            header.teams[0].won = team0_won;
-            header.teams[1].won = !team0_won;
-        }
-
-        for u in &round.match_feedback {
-            match u.kind {
-                MatchUpdateType::Kill | MatchUpdateType::Death => {
-                    if let Some(t) = u.victim().and_then(team_of) {
-                        deaths[t] += 1;
-                    }
-                }
-                MatchUpdateType::DefuserPlantComplete => planter_team = team_of(&u.username),
-                MatchUpdateType::DefuserDisableComplete => {
-                    if let Some(t) = team_of(&u.username) {
-                        header.teams[t].won = true;
-                        header.teams[t].win_condition = Some(WinCondition::DisabledDefuser);
-                    }
-                    return;
-                }
-                _ => {}
+            roster[p.team_index] += 1;
+            let dead_in_prep = prep_deaths.contains(&p.username.as_str());
+            let no_health = self.health_before_action.get(&p.username) == Some(&0);
+            if dead_in_prep || no_health {
+                outcome.down_at_start.push(p.username.clone());
+            } else {
+                outcome.players_at_start[p.team_index] += 1;
             }
         }
 
-        if let Some(t) = planter_team {
-            header.teams[t].won = true;
-            header.teams[t].win_condition = Some(WinCondition::DefusedBomb);
-            return;
-        }
-        // Y9S4+ headers state the winner; the condition is not yet reliable.
-        if explicit_scores {
-            return;
-        }
-        for (dead, winner) in [(0, 1), (1, 0)] {
-            if deaths[dead] == sizes[dead] {
-                header.teams[winner].won = true;
-                header.teams[winner].win_condition = Some(WinCondition::KilledOpponents);
-                return;
+        // Deaths of players alive at the start, with when the last one fell.
+        let mut dead: Vec<&str> = Vec::new();
+        let mut last_death = [f64::NEG_INFINITY; 2];
+        for u in feed.iter().filter(|u| u.phase != Phase::Prep) {
+            let Some(victim) = u.victim() else { continue };
+            let Some(t) = team_of(victim) else { continue };
+            if dead.contains(&victim) || outcome.down_at_start.iter().any(|d| d == victim) {
+                continue;
             }
+            dead.push(victim);
+            outcome.deaths[t] += 1;
+            last_death[t] = last_death[t].max(u.elapsed);
         }
-        // Nobody was wiped out: defenders win on time.
-        let defenders = usize::from(roles[1] == Some(TeamRole::Defense));
-        header.teams[defenders].won = true;
-        header.teams[defenders].win_condition = Some(WinCondition::Time);
+        let kinds = |k: MatchUpdateType| feed.iter().filter(move |u| u.kind == k);
+        outcome.planted = kinds(MatchUpdateType::DefuserPlantComplete)
+            .next()
+            .is_some();
+        outcome.disabled = kinds(MatchUpdateType::DefuserDisableComplete)
+            .next()
+            .is_some();
+
+        let role_team = |role| header.teams.iter().position(|t| t.role == Some(role));
+        let (attack, defense) = match (role_team(TeamRole::Attack), role_team(TeamRole::Defense)) {
+            (Some(a), Some(d)) => (a, d),
+            _ => {
+                // Without sides, fall back to who planted or disabled.
+                let planter = kinds(MatchUpdateType::DefuserPlantComplete)
+                    .find_map(|u| u.team.or_else(|| team_of(&u.username)));
+                match planter {
+                    Some(a) => (a, a ^ 1),
+                    None => {
+                        outcome
+                            .warnings
+                            .push("sides unknown: no result from events".into());
+                        round.outcome = outcome;
+                        return;
+                    }
+                }
+            }
+        };
+        let wiped = |t: usize| {
+            outcome.players_at_start[t] > 0 && outcome.deaths[t] >= outcome.players_at_start[t]
+        };
+
+        // Who the events say won.
+        let from_events = if outcome.disabled {
+            defense
+        } else if outcome.planted {
+            attack
+        } else {
+            match (wiped(attack), wiped(defense)) {
+                // Both wiped (a trade, or a player left): the later wipe won.
+                (true, true) if last_death[attack] > last_death[defense] => attack,
+                (true, _) => defense,
+                (false, true) => attack,
+                // Nobody wiped and nothing planted: defenders win on time.
+                (false, false) => defense,
+            }
+        };
+
+        // Y9S4+ headers state the score after the round.
+        let explicit = header.code_version >= version::Y9S4;
+        let from_header = explicit
+            .then(|| (0..2).find(|&t| header.teams[t].score > header.teams[t].starting_score))
+            .flatten();
+        let winner = match from_header {
+            Some(h) => {
+                outcome.reason_source = if h == from_events {
+                    ReasonSource::Confirmed
+                } else {
+                    outcome.warnings.push(format!(
+                        "header says team {h} won, the kill feed and defuser events suggest team {from_events}"
+                    ));
+                    ReasonSource::Header
+                };
+                h
+            }
+            None => {
+                if explicit {
+                    outcome
+                        .warnings
+                        .push("header score did not change; winner taken from events".into());
+                }
+                outcome.reason_source = ReasonSource::Events;
+                from_events
+            }
+        };
+
+        // How the winner won, given what happened.
+        let reason = if winner == defense {
+            if outcome.planted {
+                if !outcome.disabled {
+                    outcome.warnings.push(
+                        "defenders won after a plant, but no completed disable was seen".into(),
+                    );
+                }
+                Some(WinCondition::DisabledDefuser)
+            } else if wiped(attack) {
+                Some(WinCondition::KilledOpponents)
+            } else {
+                // Time ran out: the clock should have counted down to 0:00.
+                let end = round.timeline.end_start.map(|e| round.timeline.ticks[e]);
+                if end.is_some_and(|t| t.seconds > 1.0) {
+                    outcome.warnings.push(format!(
+                        "defenders won with attackers alive and {} left on the clock",
+                        crate::feedback::display_clock(end.map_or(0.0, |t| t.seconds))
+                    ));
+                }
+                Some(WinCondition::Time)
+            }
+        } else if wiped(defense) {
+            Some(WinCondition::KilledOpponents)
+        } else if outcome.planted {
+            Some(WinCondition::DefusedBomb)
+        } else {
+            outcome.warnings.push(
+                "attackers won without a plant or eliminating the defenders (a player left?)"
+                    .into(),
+            );
+            None
+        };
+        if outcome.disabled && winner != defense {
+            outcome
+                .warnings
+                .push("a completed disable was seen, but attackers won".into());
+        }
+
+        for (t, team) in header.teams.iter_mut().enumerate() {
+            team.won = t == winner;
+            team.win_condition = if t == winner { reason } else { None };
+        }
+        outcome.winner = Some(winner);
+        outcome.reason = reason;
+        round.outcome = outcome;
     }
 }
 

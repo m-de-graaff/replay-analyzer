@@ -7,6 +7,8 @@ pub enum Error {
     InvalidFile,
     #[error("folder contains no .rec replay files")]
     InvalidFolder,
+    #[error("{0} is an in-progress recording (.tmprec), not a finished replay")]
+    TemporaryFile(String),
     #[error("invalid header string separator at offset {0}")]
     InvalidStringSeparator(usize),
     #[error("unexpected end of replay data")]

@@ -7,8 +7,12 @@ replay-analyzer R01.rec                 # one round as JSON
 replay-analyzer Match-2024-05-04/ -o match.json   # every round in a match folder, plus totals
 replay-analyzer R01.rec --info          # short header summary
 replay-analyzer R01.rec --partial       # header and players only (faster)
+replay-analyzer R01.rec --census        # also count every packet and field seen
+replay-analyzer MatchReplay/ --list     # every match folder: rounds, gaps, versions, hashes
 replay-analyzer R01.rec --dump -o raw.bin  # decompressed stream, for format research
 ```
+
+Only finished `.rec` files are read. The game also writes in-progress recordings as `*_FrameDataStream.tmprec`, `*_StaticData.tmprec` and `*_StreamInfo.tmprec`; those are refused as input and listed as skipped in a folder.
 
 Pass `--pretty` for indented JSON and `--debug` for a packet-level log on stderr.
 
@@ -35,21 +39,98 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 
 | Key | What it holds | Versions |
 |---|---|---|
-| `bans` | Banned operators with their side. The replay stores only the operator icon, so names resolve for icons in the lookup table (current season); older seasons keep the raw `icon` id. | Y8S1+ |
+| `bans` | Banned operators with their side. The replay stores only the operator icon, so names resolve for icons in the lookup table (current season); older seasons keep the raw `icon` id. From Y11S3, `team` is the team that banned the operator, and each team's bans keep their slot order. The ban phase happens before recording starts, so bans carry no time. | Y8S1+ |
+| `players[].level` | A number per player from the round's opening snapshot. It is most likely the clearance level: it stays the same across rounds and differs per player, but it has not been checked against Ubisoft's stats. `decodeStatus.levels` reports it as `inferred`. | Y11S3+ |
 | `matchFeedback[].weapon` | Id of the gun or gadget behind each kill. | Y8S1+ |
 | `loadouts` | Guns and gadgets per player, once per operator played, so attacker swaps get their own entry. Ids only: replays carry no item names. Kill `weapon` ids match these. | Y8S1+ |
 | `health` | Every health change in the action phase, with the clock. | Y8S1+ |
 | `lifeEvents` | Downs (DBNO) and revives. | Y8S1+ |
 | `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
 | `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. | Y8S1+ |
+| `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
+
+Each round also carries a `round` block with the round itself in one place:
+
+| Key | What it holds | How |
+|---|---|---|
+| `number`, `overtime`, `overtimeNumber` | Round number from 1, and whether (and which) overtime round it is. | Decoded |
+| `scoreBefore`, `scoreAfter`, `matchPoint` | Score going in and coming out, and which teams were one round from winning. | Decoded |
+| `winProbability` | Each team's chance to win the match going into the round if every remaining round were a coin flip. A score-only baseline, not a prediction. | Derived |
+| `sides`, `site` | Attack or defense per team, and the defended site. | Decoded |
+| `winner`, `winnerSide`, `endReason`, `endReasonSource` | Who won and how: `KilledOpponents`, `DefusedBomb` (the defuser went off), `DisabledDefuser` or `Time`. The reason comes from the kill feed and defuser events; `endReasonSource` is `confirmed` when the header's score names the same winner, `header` when they disagree (see `warnings`), `events` before Y9S4. | Inferred, cross-checked |
+| `planted`, `plant`, `ended` | Whether and when the defuser was planted, and when the round was decided. | Decoded |
+| `playersAtStart`, `startedDown`, `downAtStart` | Players per team alive when action started, and which teams started a player down. | Inferred |
+| `lineup` | Per player: side, the operator played after prep, the attacker spawn (defenders get the site), and operators swapped away from. | Decoded |
+| `swaps` | Attacker operator swaps: who, `from`, `to`, clock, and `late` for the last 10 seconds of prep. | Decoded |
+| `phases` | `Prep`, `Action`, `Planted`, `End`, each with its start and end on the round clock and in seconds since prep started. | Inferred |
+
+Every kill feed entry, health change, life event and observation session carries `phase` and `elapsed` (seconds since prep started), so everything sits on one timeline across the prep, action and defuser clocks. `time` stays the in-game clock: whole seconds, counting down, restarting at the plant. Events the game logs after resetting the clock at round end keep the last live second, so the kill that ended a round at 0:12 reads `0:12`, not `0:00`.
+
+From Y11S3 the defuser is an interaction object whose countdown runs from 7.000 to 0. Plants and disables that reach zero complete; abandoned ones only have a start. The object does not say who holds it, so defuser events carry the `team` and name the player only when one player of that side was alive (`decodeStatus.defuserPlayers`).
+
+A match folder adds `analytics`: per team attack and defense records, rounds started a player down, plants, disables and prep swaps (late ones counted apart); per site the defense win rate overall and per team; per attacker spawn and team the pick and round win rates; per operator and team rounds, win rate, kills, deaths, headshots and how often it was swapped to; and a count of rounds per end reason and winning side. `summary.rounds[]` also gains `winProbability`, `endReason` and `playersAtStart`.
+
+Every round also says where it came from and how far it can be trusted:
+
+| Key | What it holds |
+|---|---|
+| `replay.file` | Path, size, modified time and SHA-256, for deduplication and "already imported" checks. |
+| `replay.format` | The `dissect` prelude: format version (7 before Y8S4, 8 since), layout, declared frame count and header property count. |
+| `replay.version` | `Y11S3_Alpha04` split into season, year, season number and branch, plus the build number (`code`). |
+| `replay.parser` | Parser version and the decoder profile and revision chosen for the build. A decoding fix bumps the revision of the profiles it touches, so stored rounds with an older `(decoder, decoderRevision)` are the ones to re-parse. `untestedBuild` flags builds newer than any the decoders were checked against. |
+| `decodeStatus` | Per field (`players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. |
+| `timing` | From the frame time index: frame count, duration, median interval, sample rate, and intervals over 4x the median (`gaps`). `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
+| `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes, known or not. |
+| `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. `matchResult` appears only on the round that decides the match. |
+
+A match folder adds `summary`, one record per match for match history. It is built from round headers only, so `--list` carries it too:
+
+| Key | What it holds |
+|---|---|
+| `matchID` | Shared by every round and every player's recording, so teammates importing the same match dedupe on it. |
+| `startTime`, `endTime` | UTC, from the first and last round read. Before Y11S3 only the recording PC's local time exists; `startTimeIsLocal` says so. |
+| `matchType`, `queue`, `playlistCategory` | The raw match type with its name, and its queue family: `ranked`, `unranked`, `quickMatch`, `custom`, `standard`. `playlistCategory` is raw. |
+| `gameMode` | Bomb, Secure Area, Hostage, ... with the raw id. |
+| `map` | `id`, full `name`, and `base` plus rework `version` (`BankY10` is `Bank`, `Y10`). Reworked maps get new ids, so key floor plans and callouts by `id`. |
+| `rules` | Regulation rounds and the rounds needed to win, overtime rounds and the total needed once overtime starts, players per team, and the raw `gameModeSettings` list (kept raw until each value is named). |
+| `teams` | Name, final score, starting side, and players with profile id and level. |
+| `recording`, `yourTeam` | Who recorded, whether as a spectator, and the index of their team (absent for spectators). |
+| `result` | Final score, `winner`, `outcome` from your side (`win`, `loss`, `draw`, `decided` for spectators, `unfinished`), whether it went to overtime, and `endedEarly` when the game ended the match before either team reached the target (forfeit or abandon; Y11S3+). |
+| `rounds[]` | Per round: score before and after, winner, each team's side, which teams were on match point, overtime, the bomb sites, `bans` with the banning team, and `picks`: every operator each player played, in order, so swaps show up as several operators. `bans` and `picks` need a full read. |
+
+A match folder also adds `folder`: rounds found and missing (numbered from 1 like `R01.rec`), duplicate round numbers, skipped files (`.tmprec`, byte-identical copies, unreadable files), the match ids seen, the final score and whether the match finished. Rounds are ordered by the header's round number, not the file name. One unreadable round no longer fails the whole folder.
 
 Limits worth knowing:
+
+- Replays hold no rank, reputation or server region. The Y11S3 test replays were searched for these and they weren't there. Use the players' `profileID` with Ubisoft's stats services for rank.
+- `endedEarly` (forfeits, abandoned matches) is inferred: the game marks the deciding round with `matchresult`, so a marked round where neither team reached the win target means the match ended early. No forfeit replay has been checked yet.
+- Dual Front (6v6, respawns) has not been seen in a replay. The player-count check follows `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
 
 - Replays record a player's health, never who caused a change, so there is damage taken but no damage dealt.
 - Older replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
 - Observation tool ids 1 (drone), 2 (camera), 6 (Black Eye), 8 (Flores drone) and 9 (shock drone) are confirmed; 3 is a second camera kind seen on defenders with a camera gadget. Others print as `ObservationTool(n)`.
 
 Y11S3 attacker swaps are linked through the player's state object, because the caster UI id older seasons use is shared by a whole team there.
+
+Y11S3 scoreboard packets still arrive but no longer carry ids that match players, so `scoreboard` reports `missing` there.
+
+## File format notes
+
+What sits around the header, as observed from Y8S1 to Y11S3:
+
+```text
+"dissect" 00                 magic
+u32 format                   7 up to Y8S3, 8 from Y8S4
+u8 7, 7 zero bytes, "UNKNOWN"
+u32 0, u32 last frame, u32 property count, u32 0
+properties                   u8 length, 7 zero bytes, text; key then value
+u32 ?, u32 ?, u32 frames     frame time index: frames x (u32 index, f64 seconds)
+per-player table, "CMPRV002" trailer
+```
+
+From Y8S4 the header and index are uncompressed and the packet stream follows as independent zstd frames; before that everything is one zstd stream. Reading only the header therefore needs no decompression for Y8S4+ (`ReadMode::Header`).
+
+The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 2 ms of `endtime`. It also shows the recording rate changed: roughly 200 to 260 frames a second in Y8 and Y9 replays, about 29 in Y11S3. The header `datetime` is the recording PC's local time, not UTC.
 
 ## Benchmarks
 
@@ -58,7 +139,7 @@ Y11S3 attacker swaps are linked through the player's state object, because the c
 | Bench | What it does | Time | Throughput |
 |---|---|---|---|
 | `round/decompress` | zstd frames to the raw stream | 76 ms | 115 MiB/s |
-| `round/header` | header and players only | 58 ms | 151 MiB/s |
+| `round/header` | header and frame index only; no decompression | 0.19 ms | n/a |
 | `round/partial` | `ReadMode::Partial` | 72 ms | 121 MiB/s |
 | `round/full` | `ReadMode::Full`, every packet | 141 ms | 62 MiB/s |
 | `match/folder_10_rounds` | `Match::open` on 10 rounds | 823 ms | 98 MiB/s |

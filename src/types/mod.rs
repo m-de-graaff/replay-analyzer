@@ -151,6 +151,15 @@ pub enum TeamRole {
     Defense,
 }
 
+impl TeamRole {
+    pub fn opposite(self) -> Self {
+        match self {
+            TeamRole::Attack => TeamRole::Defense,
+            TeamRole::Defense => TeamRole::Attack,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum WinCondition {
     KilledOpponents,

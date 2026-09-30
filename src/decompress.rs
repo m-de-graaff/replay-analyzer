@@ -13,6 +13,7 @@ use rayon::prelude::*;
 use zstd::zstd_safe;
 
 use crate::error::{Error, Result};
+use crate::format::{self, FormatInfo, FrameIndex, Layout};
 use crate::header;
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -24,36 +25,79 @@ pub struct Decompressed {
     pub header: header::Header,
     /// Offset in `data` where packet data begins.
     pub body_start: usize,
+    pub format: FormatInfo,
+    /// Number of zstd frames in the file.
+    pub zstd_frames: usize,
+    /// Frame timestamps, when the index was found.
+    pub frame_index: Option<FrameIndex>,
 }
 
 pub fn decompress(raw: &[u8]) -> Result<Decompressed> {
     if raw.starts_with(&ZSTD_MAGIC) {
-        let data = decompress_frames(raw, 0)?;
-        let (header, body_start) = header::parse(&data)?;
+        let frames = locate_frames(raw, 0);
+        let data = decompress_frames(raw, &frames)?;
+        let (header, mut format, body_start) = header::parse(&data)?;
+        format.layout = Layout::Stream;
+        let frame_index = data
+            .get(body_start..)
+            .and_then(|b| format::read_frame_index(b, format.declared_frames));
         Ok(Decompressed {
             data,
             header,
             body_start,
+            format,
+            zstd_frames: frames.len(),
+            frame_index,
         })
     } else if raw.starts_with(DISSECT_MAGIC) {
-        let (header, header_end) = header::parse(raw)?;
-        let data = decompress_frames(raw, header_end)?;
+        let (header, mut format, header_end) = header::parse(raw)?;
+        format.layout = Layout::Chunked;
+        let frames = locate_frames(raw, header_end);
+        let data = decompress_frames(raw, &frames)?;
+        // The index sits uncompressed between the header and the first frame.
+        let index_end = frames.first().map_or(raw.len(), |f| f.0);
+        let frame_index = raw
+            .get(header_end..index_end)
+            .and_then(|b| format::read_frame_index(b, format.declared_frames));
         Ok(Decompressed {
             data,
             header,
             body_start: 0,
+            format,
+            zstd_frames: frames.len(),
+            frame_index,
         })
     } else {
         Err(Error::InvalidFile)
     }
 }
 
-/// Decompresses every zstd frame found at or after `start` and concatenates
-/// the output. Non-zstd bytes between or after frames are ignored, matching
-/// the original tool which tolerated non-zstd trailers. A damaged frame is an
-/// error.
-fn decompress_frames(raw: &[u8], start: usize) -> Result<Vec<u8>> {
-    let frames = locate_frames(raw, start);
+/// Like [`decompress`], but for Y8S4+ replays only the uncompressed header and
+/// frame index are read and `data` is left empty.
+pub fn header_only(raw: &[u8]) -> Result<Decompressed> {
+    if !raw.starts_with(DISSECT_MAGIC) {
+        return decompress(raw);
+    }
+    let (header, mut format, header_end) = header::parse(raw)?;
+    format.layout = Layout::Chunked;
+    let first_frame = memmem::find(&raw[header_end..], &ZSTD_MAGIC).map(|i| header_end + i);
+    let frame_index = first_frame
+        .and_then(|end| raw.get(header_end..end))
+        .and_then(|b| format::read_frame_index(b, format.declared_frames));
+    Ok(Decompressed {
+        data: Vec::new(),
+        header,
+        body_start: 0,
+        format,
+        zstd_frames: 0,
+        frame_index,
+    })
+}
+
+/// Decompresses the given zstd frames and concatenates the output. Non-zstd
+/// bytes between or after frames are ignored, matching the original tool
+/// which tolerated non-zstd trailers. A damaged frame is an error.
+fn decompress_frames(raw: &[u8], frames: &[(usize, usize)]) -> Result<Vec<u8>> {
     if frames.is_empty() {
         return Err(Error::InvalidFile);
     }

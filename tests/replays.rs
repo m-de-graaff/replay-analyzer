@@ -271,7 +271,7 @@ fn chunked_layout_matches_single_stream() {
     let path = &path;
     let raw = std::fs::read(path).unwrap();
     let data = replay_analyzer::decompressed_bytes(&raw).unwrap();
-    let (_, header_len) = replay_analyzer::header::parse(&data).unwrap();
+    let (_, _, header_len) = replay_analyzer::header::parse(&data).unwrap();
 
     let mut chunked = data[..header_len].to_vec();
     for (i, part) in data[header_len..].chunks(1 << 20).enumerate() {
@@ -283,10 +283,16 @@ fn chunked_layout_matches_single_stream() {
 
     let legacy = Round::from_bytes(&raw, ReadMode::Full).unwrap();
     let repacked = Round::from_bytes(&chunked, ReadMode::Full).unwrap();
-    assert_eq!(
-        serde_json::to_value(&legacy).unwrap(),
-        serde_json::to_value(&repacked).unwrap()
-    );
+    // The container facts differ by construction: layout, frame count, and
+    // the frame index (now inside the first compressed frame).
+    let content = |r: &Round| {
+        let mut v = serde_json::to_value(r).unwrap();
+        for key in ["replay", "timing", "decodeStatus"] {
+            v.as_object_mut().unwrap().remove(key);
+        }
+        v
+    };
+    assert_eq!(content(&legacy), content(&repacked));
 }
 
 /// Y11S3 round from a pro match: fixed facts checked against the game.
@@ -385,4 +391,452 @@ fn extended_data_is_consistent() {
             path.display()
         );
     }
+}
+
+#[test]
+fn y11s3_container_and_version_are_decoded() {
+    let Some(dir) = data_dir() else { return };
+    let Some(round) = y11s3(&dir, "custom_1.rec") else {
+        return;
+    };
+    let f = &round.format;
+    assert!(f.prelude_decoded);
+    assert_eq!((f.magic.as_str(), f.format_version), ("dissect", 8));
+    assert_eq!(f.property_count, 175);
+    assert_eq!(round.header.keys.iter().map(|k| k.1).sum::<u32>(), 175);
+    let v = &round.version;
+    assert_eq!(v.season.as_deref(), Some("Y11S3"));
+    assert_eq!((v.branch.as_str(), v.build), ("Alpha04", 9883691));
+    assert_eq!(round.parser.decoder, "Y9S4");
+    assert_eq!(round.header.is_spectator, Some(true));
+    // The index holds exactly the frames the prelude announces.
+    let t = round.timing.as_ref().unwrap();
+    assert_eq!(t.frames as u32, f.declared_frames);
+    assert!((t.sample_rate - 29.4).abs() < 0.1, "{}", t.sample_rate);
+    assert!(t.gaps.is_empty());
+    // starttime and endtime (UTC) agree with the frame index, and put the
+    // local header timestamp three hours behind UTC.
+    assert_eq!(t.started_at.as_deref(), Some("2026-09-12T20:05:51.067Z"));
+    assert_eq!(t.header_utc_offset_minutes, Some(-180));
+    assert!(
+        round.decode.warnings.is_empty(),
+        "{:?}",
+        round.decode.warnings
+    );
+    let file = round.file.as_ref().unwrap();
+    assert_eq!(file.size, 9141431);
+    assert_eq!(file.sha256.len(), 64);
+}
+
+#[test]
+fn every_valid_replay_has_a_frame_index() {
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Full).unwrap();
+        let t = round.timing.as_ref().expect("frame index");
+        assert_eq!(
+            t.frames as u32,
+            round.format.declared_frames,
+            "{}",
+            path.display()
+        );
+        assert!(
+            t.sample_rate > 20.0,
+            "{}: {}",
+            path.display(),
+            t.sample_rate
+        );
+        // Header-only reads find the same index without the packet data.
+        let fast = Round::open(&path, ReadMode::Header).unwrap();
+        assert_eq!(fast.timing.map(|t| t.frames), Some(t.frames));
+        assert_eq!(fast.header.match_id, round.header.match_id);
+    }
+}
+
+#[test]
+fn decode_status_reports_what_can_be_trusted() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Full).unwrap();
+        let status = |f: &str| round.decode.get(f).unwrap().status;
+        assert_eq!(status("header"), Status::Decoded, "{}", path.display());
+        assert!(status("kills").trusted(), "{}", path.display());
+        let result = if round.header.code_version >= replay_analyzer::types::version::Y9S4 {
+            Status::Decoded
+        } else {
+            Status::Inferred
+        };
+        assert_eq!(status("result"), result, "{}", path.display());
+        let partial = Round::open(&path, ReadMode::Partial).unwrap();
+        assert_eq!(
+            partial.decode.get("result").unwrap().status,
+            Status::Skipped
+        );
+    }
+    // Y11S3 scoreboard packets no longer match players; that must show.
+    if let Some(round) = y11s3(&dir, "custom_1.rec") {
+        assert_eq!(
+            round.decode.get("scoreboard").unwrap().status,
+            Status::Missing
+        );
+        assert!(!round.decode.trusted);
+    }
+}
+
+#[test]
+fn census_counts_known_and_unknown_fields() {
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let options = replay_analyzer::ReadOptions {
+            mode: ReadMode::Full,
+            census: true,
+        };
+        let round = Round::open(&path, options).unwrap();
+        let c = round.census.as_ref().unwrap();
+        // Quick matches have no ban phase, so no operator icons.
+        let core = ["player", "time", "legacyTime", "feedback", "health", "item"];
+        let missing: Vec<_> = c
+            .packets_not_seen
+            .iter()
+            .filter(|p| core.contains(p))
+            .collect();
+        assert!(missing.is_empty(), "{}: {missing:?}", path.display());
+        let missing: Vec<_> = c
+            .fields_not_seen
+            .iter()
+            .filter(|p| core.contains(p))
+            .collect();
+        assert!(missing.is_empty(), "{}: {missing:?}", path.display());
+        assert!(
+            c.unknown_header_keys.is_empty(),
+            "{}: {:?}",
+            path.display(),
+            c.unknown_header_keys
+        );
+        assert!(c.fields.iter().any(|f| f.known == Some("health")));
+        assert!(c.unknown_fields > 50, "{}", path.display());
+        let time = c.packets.iter().find(|p| p.name.ends_with("ime")).unwrap();
+        assert!(time.seen > 100);
+    }
+}
+
+#[test]
+fn temporary_recordings_are_refused() {
+    let dir = std::env::temp_dir().join(format!("ra-tmprec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("P1_50_Y2026_M9_D12_H17_M05_FrameDataStream.tmprec");
+    std::fs::write(&path, b"dissect").unwrap();
+    assert!(matches!(
+        Round::open(&path, ReadMode::Full),
+        Err(Error::TemporaryFile(_))
+    ));
+    // A folder with only temporary files has no rounds.
+    assert!(matches!(
+        replay_analyzer::Match::open(&dir),
+        Err(Error::InvalidFolder)
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn match_folder_groups_rounds_and_spots_gaps() {
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.is_dir() {
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ra-match-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // Rounds 1, 2, 4 and 10 as R-files, a stray copy, and a temporary file.
+    for (from, to) in [(1, "R01"), (2, "R02"), (4, "R04"), (10, "R10"), (2, "copy")] {
+        std::fs::copy(
+            src.join(format!("custom_{from}.rec")),
+            tmp.join(format!("{to}.rec")),
+        )
+        .unwrap();
+    }
+    std::fs::write(tmp.join("x_StaticData.tmprec"), b"").unwrap();
+
+    let m = replay_analyzer::Match::open_with(&tmp, ReadMode::Header).unwrap();
+    let f = m.folder.as_ref().unwrap();
+    std::fs::remove_dir_all(&tmp).unwrap();
+    assert_eq!(f.round_files, 5);
+    assert_eq!(f.rounds, vec![1, 2, 4, 10]);
+    assert_eq!(f.missing_rounds, vec![3, 5, 6, 7, 8, 9]);
+    assert_eq!(f.match_ids.len(), 1);
+    assert_eq!(f.complete, Some(true));
+    assert_eq!(f.final_score, Some([3, 7]));
+    let skipped: Vec<_> = f.skipped.iter().map(|s| s.file.as_str()).collect();
+    assert_eq!(skipped, ["x_StaticData.tmprec", "copy.rec"]);
+    let order: Vec<_> = m.rounds.iter().map(|r| r.header.round_number).collect();
+    assert_eq!(order, [0, 1, 3, 9]);
+}
+
+#[test]
+fn match_summary_describes_the_whole_match() {
+    use replay_analyzer::summary::Outcome;
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.is_dir() {
+        return;
+    }
+    // Header-only reads must be enough for match history.
+    let m = replay_analyzer::Match::open_with(&src, ReadMode::Header).unwrap();
+    let s = m.summary().unwrap();
+    assert_eq!(s.match_id, "8f0fe7b9-461c-4294-95a1-be4d25709562");
+    assert!(!s.start_time_is_local);
+    assert_eq!(s.start_time.to_rfc3339(), "2026-09-12T20:05:51.067+00:00");
+    assert!(s.end_time.unwrap() > s.start_time);
+    assert_eq!(s.queue, "custom");
+    assert_eq!(s.game_mode.name(), Some("Bomb"));
+    assert_eq!(s.map.name, "BankY10");
+    assert_eq!(s.map.base.as_deref(), Some("Bank"));
+    assert_eq!(s.map.version.as_deref(), Some("Y10"));
+    assert_eq!(s.rules.rounds_to_win, 7);
+    assert_eq!(s.rules.overtime_rounds_to_win, Some(8));
+    assert_eq!(s.rules.max_players_per_team, Some(5));
+    assert_eq!(s.rules.game_mode_settings.len(), 61);
+    assert_eq!(s.teams[0].name, "LUCKY FIVE");
+    assert_eq!(s.teams[1].name, "FAZE CLAN");
+    assert_eq!(s.teams[0].players.len(), 5);
+    assert_eq!(s.teams[0].starting_side, Some(TeamRole::Defense));
+    assert!(s.recording.spectator);
+    assert_eq!(s.your_team, None);
+    assert_eq!(s.result.final_score, [3, 7]);
+    assert_eq!(s.result.winner, Some(1));
+    assert_eq!(s.result.outcome, Outcome::Decided);
+    assert_eq!(s.result.ended_early, Some(false));
+    assert!(s.result.complete && !s.result.overtime);
+
+    assert_eq!(s.rounds.len(), 10);
+    // Sides swap after six rounds of twelve.
+    assert_eq!(s.rounds[5].sides[0], Some(TeamRole::Defense));
+    assert_eq!(s.rounds[6].sides[0], Some(TeamRole::Attack));
+    // FaZe went into the last round on 6.
+    assert_eq!(s.rounds[9].score_before, [3, 6]);
+    assert_eq!(s.rounds[9].match_point, [false, true]);
+    assert!(
+        s.rounds[..9]
+            .iter()
+            .all(|r| r.match_point == [false, false])
+    );
+    let wins: Vec<_> = s.rounds.iter().map(|r| r.winner.unwrap()).collect();
+    assert_eq!(wins, [0, 0, 1, 1, 1, 1, 1, 0, 1, 1]);
+}
+
+#[test]
+fn y11s3_bans_levels_and_picks() {
+    let Some(dir) = data_dir() else { return };
+    let Some(r10) = y11s3(&dir, "custom_10.rec") else {
+        return;
+    };
+    // Each team bans operators of the side it plays against.
+    let bans: Vec<_> = r10
+        .bans
+        .iter()
+        .map(|b| (b.team, b.operator.and_then(|o| o.name())))
+        .collect();
+    assert_eq!(
+        bans,
+        [
+            (Some(0), Some("Castle")),
+            (Some(0), Some("Wamai")),
+            (Some(0), Some("Goyo")),
+            (Some(1), Some("Ace")),
+            (Some(1), Some("Hibana")),
+            (Some(1), Some("Ying")),
+        ]
+    );
+    let level = |name: &str| {
+        r10.header
+            .players
+            .iter()
+            .find(|p| p.username == name)
+            .and_then(|p| p.level)
+    };
+    assert_eq!(level("WIZARD.L5"), Some(1039));
+    assert_eq!(level("cyber.FaZe"), Some(364));
+    assert!(r10.header.players.iter().all(|p| p.level.is_some()));
+
+    let m = replay_analyzer::Match::open(dir.join("valid/Y11S3")).unwrap();
+    let s = m.summary().unwrap();
+    assert_eq!(s.teams[1].players[2].level, Some(364));
+    // Bassetto swapped from Montagne to Ying in round 7.
+    let pick = s.rounds[6]
+        .picks
+        .iter()
+        .find(|p| p.username == "Bassetto.L5")
+        .unwrap();
+    let ops: Vec<_> = pick.operators.iter().map(|o| o.name().unwrap()).collect();
+    assert_eq!(ops, ["Montagne", "Ying"]);
+    assert!(
+        s.rounds
+            .iter()
+            .all(|r| r.picks.len() == 10 && r.bans.len() >= 4)
+    );
+}
+
+/// Every Y11S3 round: the end reason from events agrees with the header's
+/// winner, the clock resolves into prep then action, and ten players start.
+#[test]
+fn y11s3_rounds_end_and_phase_consistently() {
+    use replay_analyzer::{Phase, ReasonSource, WinCondition};
+    let Some(dir) = data_dir() else { return };
+    let mut reasons = Vec::new();
+    for n in 1..=10 {
+        let Some(round) = y11s3(&dir, &format!("custom_{n}.rec")) else {
+            return;
+        };
+        let info = round.info();
+        assert_eq!(info.number, n, "custom_{n}");
+        assert_eq!(
+            info.end_reason_source,
+            ReasonSource::Confirmed,
+            "custom_{n}: {:?}",
+            info.warnings
+        );
+        assert_eq!(info.players_at_start, Some([5, 5]), "custom_{n}");
+        let phases: Vec<Phase> = info.phases.iter().map(|p| p.phase).collect();
+        assert_eq!(&phases[..2], [Phase::Prep, Phase::Action], "custom_{n}");
+        assert_eq!(phases.last(), Some(&Phase::End), "custom_{n}");
+        assert_eq!(info.planted, phases.contains(&Phase::Planted), "custom_{n}");
+        // One timeline: events never go back in time.
+        let elapsed: Vec<f64> = round.match_feedback.iter().map(|u| u.elapsed).collect();
+        assert!(
+            elapsed.windows(2).all(|w| w[0] <= w[1]),
+            "custom_{n}: {elapsed:?}"
+        );
+        assert!(
+            round.timing.as_ref().unwrap().clock_gaps.is_empty(),
+            "custom_{n}"
+        );
+        reasons.push(info.end_reason.unwrap());
+    }
+    use WinCondition::*;
+    assert_eq!(
+        reasons,
+        [
+            KilledOpponents,
+            DisabledDefuser,
+            KilledOpponents,
+            KilledOpponents,
+            KilledOpponents,
+            KilledOpponents,
+            DisabledDefuser,
+            KilledOpponents,
+            KilledOpponents,
+            KilledOpponents,
+        ]
+    );
+}
+
+/// Y11S3 defuser objects: plants and disables with their clock, and the
+/// player named when only one of that side was alive.
+#[test]
+fn y11s3_defuser_plants_and_disables() {
+    use replay_analyzer::MatchUpdateType::*;
+    let Some(dir) = data_dir() else { return };
+    let events = |name: &str| -> Option<Vec<(replay_analyzer::MatchUpdateType, String, String)>> {
+        let round = y11s3(&dir, name)?;
+        Some(
+            round
+                .match_feedback
+                .iter()
+                .filter(|u| matches!(u.kind, DefuserPlantComplete | DefuserDisableComplete))
+                .map(|u| (u.kind, u.username.clone(), u.time.clone()))
+                .collect(),
+        )
+    };
+    let Some(r2) = events("custom_2.rec") else {
+        return;
+    };
+    assert_eq!(
+        r2,
+        [
+            (DefuserPlantComplete, "soulz1.FaZe".into(), "0:29".into()),
+            (DefuserDisableComplete, String::new(), "0:33".into()),
+        ]
+    );
+    // Planted as the action clock hit 0:00; disabled by the last defender.
+    let r7 = events("custom_7.rec").unwrap();
+    assert_eq!(
+        r7,
+        [
+            (DefuserPlantComplete, String::new(), "0:00".into()),
+            (DefuserDisableComplete, "Handyy.FaZe".into(), "0:04".into()),
+        ]
+    );
+    // Started but abandoned plants do not complete.
+    assert!(events("custom_10.rec").unwrap().is_empty());
+}
+
+/// The kill that ends a round is logged after the clock resets to 0:00; it
+/// keeps the last live second. Prep swaps name both operators.
+#[test]
+fn y11s3_end_clock_and_swaps() {
+    use replay_analyzer::Phase;
+    let Some(dir) = data_dir() else { return };
+    let Some(round) = y11s3(&dir, "custom_1.rec") else {
+        return;
+    };
+    let last = round.match_feedback.last().unwrap();
+    assert_eq!((last.time.as_str(), last.phase), ("0:12", Phase::End));
+
+    let round = y11s3(&dir, "custom_3.rec").unwrap();
+    let swaps: Vec<_> = round
+        .info()
+        .swaps
+        .iter()
+        .map(|s| (s.username.clone(), s.from.name(), s.to.name(), s.late))
+        .collect();
+    assert_eq!(
+        swaps,
+        [
+            ("Handyy.FaZe".into(), Some("SolidSnake"), Some("IQ"), false),
+            ("kds.FaZe".into(), Some("Lion"), Some("Ram"), false),
+            (
+                "soulz1.FaZe".into(),
+                Some("Capitao"),
+                Some("Striker"),
+                false
+            ),
+            ("Handyy.FaZe".into(), Some("IQ"), Some("Twitch"), true),
+            ("cyber.FaZe".into(), Some("Ash"), Some("Deimos"), true),
+        ]
+    );
+    assert!(round.info().swaps.iter().all(|s| s.phase == Phase::Prep));
+}
+
+#[test]
+fn match_analytics_add_up() {
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.is_dir() {
+        return;
+    }
+    let m = replay_analyzer::Match::open(&src).unwrap();
+    let a = m.analytics();
+    let won: Vec<u32> = a
+        .teams
+        .iter()
+        .map(|t| t.attack.won + t.defense.won)
+        .collect();
+    assert_eq!(won, [3, 7]);
+    for t in &a.teams {
+        assert_eq!(t.attack.played + t.defense.played, 10);
+    }
+    let site_rounds: u32 = a.sites.iter().map(|s| s.defense.played).sum();
+    assert_eq!(site_rounds, 10);
+    let reasons: u32 = a.end_reasons.iter().map(|e| e.rounds).sum();
+    assert_eq!(reasons, 10);
+    // Every attacker spawns once per attacking round.
+    let picks: u32 = a.spawns.iter().map(|s| s.picks.played).sum();
+    assert_eq!(picks, 5 * 10);
+    let operator_rounds: u32 = a.operators.iter().map(|o| o.rounds.played).sum();
+    assert_eq!(operator_rounds, 10 * 10);
+    let s = m.summary().unwrap();
+    let wp = s.rounds[0].win_probability.unwrap();
+    assert_eq!(wp, [0.5, 0.5]);
+    assert!(s.rounds[9].win_probability.unwrap()[1] > 0.9);
 }

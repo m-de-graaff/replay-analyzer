@@ -14,16 +14,35 @@ pub struct Ban {
     pub operator: Option<Operator>,
     /// The side the banned operator plays on.
     pub role: TeamRole,
+    /// Index of the team that owns the ban slot, i.e. the team that banned
+    /// the operator (Y11S3+). Slots are listed in the game's order, so bans
+    /// of one team keep their slot order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<usize>,
     /// The operator's role image id, which is all the replay records.
     pub icon: u64,
 }
 
-/// The two timed parts of a round.
+/// Where in the round something happened. Inferred from the clock: prep
+/// counts down from 45 seconds, action from its round length, and a plant
+/// restarts the clock at the defuser timer. `End` covers what the replay
+/// records after the round was decided (the clock resets to 0:00).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
 pub enum Phase {
     #[default]
     Prep,
     Action,
+    /// After the defuser was planted.
+    Planted,
+    /// After the round was decided.
+    End,
+}
+
+impl Phase {
+    /// Action or after the plant: the part of the round where fighting counts.
+    pub fn is_live(self) -> bool {
+        matches!(self, Phase::Action | Phase::Planted)
+    }
 }
 
 /// A change to a player's health, from damage or healing.
@@ -40,6 +59,10 @@ pub struct HealthUpdate {
     pub time: String,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub time_in_seconds: f64,
+    pub phase: Phase,
+    /// Seconds since the prep phase started; see `Round::phases`.
+    #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
+    pub elapsed: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -59,6 +82,9 @@ pub struct LifeEvent {
     pub time: String,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub time_in_seconds: f64,
+    pub phase: Phase,
+    #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
+    pub elapsed: f64,
 }
 
 /// A stretch of time a player spent looking through an observation device.
@@ -75,6 +101,9 @@ pub struct ObservationSession {
     pub time: String,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub time_in_seconds: f64,
+    /// Seconds since the prep phase started, when the session started.
+    #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
+    pub elapsed: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub seconds: f64,
 }

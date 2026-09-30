@@ -12,7 +12,9 @@ use crate::decoder::ParserInfo;
 use crate::error::{Error, Result};
 use crate::file::{self, FileInfo, MatchFolderName, TempRecording};
 use crate::format::GameVersion;
-use crate::matches::{FolderReport, Match, UnsavedGap, find_match_folders};
+use crate::matches::{
+    FolderReport, IdGap, MIN_ROUND_IDS, Match, file_name, find_match_folders, unused_ids,
+};
 use crate::round::{ReadMode, Round};
 use crate::summary::MatchSummary;
 
@@ -90,15 +92,15 @@ pub struct Session {
     /// Match folders, oldest first.
     pub folders: Vec<String>,
     pub rounds: usize,
+    /// Ids start at 0 when the game starts, so a higher first id means the
+    /// run recorded earlier rounds that are not here, at 9 to 12 ids each.
     pub first_recording_id: u32,
     pub last_recording_id: u32,
-    /// Ids the session used before its first round here: recordings made
-    /// earlier in the same run of the game that are not in the library, at
-    /// 9 to 12 ids per round.
-    pub ids_before_first: u32,
-    /// Ids skipped between two rounds, within or across folders.
+    /// Ids no round here used, between two rounds of the session. Fewer than
+    /// 9 cannot be a saved round: a recording was started and never saved.
+    /// More can also be rounds or matches no longer here.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unsaved_recordings: Vec<UnsavedGap>,
+    pub id_gaps: Vec<IdGap>,
 }
 
 /// The same round found more than once.
@@ -125,7 +127,7 @@ pub enum DuplicateKind {
 struct Recording {
     file: String,
     id: u32,
-    streams: u32,
+    streams: usize,
 }
 
 /// A game-named folder and its rounds' recordings, for [`sessions`].
@@ -162,23 +164,23 @@ fn sessions(mut folders: Vec<SessionFolder>) -> Vec<Session> {
                 rounds: 0,
                 first_recording_id: first.id,
                 last_recording_id: first.id,
-                ids_before_first: first.id,
-                unsaved_recordings: Vec::new(),
+                id_gaps: Vec::new(),
             });
             last = None;
         }
         let s = out.last_mut().expect("pushed above");
         s.folders.push(f.folder);
         for r in recordings {
-            if let Some((_, prev)) = &last {
-                let expected = prev.id + 1 + prev.streams;
-                if r.id > expected {
-                    s.unsaved_recordings.push(UnsavedGap {
-                        after: prev.file.clone(),
-                        before: r.file.clone(),
-                        ids: r.id - expected,
-                    });
-                }
+            if let Some(ids) = last
+                .as_ref()
+                .and_then(|(_, prev)| unused_ids(prev.id, prev.streams, r.id))
+            {
+                let (_, prev) = last.as_ref().expect("checked above");
+                s.id_gaps.push(IdGap {
+                    after: prev.file.clone(),
+                    before: r.file.clone(),
+                    ids,
+                });
             }
             s.rounds += 1;
             s.last_recording_id = r.id;
@@ -232,7 +234,7 @@ pub fn scan(root: &Path, mode: ReadMode) -> Result<Library> {
                         Some(Recording {
                             file: file_name(r),
                             id: c.recording_id?,
-                            streams: c.streams.len() as u32,
+                            streams: c.streams.len(),
                         })
                     })
                     .collect(),
@@ -271,13 +273,6 @@ pub fn scan(root: &Path, mode: ReadMode) -> Result<Library> {
     lib.temporary.dedup_by(|a, b| a.file == b.file);
     lib.warnings = library_warnings(&lib);
     Ok(lib)
-}
-
-fn file_name(r: &Round) -> String {
-    r.file
-        .as_ref()
-        .map(|f| f.file_name.clone())
-        .unwrap_or_default()
 }
 
 fn library_round(r: &Round) -> LibraryRound {
@@ -380,16 +375,18 @@ fn library_warnings(lib: &Library) -> Vec<String> {
         ));
     }
     for s in &lib.sessions {
-        match s.unsaved_recordings.len() {
-            0 => {}
-            1 => w.push(format!(
-                "game process {}: a recording was started and never saved",
-                s.process_id
-            )),
-            n => w.push(format!(
-                "game process {}: {n} recordings were started and never saved",
-                s.process_id
-            )),
+        for g in &s.id_gaps {
+            w.push(if g.ids < MIN_ROUND_IDS {
+                format!(
+                    "game process {}: a recording was started between {} and {} and never saved",
+                    s.process_id, g.after, g.before
+                )
+            } else {
+                format!(
+                    "game process {}: {} ids unused between {} and {}: rounds no longer here, or recordings never saved",
+                    s.process_id, g.ids, g.after, g.before
+                )
+            });
         }
     }
     if !lib.duplicates.is_empty() {
@@ -424,7 +421,7 @@ mod tests {
                 .map(|(i, &(id, streams))| Recording {
                     file: format!("{name}-R{:02}.rec", i + 1),
                     id,
-                    streams,
+                    streams: streams as usize,
                 })
                 .collect(),
         }
@@ -439,10 +436,9 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].folders, ["A", "B"]);
         assert_eq!((s[0].first_recording_id, s[0].last_recording_id), (0, 23));
-        assert_eq!(s[0].ids_before_first, 0);
         assert_eq!(
-            s[0].unsaved_recordings,
-            [UnsavedGap {
+            s[0].id_gaps,
+            [IdGap {
                 after: "A-R01.rec".into(),
                 before: "B-R01.rec".into(),
                 ids: 1
@@ -453,8 +449,8 @@ mod tests {
     #[test]
     fn a_session_that_starts_late_counts_the_ids_before_it() {
         let s = sessions(vec![folder("C", 9, "2026-09-20T00:32:29", &[(156, 10)])]);
-        assert_eq!(s[0].ids_before_first, 156);
-        assert!(s[0].unsaved_recordings.is_empty());
+        assert_eq!(s[0].first_recording_id, 156);
+        assert!(s[0].id_gaps.is_empty());
     }
 
     #[test]
@@ -465,6 +461,17 @@ mod tests {
         ]);
         assert_eq!(s.len(), 2);
         assert_eq!(s[1].folders, ["New"]);
-        assert!(s.iter().all(|s| s.unsaved_recordings.is_empty()));
+        assert!(s.iter().all(|s| s.id_gaps.is_empty()));
+    }
+
+    #[test]
+    fn garbage_recording_ids_do_not_overflow_a_session() {
+        let s = sessions(vec![folder(
+            "D",
+            3,
+            "2026-09-20T00:00:00",
+            &[(u32::MAX - 1, 10), (u32::MAX, 10)],
+        )]);
+        assert!(s[0].id_gaps.is_empty());
     }
 }

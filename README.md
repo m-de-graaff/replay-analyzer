@@ -103,7 +103,7 @@ A match folder adds `summary`, one record per match for match history. It is bui
 
 A match folder also adds `folder`: rounds found and missing (numbered from 1 like `R01.rec`), duplicate round numbers, skipped files (`.tmprec`, byte-identical copies, unreadable files), the match ids seen, the final score and whether the match finished. Rounds are ordered by the header's round number, not the file name. One unreadable round no longer fails the whole folder.
 
-`name` reads the game's folder name, `Match-2026-09-20_00-32-29-13160`: when the folder was created, in local time, and the game's process id. Each round file's name (`…-R03.rec`) is checked against its header and its folder. `incomplete` lists round files the game did not finish writing, `unsavedRecordings` the stream ids skipped between two rounds (a recording that was started and never saved), and `temporary` any `.tmprec` files, with what their names say.
+`name` reads the game's folder name, `Match-2026-09-20_00-32-29-13160`: when the folder was created, in local time, and the game's process id. Each round file's name (`…-R03.rec`) is checked against its header and its folder. `incomplete` lists round files the game did not finish writing, `unsavedRecordings` the stream ids skipped between two consecutive rounds (a recording that was started and never saved), and `temporary` any `.tmprec` files, with what their names say.
 
 ## Match history folder
 
@@ -112,11 +112,11 @@ A match folder also adds `folder`: rounds found and missing (numbered from 1 lik
 | Key | What it holds |
 |---|---|
 | `folders[]` | Each folder's `folder` report and `summary`, and `roundList`: per round the file, round number, `matchID`, `startTime` (UTC, Y11S3+), `localTime`, version, parser, `recordingId`, `complete`, frame count, sample rate and gaps. |
-| `sessions[]` | One per run of the game: process id, folders, rounds, first and last `recordingId`, `idsBeforeFirst` (recordings of that run no longer in the folder, 9 to 12 ids per round) and `unsavedRecordings` within and across folders. The same process id starting over at 0 is a new run. |
+| `sessions[]` | One per run of the game: process id, folders, rounds, and first and last `recordingId`. Ids start at 0 when the game starts, so a higher first id means rounds of that run are no longer in the folder, at 9 to 12 ids each. `idGaps` lists ids no round used between two rounds, within or across folders: fewer than 9 is a recording that was never saved, more can also be rounds no longer here. The same process id starting over at 0 is a new run. |
 | `duplicates[]` | `sameFile`: byte-identical copies. `sameRound`: different files of the same round of the same match, such as a teammate's recording of it. |
 | `temporary[]` | `.tmprec` files under the folder, in its `DissectTmp`, and, for a `MatchReplay` folder, in the game folder around it and that folder's `DissectTmp`. |
 
-The game keeps a fixed number of matches: the folder held 30 on both days it was read, the oldest dropping out as new ones arrived. Copy out what should last; `idsBeforeFirst` shows how much of a session is already gone.
+The game keeps a fixed number of matches: the folder held 30 on both days it was read, the oldest dropping out as new ones arrived. Copy out what should last; a session's `firstRecordingId` shows how much of it is already gone.
 
 The library equivalent is `library::scan(path, ReadMode::Header)`.
 

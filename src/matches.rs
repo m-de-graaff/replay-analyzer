@@ -30,17 +30,35 @@ pub struct SkippedFile {
     pub reason: String,
 }
 
-/// Stream ids no saved round used, between two rounds of a folder.
+/// Stream ids no round used, between two recordings.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct UnsavedGap {
+pub struct IdGap {
     /// The round file before the skipped ids, and the one after.
     pub after: String,
     pub before: String,
     /// How many ids were skipped. A recording takes one id when it starts
-    /// and one per stream as they are created, so each unsaved recording
-    /// accounts for at least one.
+    /// and one per stream as they are created, so each recording that was
+    /// never saved accounts for at least one, and a saved round for
+    /// `MIN_ROUND_IDS` or more.
     pub ids: u32,
+}
+
+/// The fewest ids a saved round takes: its main id and 8 streams, the
+/// fewest seen. A smaller gap cannot be a round that is no longer there.
+pub const MIN_ROUND_IDS: u32 = 9;
+
+/// The id the next recording takes after one that took `id` and one per
+/// stream. `None` for ids too large to be real.
+pub(crate) fn next_recording_id(id: u32, streams: usize) -> Option<u32> {
+    id.checked_add(1)?.checked_add(u32::try_from(streams).ok()?)
+}
+
+/// Ids skipped between a recording (`id`, `streams`) and the next one to
+/// start, at `next`.
+pub(crate) fn unused_ids(id: u32, streams: usize, next: u32) -> Option<u32> {
+    next.checked_sub(next_recording_id(id, streams)?)
+        .filter(|&n| n > 0)
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -64,10 +82,10 @@ pub struct FolderReport {
     /// Round files the game did not finish writing (`replay.container`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub incomplete: Vec<String>,
-    /// Recordings started between two rounds and never saved, found from the
-    /// stream ids the rounds use (Y8S4+).
+    /// Recordings started between two consecutive rounds and never saved,
+    /// found from the stream ids the rounds use (Y8S4+).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub unsaved_recordings: Vec<UnsavedGap>,
+    pub unsaved_recordings: Vec<IdGap>,
     /// Match ids across the rounds; more than one means the folder mixes
     /// matches.
     pub match_ids: Vec<String>,
@@ -192,7 +210,7 @@ fn display_name(path: &Path) -> String {
     )
 }
 
-fn file_name(r: &Round) -> String {
+pub(crate) fn file_name(r: &Round) -> String {
     r.file
         .as_ref()
         .map(|f| f.file_name.clone())
@@ -283,18 +301,11 @@ pub fn analyze(rounds: &[Round]) -> FolderReport {
 /// used. Each round takes its recording id and one id per stream; the next
 /// recording the game starts takes the id after.
 fn recording_gaps(rounds: &[Round], report: &mut FolderReport) {
-    let recorded: Vec<(&Round, &crate::Container, u32)> = rounds
+    report.incomplete = rounds
         .iter()
-        .filter_map(|r| {
-            let c = r.container.as_ref()?;
-            Some((r, c, c.recording_id?))
-        })
+        .filter(|r| r.container.as_ref().is_some_and(|c| !c.complete))
+        .map(file_name)
         .collect();
-    for (r, c, _) in &recorded {
-        if !c.complete {
-            report.incomplete.push(file_name(r));
-        }
-    }
     match report.incomplete.as_slice() {
         [] => {}
         [one] => report.warnings.push(format!(
@@ -305,14 +316,25 @@ fn recording_gaps(rounds: &[Round], report: &mut FolderReport) {
             many.join(", ")
         )),
     }
+    let recorded: Vec<(&Round, usize, u32)> = rounds
+        .iter()
+        .filter_map(|r| {
+            let c = r.container.as_ref()?;
+            Some((r, c.streams.len(), c.recording_id?))
+        })
+        .collect();
     for w in recorded.windows(2) {
-        let ((a, ca, first), (b, _, next)) = (w[0], w[1]);
-        let expected = first + 1 + ca.streams.len() as u32;
-        if next > expected {
-            let gap = UnsavedGap {
+        let ((a, streams, first), (b, _, next)) = (w[0], w[1]);
+        // Rounds that do not follow each other are missing ones or copies,
+        // already reported.
+        if a.header.round_number.checked_add(1) != Some(b.header.round_number) {
+            continue;
+        }
+        if let Some(ids) = unused_ids(first, streams, next) {
+            let gap = IdGap {
                 after: file_name(a),
                 before: file_name(b),
-                ids: next - expected,
+                ids,
             };
             report.warnings.push(format!(
                 "{} stream ids unused between {} and {}: a recording was started there and never saved",
@@ -546,7 +568,7 @@ mod tests {
         let r = analyze(&rounds);
         assert_eq!(
             r.unsaved_recordings,
-            [UnsavedGap {
+            [IdGap {
                 after: "R01.rec".into(),
                 before: "R02.rec".into(),
                 ids: 1
@@ -560,12 +582,52 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_round_is_not_an_unsaved_recording() {
+        // R02's ids are unused because R02 is missing, which the report
+        // already says; two files for R03 are copies, not a restart.
+        let rounds = [
+            recorded(0, "R01.rec", 0, 10),
+            recorded(2, "R03.rec", 22, 10),
+            recorded(2, "R03 copy.rec", 11, 10),
+        ];
+        let r = analyze(&rounds);
+        assert_eq!(r.missing_rounds, [2]);
+        assert!(
+            r.unsaved_recordings.is_empty(),
+            "{:?}",
+            r.unsaved_recordings
+        );
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("restarted")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn garbage_recording_ids_do_not_overflow() {
+        let r = analyze(&[
+            recorded(0, "R01.rec", u32::MAX - 1, 10),
+            recorded(1, "R02.rec", 5, 10),
+        ]);
+        assert!(r.unsaved_recordings.is_empty());
+    }
+
+    #[test]
     fn lists_files_the_game_did_not_finish() {
         let mut broken = recorded(1, "R02.rec", 11, 10);
         broken.container.as_mut().unwrap().complete = false;
         let r = analyze(&[recorded(0, "R01.rec", 0, 10), broken]);
         assert_eq!(r.incomplete, ["R02.rec"]);
         assert!(r.unsaved_recordings.is_empty());
+    }
+
+    #[test]
+    fn a_file_cut_before_its_stream_list_is_incomplete_too() {
+        let mut cut = round(1, [1, 1], "R02.rec");
+        cut.container = Some(crate::Container::default());
+        let r = analyze(&[recorded(0, "R01.rec", 0, 10), cut]);
+        assert_eq!(r.incomplete, ["R02.rec"]);
     }
 
     #[test]

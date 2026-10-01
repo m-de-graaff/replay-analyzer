@@ -57,8 +57,8 @@ use crate::timeline::Timeline;
 use crate::types::{Operator, TeamRole, attachment_info, item_name};
 
 /// Name hashes of the two streams read here.
-const STATE_STREAM: Hash = [0xA9, 0x8F, 0xDD, 0x0B];
-const MOVEMENT_STREAM: Hash = [0x20, 0xA5, 0xC4, 0xE3];
+pub(crate) const STATE_STREAM: Hash = [0xA9, 0x8F, 0xDD, 0x0B];
+pub(crate) const MOVEMENT_STREAM: Hash = [0x20, 0xA5, 0xC4, 0xE3];
 
 /// Controller -> the player's `PlayerLoadoutViewModel`.
 const LOADOUT_FIELD: Hash = [0xE8, 0xD1, 0xE5, 0x39];
@@ -67,6 +67,9 @@ const PRIMARY_FIELD: Hash = [0x93, 0x27, 0xA1, 0x2B];
 const SECONDARY_FIELD: Hash = [0x03, 0x99, 0x40, 0x83];
 const ABILITY_FIELD: Hash = [0x4C, 0xD6, 0xA0, 0xC7];
 const GADGET_FIELD: Hash = [0xD8, 0x90, 0xB5, 0xF7];
+/// The four slot fields: primary, secondary, ability, gadget.
+pub(crate) const SLOT_FIELDS: [Hash; 4] =
+    [PRIMARY_FIELD, SECONDARY_FIELD, ABILITY_FIELD, GADGET_FIELD];
 /// Slot classes (`GadgetViewModel`, `WeaponViewModel`) and the class of a
 /// weapon slot's ammunition object (`WeaponAmmoViewModel`).
 const GADGET_VIEW: Hash = [0x9F, 0x44, 0x69, 0x0A];
@@ -78,7 +81,7 @@ const AMMO: Hash = [0x14, 0xD1, 0xBD, 0x4F];
 const MAX_AMMO: Hash = [0x3E, 0xB2, 0x43, 0xDC];
 /// Weapon ammunition: rounds in the gun plus in reserve (`TotalAmmo`), and
 /// what a magazine holds (`MagazineSize`).
-const TOTAL_AMMO: Hash = [0x40, 0x0A, 0xC8, 0x29];
+pub(crate) const TOTAL_AMMO: Hash = [0x40, 0x0A, 0xC8, 0x29];
 const MAGAZINE_SIZE: Hash = [0x56, 0xF5, 0x44, 0x0A];
 /// Slot -> item object -> item data, which carries the item id.
 const ITEM_OBJECT_FIELD: Hash = [0xD1, 0x9C, 0x57, 0x16];
@@ -245,10 +248,10 @@ pub struct Counted {
 /// One value of a counter, with the frame and offset it was written at.
 /// The frame is `None` in the opening snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Sample {
-    value: u32,
-    frame: Option<u32>,
-    at: usize,
+pub(crate) struct Sample {
+    pub value: u32,
+    pub frame: Option<u32>,
+    pub at: usize,
 }
 
 #[derive(Debug, Default)]
@@ -324,27 +327,35 @@ impl Hud {
                 self.nodes.entry(obj).or_default().item = Some(u64::from_le_bytes(id));
             }
         } else if [AMMO, MAX_AMMO, TOTAL_AMMO, MAGAZINE_SIZE].contains(&hash)
-            && let Ok(v) = <[u8; 4]>::try_from(value)
+            || crate::weapons::COUNTERS.contains(&hash)
         {
-            let value = u32::from_le_bytes(v);
+            if let Ok(v) = <[u8; 4]>::try_from(value) {
+                let value = u32::from_le_bytes(v);
+                let counters = &mut self.nodes.entry(obj).or_default().counters;
+                counters.push((hash, Sample { value, frame, at }));
+            }
+        } else if crate::weapons::FLAGS.contains(&hash)
+            && let [v] = *value
+        {
+            let value = u32::from(v);
             let counters = &mut self.nodes.entry(obj).or_default().counters;
             counters.push((hash, Sample { value, frame, at }));
         }
     }
 
     /// The last child linked to `obj` that `wanted` accepts, with its class.
-    fn last_link(&self, obj: u32, wanted: impl Fn(Hash, Hash) -> bool) -> Option<(u32, Hash)> {
+    pub(crate) fn last_link(&self, obj: u32, wanted: impl Fn(Hash, Hash) -> bool) -> Option<(u32, Hash)> {
         let links = &self.nodes.get(&obj)?.links;
         let (_, child, class) = links.iter().rev().find(|l| wanted(l.0, l.2))?;
         Some((*child, *class))
     }
 
-    fn child(&self, obj: u32, field: Hash) -> Option<u32> {
+    pub(crate) fn child(&self, obj: u32, field: Hash) -> Option<u32> {
         Some(self.last_link(obj, |f, _| f == field)?.0)
     }
 
     /// Every value of one counter of `obj`, in stream order.
-    fn series(&self, obj: u32, counter: Hash) -> impl Iterator<Item = Sample> + '_ {
+    pub(crate) fn series(&self, obj: u32, counter: Hash) -> impl Iterator<Item = Sample> + '_ {
         self.nodes
             .get(&obj)
             .into_iter()
@@ -353,17 +364,46 @@ impl Hud {
             .map(|c| c.1)
     }
 
+    /// The item id of the slot object `slot`.
+    pub(crate) fn item(&self, slot: u32) -> Option<u64> {
+        self.child(slot, ITEM_OBJECT_FIELD)
+            .and_then(|o| self.child(o, ITEM_DATA_FIELD))
+            .and_then(|o| self.nodes.get(&o)?.item)
+    }
+
+    /// The slot object last linked to `field` of the loadout view `view`,
+    /// and whether it is a `WeaponViewModel`.
+    pub(crate) fn slot_object(&self, view: u32, field: Hash) -> Option<(u32, bool)> {
+        let (obj, class) = self.last_link(view, |f, c| {
+            f == field && (c == GADGET_VIEW || c == WEAPON_VIEW)
+        })?;
+        Some((obj, class == WEAPON_VIEW))
+    }
+
+    /// The `WeaponAmmoViewModel` of a weapon slot object.
+    pub(crate) fn ammo_object(&self, slot: u32) -> Option<u32> {
+        Some(self.last_link(slot, |_, c| c == WEAPON_AMMO)?.0)
+    }
+
+    /// The loadout view of the player with this controller that was
+    /// played: the last one with a slot (see [`Hud::slots`]).
+    pub(crate) fn view(&self, controller: u32) -> Option<u32> {
+        let links = &self.nodes.get(&controller)?.links;
+        links
+            .iter()
+            .rev()
+            .filter(|l| l.0 == LOADOUT_FIELD)
+            .map(|l| l.1)
+            .find(|&view| SLOT_FIELDS.iter().any(|&f| self.slot(view, f).is_some()))
+    }
+
     /// The slot last linked to `field` of the loadout view `view`.
     fn slot(&self, view: u32, field: Hash) -> Option<Slot> {
         let (obj, class) = self.last_link(view, |f, c| {
             f == field && (c == GADGET_VIEW || c == WEAPON_VIEW)
         })?;
-        let item = self
-            .child(obj, ITEM_OBJECT_FIELD)
-            .and_then(|o| self.child(o, ITEM_DATA_FIELD))
-            .and_then(|o| self.nodes.get(&o)?.item);
         let mut slot = Slot {
-            item,
+            item: self.item(obj),
             weapon: class == WEAPON_VIEW,
             ..Slot::default()
         };
@@ -397,22 +437,14 @@ impl Hud {
         // A player who leaves has their view unlinked, and whoever takes
         // the seat gets a new one that stays empty until they spawn: the
         // last view with a slot is the one that was played.
-        let links = &self.nodes.get(&controller)?.links;
-        links
-            .iter()
-            .rev()
-            .filter(|l| l.0 == LOADOUT_FIELD)
-            .map(|&(_, view, _)| {
-                [PRIMARY_FIELD, SECONDARY_FIELD, ABILITY_FIELD, GADGET_FIELD]
-                    .map(|f| self.slot(view, f))
-            })
-            .find(|slots| slots.iter().any(Option::is_some))
+        let view = self.view(controller)?;
+        Some(SLOT_FIELDS.map(|f| self.slot(view, f)))
     }
 }
 
 /// `samples` without values repeating the one before: the game sends a
 /// value again without it having changed.
-fn distinct(samples: impl Iterator<Item = Sample>) -> Vec<Sample> {
+pub(crate) fn distinct(samples: impl Iterator<Item = Sample>) -> Vec<Sample> {
     let mut out: Vec<Sample> = Vec::new();
     for s in samples {
         if out.last().is_none_or(|l| l.value != s.value) {
@@ -492,7 +524,7 @@ pub(crate) fn descriptor(payload: &[u8]) -> Option<Descriptor> {
 
 /// The messages of a movement snapshot or record: `(entity, offset of the
 /// payload in block, payload)`. Stops at a message the block cannot hold.
-fn messages(block: &[u8]) -> impl Iterator<Item = (u64, usize, &[u8])> {
+pub(crate) fn messages(block: &[u8]) -> impl Iterator<Item = (u64, usize, &[u8])> {
     let count = block
         .get(..2)
         .map_or(0, |c| u16::from_le_bytes([c[0], c[1]]));
@@ -699,21 +731,75 @@ pub(crate) struct Clock<'a> {
 }
 
 impl Clock<'_> {
-    fn place(&self, count: u32, s: Sample) -> Use {
+    /// Seconds since the recording started for something written in
+    /// `frame`.
+    pub(crate) fn seconds(&self, frame: Option<u32>) -> Option<f64> {
+        self.frame_times.get(frame? as usize).copied()
+    }
+
+    /// When something written at offset `at`, in `frame`, happened: the
+    /// clock reading in force, and the recording time to the millisecond.
+    pub(crate) fn when(&self, at: usize, frame: Option<u32>) -> When {
         // The reading in force is the last one shown before the offset.
         let tick = self
             .reading_offsets
-            .partition_point(|&o| o <= s.at)
+            .partition_point(|&o| o <= at)
             .checked_sub(1);
         let at = self.timeline.at(tick);
-        let seconds = s.frame.and_then(|f| self.frame_times.get(f as usize));
-        Use {
-            count,
+        When {
             time: display_clock(at.seconds),
             phase: at.phase,
             elapsed: at.elapsed,
-            recording_time: seconds.map(|t| (t * 1000.0).round() / 1000.0),
+            recording_time: (self.seconds(frame)).map(|t| (t * 1000.0).round() / 1000.0),
         }
+    }
+
+    fn place(&self, count: u32, s: Sample) -> Use {
+        let when = self.when(s.at, s.frame);
+        Use {
+            count,
+            time: when.time,
+            phase: when.phase,
+            elapsed: when.elapsed,
+            recording_time: when.recording_time,
+        }
+    }
+}
+
+/// When an event happened, as every timed event of a round says it: the
+/// round clock, the phase, seconds since prep started and seconds since
+/// the recording started.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct When {
+    pub time: String,
+    pub phase: Phase,
+    /// Seconds since the prep phase started.
+    #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
+    pub elapsed: f64,
+    /// Seconds since the recording started, to the frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
+}
+
+/// What a decoder of one kind of event reads from: the decompressed data
+/// with its streams, the players, and the clock to place events with.
+pub(crate) struct Input<'a> {
+    pub data: &'a [u8],
+    pub map: &'a RecordMap,
+    pub streams: &'a [StreamInfo],
+    pub players: &'a [Player],
+    pub clock: &'a Clock<'a>,
+}
+
+impl Input<'_> {
+    /// `(start, end, frame)` in `data` of the opening snapshot (frame
+    /// `None`) and of each record of the stream named `name`, in order.
+    pub(crate) fn blocks(
+        &self,
+        name: Hash,
+    ) -> impl Iterator<Item = (usize, usize, Option<u32>)> + '_ {
+        blocks(self.map, self.streams, name)
     }
 }
 
@@ -811,6 +897,8 @@ pub(crate) struct Detail {
 pub(crate) struct Decoded {
     /// `(index into the players, loadout)`.
     pub details: Vec<(usize, Detail)>,
+    /// What each player held, fired and reloaded.
+    pub activity: Vec<crate::weapons::Activity>,
     /// Players whose HUD loadout was found, of how many.
     pub resolved: usize,
     pub expected: usize,
@@ -820,7 +908,7 @@ pub(crate) struct Decoded {
 
 /// `(start, end, frame)` of a stream's opening snapshot and of each of its
 /// records, in order.
-fn blocks(
+pub(crate) fn blocks(
     map: &RecordMap,
     streams: &[StreamInfo],
     name: Hash,
@@ -840,13 +928,14 @@ fn blocks(
 }
 
 /// Reads every player's loadout from the state and movement streams.
-pub(crate) fn decode(
-    data: &[u8],
-    map: &RecordMap,
-    streams: &[StreamInfo],
-    players: &[Player],
-    clock: &Clock,
-) -> Decoded {
+pub(crate) fn decode(input: &Input) -> Decoded {
+    let &Input {
+        data,
+        map,
+        streams,
+        players,
+        clock,
+    } = input;
     let mut hud = Hud::default();
     for (start, end, frame) in blocks(map, streams, STATE_STREAM) {
         if let Some(block) = data.get(start..end) {
@@ -865,6 +954,9 @@ pub(crate) fn decode(
     };
     for (i, p) in players.iter().enumerate() {
         let slots = p.entities.as_ref().and_then(|e| hud.slots(e.controller));
+        let view = p.entities.as_ref().and_then(|e| hud.view(e.controller));
+        out.activity
+            .extend(view.map(|v| crate::weapons::activity(&hud, v, &p.username, clock)));
         let fallback = p.entities.as_ref().and_then(|e| e.movement);
         let body = entities.body(p.id, fallback);
         if slots.is_none() && body.is_none() {

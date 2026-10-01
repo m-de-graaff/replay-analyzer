@@ -26,14 +26,18 @@ pub mod identity;
 pub mod library;
 pub mod loadout;
 pub mod matches;
+pub mod melee;
 pub mod outcome;
 pub mod records;
 pub mod report;
 pub mod round;
+pub mod shots;
 pub mod stats;
 pub mod summary;
+pub mod throws;
 pub mod timeline;
 pub mod types;
+pub mod weapons;
 
 pub use analytics::MatchAnalytics;
 pub use census::Census;

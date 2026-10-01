@@ -70,6 +70,18 @@ pub struct Round {
     pub outcome: RoundOutcome,
     /// Y8S1+: each change of a player's weapon-ready flag, by username.
     pub weapon_ready: Vec<WeaponReady>,
+    /// Y11S3: what each player held, fired and reloaded.
+    pub weapon_activity: Vec<crate::weapons::Activity>,
+    /// Y11S3: every shot, with where it went.
+    pub shots: Vec<crate::shots::Shot>,
+    /// Y11S3: every bullet that hit a player.
+    pub bullet_hits: Vec<crate::shots::Hit>,
+    /// Y11S3: everything thrown or launched.
+    pub throws: Vec<crate::throws::Throw>,
+    /// Y11S3: melee hits on barricades and the map.
+    pub melee_hits: Vec<crate::melee::MeleeHit>,
+    /// Y11S3: shields raised, extended and put away.
+    pub shield_actions: Vec<crate::melee::ShieldAction>,
 }
 
 /// A player's weapon going up (`ready`) or down.
@@ -239,6 +251,18 @@ impl Serialize for Round {
             loadouts: &'a [Loadout],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             weapon_ready: &'a [WeaponReady],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            weapon_activity: &'a [crate::weapons::Activity],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            shots: &'a [crate::shots::Shot],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            bullet_hits: &'a [crate::shots::Hit],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            throws: &'a [crate::throws::Throw],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            melee_hits: &'a [crate::melee::MeleeHit],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            shield_actions: &'a [crate::melee::ShieldAction],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +281,12 @@ impl Serialize for Round {
             observation: &self.observation,
             loadouts: &self.loadouts,
             weapon_ready: &self.weapon_ready,
+            weapon_activity: &self.weapon_activity,
+            shots: &self.shots,
+            bullet_hits: &self.bullet_hits,
+            throws: &self.throws,
+            melee_hits: &self.melee_hits,
+            shield_actions: &self.shield_actions,
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
@@ -622,6 +652,9 @@ struct Parser<'a> {
     /// Y11S3: how many players' loadouts were resolved, with what was not
     /// found, for `decodeStatus.loadouts`.
     loadout_status: Option<crate::loadout::Decoded>,
+    /// Y11S3: `(decodeStatus field, events found, warnings)` of each kind
+    /// of weapon event decoded.
+    weapon_status: Vec<(&'static str, usize, Vec<String>)>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -714,6 +747,7 @@ impl<'a> Parser<'a> {
             records: None,
             frame_times: Vec::new(),
             loadout_status: None,
+            weapon_status: Vec::new(),
         }
     }
 
@@ -1101,6 +1135,12 @@ impl<'a> Parser<'a> {
                 ));
             }
             for w in &l.warnings {
+                f.warn(w.clone());
+            }
+        }
+        for (field, count, warnings) in &self.weapon_status {
+            let f = r.field(field, Status::Decoded, *count);
+            for w in warnings {
                 f.warn(w.clone());
             }
         }
@@ -2512,11 +2552,36 @@ impl<'a> Parser<'a> {
             frame_times: &self.frame_times,
         };
         let players = &self.round.header.players;
-        let mut decoded =
-            crate::loadout::decode(self.data, map, &container.streams, players, &clock);
+        let input = crate::loadout::Input {
+            data: self.data,
+            map,
+            streams: &container.streams,
+            players,
+            clock: &clock,
+        };
+        let mut decoded = crate::loadout::decode(&input);
         for (i, detail) in std::mem::take(&mut decoded.details) {
             crate::loadout::apply(&mut self.round.loadouts, &players[i], detail);
         }
+        let mut activity = std::mem::take(&mut decoded.activity);
+        for a in &mut activity {
+            a.died(&self.round.match_feedback, &self.round.life_events);
+        }
+        let shots = crate::shots::decode(&input);
+        let throws = crate::throws::decode(&input);
+        let melee = crate::melee::decode(&input);
+        self.weapon_status = vec![
+            ("weaponActivity", activity.len(), Vec::new()),
+            ("shots", shots.shots.len(), shots.warnings),
+            ("throws", throws.throws.len(), throws.warnings),
+            ("melee", melee.hits.len() + melee.shields.len(), melee.warnings),
+        ];
+        self.round.weapon_activity = activity;
+        self.round.shots = shots.shots;
+        self.round.bullet_hits = shots.hits;
+        self.round.throws = throws.throws;
+        self.round.melee_hits = melee.hits;
+        self.round.shield_actions = melee.shields;
         self.loadout_status = Some(decoded);
     }
 

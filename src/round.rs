@@ -1840,7 +1840,7 @@ impl<'a> Parser<'a> {
             2 => TeamRole::Defense,
             _ => return Ok(()),
         };
-        // The team is set once the team objects are read (`assign_ban_teams`).
+        // The team is set once the team objects are read (`finish_bans`).
         let color = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
             c.skip(BAN_TEAM.len())?;
             Some(c.u32()?)

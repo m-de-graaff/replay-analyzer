@@ -369,14 +369,19 @@ pub struct Snapshot {
     pub ban_slots: Vec<BanSlot>,
 }
 
-/// Reads the opening snapshot of the object tree.
-pub fn snapshot(body: &[u8]) -> Snapshot {
-    // Y11S3 writes the snapshot before the movement stream; older replays
-    // interleave the two, and their snapshot fits in the opening bytes.
+/// The part of `body` the opening snapshot can be in. Y11S3 writes the
+/// snapshot before the movement stream; older replays interleave the two,
+/// and their snapshot fits in the opening bytes.
+fn snapshot_bytes(body: &[u8]) -> &[u8] {
     let end = first_movement(body)
         .unwrap_or(body.len())
         .min(SNAPSHOT_BYTES);
-    let t = tree(&body[..end]);
+    &body[..end]
+}
+
+/// Reads the opening snapshot of the object tree.
+pub fn snapshot(body: &[u8]) -> Snapshot {
+    let t = tree(snapshot_bytes(body));
     Snapshot {
         players: player_objects(&t),
         ban_slots: ban_slots(&t),
@@ -385,7 +390,7 @@ pub fn snapshot(body: &[u8]) -> Snapshot {
 
 /// Every player's objects in the opening snapshot, in stream order.
 pub fn players(body: &[u8]) -> Vec<PlayerObjects> {
-    snapshot(body).players
+    player_objects(&tree(snapshot_bytes(body)))
 }
 
 /// The slots of the ban manager's arrays. The game sometimes sends the

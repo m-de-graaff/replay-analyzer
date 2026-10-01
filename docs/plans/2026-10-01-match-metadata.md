@@ -74,7 +74,7 @@ All hashes are CRC-32 of the game's property name, little-endian (`crc32("Health
 
 **Interfaces:** Produces table rows only.
 
-- [ ] **Step 1: Failing test** in `src/types/mod.rs`:
+- [x] **Step 1: Failing test** in `src/types/mod.rs`:
 
 ```rust
 #[test]
@@ -86,8 +86,8 @@ fn names_current_maps_and_icons() {
 }
 ```
 
-- [ ] **Step 2: Run** `cargo test --lib names_current_maps_and_icons` — expect FAIL.
-- [ ] **Step 3: Implement.** `MAPS` gains (comments give the evidence):
+- [x] **Step 2: Run** `cargo test --lib names_current_maps_and_icons` — expect FAIL.
+- [x] **Step 3: Implement.** `MAPS` gains (comments give the evidence):
   `FortressY10` 398899676157 (Y10S4 rework: new sites), `VillaY11` 409325881472 (Y11S3: basement
   site), `CalypsoCasino` 419965653950 (Y11S2 map), `SkyscraperY10` 423767322185,
   `ThemeParkY10` 430788891316 (Y10S4 update), `CoastlineY11` 436375283234 (Y11S1),
@@ -101,10 +101,10 @@ fn names_current_maps_and_icons() {
   288200867313, Zero 291191151539, Iana 104189663973 (inferred: operator id − 65, banned once,
   never in a header). Ace's comment: now seen in real headers. `MapInfo::version` doc: the suffix
   marks a new world build (new id); the floor plan can be unchanged.
-- [ ] **Step 4: Run** — PASS (also `every_role_image_names_a_known_operator`).
-- [ ] **Step 5: Real-data test** `real_maps_have_names` (header reads of every folder under
+- [x] **Step 4: Run** — PASS (also `every_role_image_names_a_known_operator`).
+- [x] **Step 5: Real-data test** `real_maps_have_names` (header reads of every folder under
   `R6_MATCH_REPLAY`): every `summary.map.base` is `Some`.
-- [ ] **Step 6: Commit** `feat(src): name current maps and ban icons`.
+- [x] **Step 6: Commit** `feat(src): name current maps and ban icons`.
 
 ### Task 2: Team colors and the ban team fix
 
@@ -121,20 +121,20 @@ fn names_current_maps_and_icons() {
     is the recorder's team (player recordings) or team 0 (spectators); color 2 the other.
   - `details::Ban.color: Option<u32>` (`#[serde(skip)]`): the raw `TeamColor` of the slot.
 
-- [ ] **Step 1: Failing unit test** in `src/header.rs`: a header with the recorder in team 1 and
+- [x] **Step 1: Failing unit test** in `src/header.rs`: a header with the recorder in team 1 and
   no colors gives `team_of_color(1) == Some(1)`, `team_of_color(2) == Some(0)`; with
   `is_spectator: Some(true)` gives `Some(0)` / `Some(1)`; with `teams[0].color = Some(2)` gives
   `team_of_color(2) == Some(0)`; `team_of_color(3) == None`.
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement** `team_of_color` and `Team.color`;
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement** `team_of_color` and `Team.color`;
   `PlayerObjects.team_color` (`t.u32(team_object, TEAM_COLOR)`); in `apply_entities`, set
   `teams[t].color` when every player of team `t` with a color agrees; `read_role_image` stores
   the raw value in `Ban.color` and leaves `team` to a pass after `apply_entities` that maps it
   with `team_of_color`. **Step 4: Run** — PASS.
-- [ ] **Step 5: Real-data test** `real_bans_are_made_by_the_other_side` (full reads,
+- [x] **Step 5: Real-data test** `real_bans_are_made_by_the_other_side` (full reads,
   `R6_MATCH_REPLAY`): in every round, every ban with a `team` has
   `teams[team].role != Some(ban.role)`; the recorder's team has `color == Some(1)`.
   Run it before Step 3 to see it fail on the inverted matches.
-- [ ] **Step 6: Commit** `fix(src): credit bans to the team that made them`.
+- [x] **Step 6: Commit** `fix(src): credit bans to the team that made them`.
 
 ### Task 3: Ban slots from the snapshot
 
@@ -151,24 +151,24 @@ fn names_current_maps_and_icons() {
   - `details::Ban.slot: Option<u32>` (JSON `slot`), `no_ban: bool` (JSON `noBan`, skipped when
     false), `icon: Option<u64>` (skipped when none).
 
-- [ ] **Step 1: Failing unit test** in `entities.rs`: a synthetic snapshot with a manager object
+- [x] **Step 1: Failing unit test** in `entities.rs`: a synthetic snapshot with a manager object
   holding `1e 561e4c23 <0> <slot>` and `1e 561e4c23 <1> <slot2>`; slot: `HeroTeam` 2,
   `TeamColor` 1, `BanState` 3, `ResultType` 1, `1b <slot> Operator <op>`, op `1a OperatorInfo
   <info>`, info `BadgeIcon` u64 39149215445; slot2: state 3, result 2, no operator. Expect two
   `BanSlot`s: index 0 with icon 39149215445, index 1 with result 2 and no icon.
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement**: `Record::Element(field, index, child)` for
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement**: `Record::Element(field, index, child)` for
   `1e` (still a child of the current object); `Object.elements`; `snapshot()` builds the tree
   once; slots are the non-zero elements of `561e4c23` / `e6372c1e`, deduplicated by
   `(color, index)` (a second copy is sometimes sent with new object ids).
-- [ ] **Step 4: Wire** in `round.rs`: `read_entities` keeps the slots; after `apply_entities`,
+- [x] **Step 4: Wire** in `round.rs`: `read_entities` keeps the slots; after `apply_entities`,
   when slots exist, `round.bans` becomes one `Ban` per resolved slot (`state == 3`): result 1
   with an icon → the operator; result 2 → `no_ban`; side 1 Attack / 2 Defense; `team` from
   `team_of_color`; sorted by team, then slot. If the packet icons differ from the slot icons,
   warn in `decodeStatus.bans`. Builds without slots keep the packet path.
-- [ ] **Step 5: Run** all tests — PASS (`y11s3_bans_levels_and_picks` order unchanged).
-- [ ] **Step 6: Real-data test** extends Task 2's: every banned slot's operator resolves to a name
+- [x] **Step 5: Run** all tests — PASS (`y11s3_bans_levels_and_picks` order unchanged).
+- [x] **Step 6: Real-data test** extends Task 2's: every banned slot's operator resolves to a name
   and its side matches the operator's role; every round's bans per team have consecutive slots.
-- [ ] **Step 7: Commit** `feat(src): read ban slots, their order and skipped bans`.
+- [x] **Step 7: Commit** `feat(src): read ban slots, their order and skipped bans`.
 
 ### Task 4: Ban decisions in the match summary
 
@@ -180,10 +180,10 @@ fn names_current_maps_and_icons() {
   `BanDecision { round: u32, #[serde(flatten)] ban: Ban }`: each distinct ban, keyed by
   `(team, role, slot, icon, no_ban)`, with the first round (from 1) it applied to.
 
-- [ ] **Step 1: Failing test**: rounds 1–3 holding bans `{A}`, `{A, B}`, `{A, B}` give decisions
+- [x] **Step 1: Failing test**: rounds 1–3 holding bans `{A}`, `{A, B}`, `{A, B}` give decisions
   `A @ 1`, `B @ 2`.
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement** `ban_decisions(rounds)`. **Step 4: Run** — PASS.
-- [ ] **Step 5: Commit** `feat(src): list each ban with the round it was made for`.
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement** `ban_decisions(rounds)`. **Step 4: Run** — PASS.
+- [x] **Step 5: Commit** `feat(src): list each ban with the round it was made for`.
 
 ### Task 5: Result, cancelled matches and the spectator flag
 
@@ -194,21 +194,21 @@ fn names_current_maps_and_icons() {
 - Produces: `summary::Outcome::Cancelled` (JSON `cancelled`); `Header.is_spectator` is
   `Some(false)` when the header has `starttime` but no `isspectator`.
 
-- [ ] **Step 1: Failing tests** in `summary.rs`, rounds built with `Round::default()`:
+- [x] **Step 1: Failing tests** in `summary.rs`, rounds built with `Round::default()`:
   (a) recorder in team 1, final round `matchresult` 2 at 4-6 (ranked rules 6+3, no winner by
   score yet) → `winner == Some(1)`, `outcome == Win`, `ended_early == Some(true)`;
   (b) `matchresult` 7 at 1-2 → `winner == None`, `outcome == Cancelled`,
   `ended_early == Some(true)`, `complete == true`;
   (c) a header with `start_time` and no `isspectator` reads `is_spectator == Some(false)`
   (`header.rs` test through `parse`).
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement**: the winner comes from the score when it
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement**: the winner comes from the score when it
   decides the match; else from `matchresult` (2 → `team_of_color(1)`, 1 → the other team,
   7 → cancelled); other values stay raw with `ended_early` set. Correct the `matchresult` docs.
-- [ ] **Step 4: Run** — PASS.
-- [ ] **Step 5: Real-data test** `real_results_agree_with_matchresult`: for every finished
+- [x] **Step 4: Run** — PASS.
+- [x] **Step 5: Real-data test** `real_results_agree_with_matchresult`: for every finished
   player-recorded match, `matchresult` 2 ⇔ `outcome == win`; no non-spectator file is listed as a
   spectator.
-- [ ] **Step 6: Commit** `fix(src): read matchresult from the recorder's side and flag cancelled matches`.
+- [x] **Step 6: Commit** `fix(src): read matchresult from the recorder's side and flag cancelled matches`.
 
 ### Task 6: Unranked and playlists
 
@@ -221,12 +221,12 @@ fn names_current_maps_and_icons() {
   `types::playlist_name(category: i64) -> Option<&'static str>`;
   `MatchSummary.playlist: Option<&'static str>`.
 
-- [ ] **Step 1: Failing tests**: `MatchType::new(7, 9_901_603).name() == Some("Unranked")`,
+- [x] **Step 1: Failing tests**: `MatchType::new(7, 9_901_603).name() == Some("Unranked")`,
   `MatchType::new(7, 8_673_114).name() == None`, `MatchType::new(9, 0).name() == Some("Unranked")`;
   `queue(MatchType::new(7, 9_901_603)) == "unranked"`; `playlist_name(416350367764) ==
   Some("Unranked")`; JSON of `MatchType::new(2, 1)` is `{"name":"Ranked","id":2}`.
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Run** — PASS.
-- [ ] **Step 5: Commit** `feat(src): name Unranked and playlists`.
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Run** — PASS.
+- [x] **Step 5: Commit** `feat(src): name Unranked and playlists`.
 
 ### Task 7: Teams sized by the header
 
@@ -234,30 +234,49 @@ fn names_current_maps_and_icons() {
 
 **Interfaces:** Produces `fn pick_team(pick: u32, per_team: u32) -> usize` (private).
 
-- [ ] **Step 1: Failing test**: `pick_team(6, 6) == 0`, `pick_team(7, 6) == 1`, `pick_team(6, 5) == 1`.
-- [ ] **Step 2: Run** — FAIL. **Step 3: Implement**: `read_player` uses `pick_team`;
+- [x] **Step 1: Failing test**: `pick_team(6, 6) == 0`, `pick_team(7, 6) == 1`, `pick_team(6, 5) == 1`.
+- [x] **Step 2: Run** — FAIL. **Step 3: Implement**: `read_player` uses `pick_team`;
   `players_read == 10` and `< 10` use `2 * maxnbplayersperteam` (default 5).
-- [ ] **Step 4: Run** — PASS. **Step 5: Commit** `fix(src): size teams from maxnbplayersperteam`.
+- [x] **Step 4: Run** — PASS. **Step 5: Commit** `fix(src): size teams from maxnbplayersperteam`.
 
 ### Task 8: Levels decoded, docs, decoder revisions
 
 **Files:** Modify `src/round.rs` (levels status), `src/header.rs` and `src/summary.rs` (level
 docs), `src/decoder.rs`, `README.md`.
 
-- [ ] **Step 1:** `decodeStatus.levels` → `decoded` (the property is `ClearanceLevelText`); fix
+- [x] **Step 1:** `decodeStatus.levels` → `decoded` (the property is `ClearanceLevelText`); fix
   the test that expects `inferred`, if any.
-- [ ] **Step 2:** Bump `revision` of profiles Y8S1 through Y9S4 (ban icons, teams, slots,
+- [x] **Step 2:** Bump `revision` of profiles Y8S1 through Y9S4 (ban icons, teams, slots,
   match type 7, spectator default), with a note in the module doc.
-- [ ] **Step 3:** README: bans (Siege X rules, slots, `noBan`, team fix), summary keys
+- [x] **Step 3:** README: bans (Siege X rules, slots, `noBan`, team fix), summary keys
   (`playlist`, `bans`, `cancelled`, `teams[].color`), level decoded, maps and version meaning,
   match type 7, `matchresult` meaning, "Limits" rewritten with what was searched for ranks,
   reputation, region and ping, Dual Front status, hashes are CRC-32 of names.
-- [ ] **Step 4:** `cargo fmt`, `cargo clippy --all-targets`, `cargo test --release` with and
+- [x] **Step 4:** `cargo fmt`, `cargo clippy --all-targets`, `cargo test --release` with and
   without `R6_MATCH_REPLAY`; `--list` and one full match read by hand.
-- [ ] **Step 5: Commit** `docs: document match metadata, bans and what replays lack`.
+- [x] **Step 5: Commit** `docs: document match metadata, bans and what replays lack`.
 
 ## Open questions for the user
 
 - Match type 7: was it Unranked? (inferred from levels and map pool)
 - 29 Sep ~01:26, Bank, 1-2: cancelled by the game? (7 = no winner is inferred)
 - Current clearance level (expected 237)?
+
+## Execution notes
+
+All tasks done on `feat/match-metadata`. Where execution departed from the plan:
+
+- **Object-tree fix (not planned).** Task 2's invariant "the recorder's team has TeamColor 1"
+  failed in one real round: a stray `26` record (index 0x69a8fc11) covered the team object's
+  first record, so its TeamColor went to another object. Array records with an index of 65536
+  or more are now rejected (real indices reach 64). A before/after diff of all 30 real matches
+  changed only that round. Committed on its own, after the ban fix.
+- **Ban decisions** (Task 4) are verified by a unit test and a by-hand read of a real overtime
+  match, not by a real-data test.
+- **Real-data tests** share one full read of the folder (`real_rounds`), which took the run
+  from 19 s to 6 s.
+- **`MatchType`** became a struct with `id` and `build` (breaking for library users), and
+  `queue` maps names rather than ids.
+- **Levels and decoder revisions** were committed apart from the README.
+- **Platform**: `PlayerPlatform` (`7dd4fc18`) varies (0, 5, 7) in real PC matches; the README
+  no longer says no field varies, but the values are not output.

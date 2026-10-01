@@ -41,8 +41,9 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 
 | Key | What it holds | Versions |
 |---|---|---|
-| `bans` | Banned operators with their side. The replay stores only the operator icon, so names resolve for icons in the lookup table (current season); older seasons keep the raw `icon` id. From Y11S3, `team` is the team that banned the operator, and each team's bans keep their slot order. The ban phase happens before recording starts, so bans carry no time. | Y8S1+ |
-| `players[].level` | A number per player from the round's opening snapshot. It is most likely the clearance level: it stays the same across rounds and differs per player, but it has not been checked against Ubisoft's stats. `decodeStatus.levels` reports it as `inferred`. | Y11S3+ |
+| `bans` | Banned operators with their side. The replay stores only the operator icon, so names resolve for icons in the lookup table (current season); older seasons keep the raw `icon` id. From Y11S3, bans come from the ban slots in the round's opening snapshot: `team` is the team that banned, `slot` its place in that team's order (from 0), and `noBan` marks a vote that ended without a ban. Bans are listed by team, then slot. The ban phase happens before recording starts, so bans carry no time. See [Bans](#bans). | Y8S1+ |
+| `players[].level` | The clearance level, from the round's opening snapshot (the game's property is `ClearanceLevelText`). Replays hold no rank, rank points or reputation; see [Limits](#limits-worth-knowing). | Y11S3+ |
+| `teams[].color` | The game's number for the team (`TeamColor`, 1 or 2), from its team object. Ban slots and `matchresult` name teams by it: in a player's own recording the player's team is always 1, whatever its index in the header. | Y11S3+ |
 | `matchFeedback[].weapon` | Id of the gun or gadget behind each kill. | Y8S1+ |
 | `loadouts` | Guns and gadgets per player, once per operator played, so attacker swaps get their own entry. Ids only: replays carry no item names. Kill `weapon` ids match these. | Y8S1+ |
 | `health` | Every health change in the action phase, with the clock. | Y8S1+ |
@@ -84,7 +85,7 @@ Every round also says where it came from and how far it can be trusted:
 | `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What a replay never records (who planted, in Y11S3) is `notInVersion`, and a player's own recording leaving out their own body is expected, so `trusted` marks faults: of the 167 real rounds in one `MatchReplay` folder, the 11 untrusted ones were 3 unfinished files, 3 rounds with a plant completion found late or not at all, 3 where other players' bodies were not linked, and 2 that ended in prep. |
 | `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
 | `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes and the stream it was seen in, known or not. `unknownStreams` lists streams whose role is unknown and `streamsNotSeen` known ones the replay lacks, so a stream or field added by a patch stands out. |
-| `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. `matchResult` appears only on the round that decides the match. |
+| `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. The game writes `isspectator` only for spectators, so it reads `false` when absent. `matchResult` appears only on the round that ends the match, as the result of the team numbered 1 (`teams[].color`): 2 won, 1 lost, 7 the game ended the match with no winner. |
 
 A match folder adds `summary`, one record per match for match history. It is built from round headers only, so `--list` carries it too:
 
@@ -92,14 +93,15 @@ A match folder adds `summary`, one record per match for match history. It is bui
 |---|---|
 | `matchID` | Shared by every round and every player's recording, so teammates importing the same match dedupe on it. |
 | `startTime`, `endTime` | UTC, from the first and last round read. Before Y11S3 only the recording PC's local time exists; `startTimeIsLocal` says so. |
-| `matchType`, `queue`, `playlistCategory` | The raw match type with its name, and its queue family: `ranked`, `unranked`, `quickMatch`, `custom`, `standard`. `playlistCategory` is raw. |
+| `matchType`, `queue`, `playlistCategory`, `playlist` | The raw match type with its name, and its queue family: `ranked`, `unranked`, `quickMatch`, `custom`, `standard`. Match type ids have been renumbered over the years; in Y11S3, 7 is Unranked (inferred: ranked rules and bans, but players below the level Ranked needs, and Tower in the pool). `playlistCategory` is an asset id with one value per playlist, named in `playlist` for the ones seen (`Ranked`, `QuickMatch`, `Unranked`). |
 | `gameMode` | Bomb, Secure Area, Hostage, ... with the raw id. |
-| `map` | `id`, full `name`, and `base` plus rework `version` (`BankY10` is `Bank`, `Y10`). Reworked maps get new ids, so key floor plans and callouts by `id`. |
-| `rules` | Regulation rounds and the rounds needed to win, overtime rounds and the total needed once overtime starts, players per team, and the raw `gameModeSettings` list (kept raw until each value is named). |
-| `teams` | Name, final score, starting side, and players with profile id and level. |
+| `map` | `id`, full `name`, and `base` plus `version` (`BankY10` is `Bank`, `Y10`). The game gives a map a new id when it rebuilds it, so key floor plans and callouts by `id`. The version is the year of that build; the floor plan can still be the old one (`SkyscraperY10` keeps Skyscraper's sites). |
+| `rules` | Regulation rounds and the rounds needed to win, overtime rounds and the total needed once overtime starts, players per team, and the raw `gameModeSettings` list (kept raw until each value is named). The settings, like `playlistCategory`, are asset ids: one fixed list per playlist, and the stream never refers to them. |
+| `teams` | Name, final score, starting side, and players with profile id and level. Matchmaking names the teams `YOUR TEAM` and `ENEMY TEAM` from the recorder's side; custom games carry the real names. |
 | `recording`, `yourTeam` | Who recorded, whether as a spectator, and the index of their team (absent for spectators). |
-| `result` | Final score, `winner`, `outcome` from your side (`win`, `loss`, `draw`, `decided` for spectators, `unfinished`), whether it went to overtime, and `endedEarly` when the game ended the match before either team reached the target (forfeit or abandon; Y11S3+). |
-| `rounds[]` | Per round: score before and after, winner, each team's side, which teams were on match point, overtime, the bomb sites, `bans` with the banning team, and `picks`: every operator each player played, in order, so swaps show up as several operators. `bans` and `picks` need a full read. |
+| `result` | Final score, `winner`, `outcome` from your side (`win`, `loss`, `draw`, `cancelled`, `decided` for spectators, `unfinished`), whether it went to overtime, `rawMatchResult`, and `endedEarly` when the game ended the match before either team reached the target (Y11S3+): a forfeit has a `winner` from `matchresult`; a match the game ended with no winner (`matchresult` 7) is `cancelled`. `unfinished` means the rounds read do not end the match, usually because the recorder left. |
+| `bans` | Each ban once, with `round`, the first round it applied to: what each team banned and when. In ranked that is the round the team's vote came before. Needs a full read. |
+| `rounds[]` | Per round: score before and after, winner, each team's side, which teams were on match point, overtime, the bomb sites, `bans` in force with the banning team and slot, and `picks`: every operator each player played, in order, so swaps show up as several operators. `bans` and `picks` need a full read. |
 
 A match folder also adds `folder`: rounds found and missing (numbered from 1 like `R01.rec`), duplicate round numbers, skipped files (`.tmprec`, byte-identical copies, unreadable files), the match ids seen, the final score and whether the match finished. Rounds are ordered by the header's round number, not the file name. One unreadable round no longer fails the whole folder.
 
@@ -120,11 +122,12 @@ The game keeps a fixed number of matches: the folder held 30 on both days it was
 
 The library equivalent is `library::scan(path, ReadMode::Header)`.
 
-Limits worth knowing:
+### Limits worth knowing
 
-- Replays hold no rank, reputation or server region. The Y11S3 test replays were searched for these and they weren't there. Use the players' `profileID` with Ubisoft's stats services for rank.
-- `endedEarly` (forfeits, abandoned matches) is inferred: the game marks the deciding round with `matchresult`, so a marked round where neither team reached the win target means the match ended early. No forfeit replay has been checked yet.
-- Dual Front (6v6, respawns) has not been seen in a replay. The player-count check follows `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
+- **Replays hold no rank, rank points, max rank or reputation.** All 167 rounds of a real `MatchReplay` folder (21 ranked, 4 unranked and 5 quick matches) and the 10 test rounds were searched: every header key, every property of every object in the state stream, every other stream, number scans for rank-point values, and text in ASCII and UTF-16. The per-player profile object holds the same 21 properties in ranked, unranked, quick and custom matches, and none is a rank. The in-game scoreboard shows ranks, so the game must fetch them from Ubisoft's services. Use the players' `profileID` with Ubisoft's stats services (or the R6 Data API) for lobby strength.
+- **Replays hold no server region and no ping.** The same rounds were searched for the data-center names the game itself uses (`gamelift/eu-west-1` and so on, plain and hashed), for region, host and IP text, and for any per-player value that behaves like latency. The scoreboard object carries score, kills, deaths, assists, a placement that is always 0 and a per-match counter, and nothing else. The only geographic hint is the recording PC's UTC offset (`timing`).
+- **`endedEarly`** comes from `matchresult`. A forfeit, where a team surrenders, should carry 1 or 2 like a normal ending and so get a winner, but no forfeit has been seen. Value 7 has been seen once: the server ended a ranked match 0.03 s into round 4, with no clock, both teams marked as losing and a system notice no other round has. The cause, which the file does not say, may be a ban of a cheating player, which ends a match for everyone.
+- **Dual Front** (6v6, respawns) has not been seen in a replay, and no source says whether it records one. Pick packets are split into teams by `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
 
 - Replays record a player's health, never who caused a change, so there is damage taken but no damage dealt.
 - Older replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
@@ -134,6 +137,20 @@ Limits worth knowing:
 Y11S3 attacker swaps are linked through the player's state object, because the caster UI id older seasons use is shared by a whole team there.
 
 Y11S3 scoreboard packets no longer carry ids that match players; they are linked through each player's scoreboard object instead (see [Players and identity](#players-and-identity)).
+
+## Bans
+
+Y11S3 replays hold the ban phase as objects in each round's opening snapshot: a ban manager with three slots per team. A slot names the side it bans (`HeroTeam`), the banning team (`TeamColor`), whether it has been used (`BanState`), whether the vote ended without a ban (`ResultType`), and the banned operator, whose descriptor links its icon (`BadgeIcon`, the id the header's `roleimage` uses).
+
+As recorded in the 25 ranked and unranked matches of a real folder:
+
+- Each team bans one operator of the other side before each round of a half, into its next slot: 2, 4, then 6 bans in rounds 1 to 3, and again after the side swap, when the slots start over.
+- Overtime adds no bans. An overtime round holds the bans of the half whose sides it repeats.
+- A team's vote can end without a ban (`noBan`), seen once in 25 matches.
+- Quick matches have the ban manager but use no slots.
+- The 12-round custom test match bans two operators per team at the start of each half and a third in the half's fourth round.
+
+Per-player votes, the timing of the ban phase and the operator pick phase (hovers, lock order) are not recorded: the ban phase ends before the recording starts, and a file refers only to operators that were played or banned. `summary.bans` lists each ban once with the first round it applied to.
 
 ## Players and identity
 
@@ -164,7 +181,7 @@ How the links are made (details in `src/entities.rs`):
 
 Not found:
 
-- **Platform.** No field varies with platform in the replays available (all PC). The profile object has constant fields (`96ba4a74` = 3 from Y9S1) that could be one, unconfirmed.
+- **Platform.** The controller has a `PlayerPlatform` property (`7dd4fc18`): 0 for most players in a real folder of PC matches, 5 or 7 for a few. What the values stand for is not known, so it is not output. The profile object's `96ba4a74` is 3 for every player.
 - **Cosmetics.** The controller's operator asset id (`f93911f2`), the header's `heroname` and `roleimage`, and the weapon item ids are the same for every player on the same operator in the test match, so no personal uniform, headgear, skin or charm id has been identified. Pro matches may force defaults; a ranked Y11S3 replay would settle it.
 - **Other players' parties.** Only the recorder's party is recorded. Premades among other players can only be guessed from match history (`--players`).
 
@@ -200,6 +217,8 @@ Decompressed, each snapshot is a u64 length and the snapshot. The main stream ho
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.
 - **Temporary files.** A current install has an empty `DissectTmp` folder next to `MatchReplay`, and the process id and stream id in the reported `.tmprec` names match what round files hold. No `.tmprec` file was available, so their contents are unchecked.
+- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills` and `PlayerPlatform`.
+- **Stray records.** Binary data between record runs can read as records. An array record claiming an index of 65536 or more (real ones reach 64) is rejected: in one real round such a "record" covered a team object's first record and moved its properties to another object.
 
 The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 2 ms of `endtime`. The header `datetime` is the recording PC's local time, not UTC.
 

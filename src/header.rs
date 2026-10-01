@@ -481,7 +481,7 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
         game_version: get("version").unwrap_or_default().to_owned(),
         code_version,
         timestamp,
-        match_type: MatchType(small("matchtype")?),
+        match_type: MatchType::new(small("matchtype")?, code_version),
         map: Map(num("worldid")?),
         site: String::new(),
         recording_player_id: num("recordingplayerid")?,

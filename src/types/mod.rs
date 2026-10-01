@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
-use tables::{MAPS, OPERATORS, ROLE_IMAGES};
+use tables::{MAPS, OPERATORS, PLAYLISTS, ROLE_IMAGES};
 
 /// Serializes as `{"name": ..., "id": ...}`.
 fn serialize_named<S: Serializer>(s: S, name: &str, id: u64) -> Result<S::Ok, S::Error> {
@@ -75,19 +75,63 @@ named_id!(
     }
 );
 
-named_id!(
-    /// The playlist a match was played in.
-    MatchType(u32),
-    |id| match id {
-        1 => Some("QuickMatch"),
-        2 => Some("Ranked"),
-        3 => Some("CustomGameLocal"),
-        4 => Some("CustomGameOnline"),
-        8 => Some("Standard"),
-        9 => Some("Unranked"),
-        _ => None,
+/// The kind of match (`matchtype`). The game has renumbered these over the
+/// years, so a name holds only for the builds it was seen in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MatchType {
+    pub id: u32,
+    /// The build (`code`) of the replay the id came from.
+    pub build: u32,
+}
+
+impl MatchType {
+    pub fn new(id: u32, build: u32) -> Self {
+        Self { id, build }
     }
-);
+
+    /// The known name for this id in this build, if any.
+    pub fn name(self) -> Option<&'static str> {
+        match self.id {
+            1 => Some("QuickMatch"),
+            2 => Some("Ranked"),
+            3 => Some("CustomGameLocal"),
+            4 => Some("CustomGameOnline"),
+            // Inferred from four Y11S3 matches: ranked rules and bans, but
+            // players below the level Ranked requires, and Tower, which only
+            // Quick Match and Unranked play.
+            7 if self.build >= version::Y11S3 => Some("Unranked"),
+            8 => Some("Standard"),
+            9 => Some("Unranked"),
+            _ => None,
+        }
+    }
+
+    /// A custom game, local or online.
+    pub fn is_custom(self) -> bool {
+        matches!(self.id, 3 | 4)
+    }
+}
+
+impl fmt::Display for MatchType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(n) => f.write_str(n),
+            None => write!(f, "MatchType({})", self.id),
+        }
+    }
+}
+
+impl Serialize for MatchType {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serialize_named(s, &self.to_string(), u64::from(self.id))
+    }
+}
+
+/// The playlist a match was queued in, from the header's
+/// `playlistcategory` (Y11S3+).
+pub fn playlist_name(category: i64) -> Option<&'static str> {
+    PLAYLISTS.iter().find(|p| p.0 == category).map(|p| p.1)
+}
 
 named_id!(
     /// The kind of observation device a player is looking through.
@@ -180,6 +224,8 @@ pub mod version {
     pub const Y9S1_UPDATE3: u32 = 8211379;
     pub const Y9S3: u32 = 8506016;
     pub const Y9S4: u32 = 8673114;
+    /// The oldest Y11S3 build seen; the season may have started earlier.
+    pub const Y11S3: u32 = 9883691;
 }
 
 #[cfg(test)]
@@ -200,6 +246,25 @@ mod tests {
             let op = Operator::from_role_image(*image);
             assert_eq!(op.and_then(Operator::name), Some(*name), "{image}");
         }
+    }
+
+    #[test]
+    fn match_type_seven_is_unranked_from_y11s3() {
+        assert_eq!(MatchType::new(7, 9_901_603).name(), Some("Unranked"));
+        assert_eq!(MatchType::new(7, version::Y9S4).name(), None);
+        assert_eq!(MatchType::new(9, 0).name(), Some("Unranked"));
+    }
+
+    #[test]
+    fn match_types_serialize_as_name_and_id() {
+        let json = serde_json::to_string(&MatchType::new(2, 1)).unwrap();
+        assert_eq!(json, r#"{"name":"Ranked","id":2}"#);
+    }
+
+    #[test]
+    fn names_playlists_by_category() {
+        assert_eq!(playlist_name(416350367764), Some("Unranked"));
+        assert_eq!(playlist_name(1), None);
     }
 
     #[test]

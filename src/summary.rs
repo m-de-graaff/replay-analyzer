@@ -12,7 +12,7 @@ use crate::entities::Relation;
 use crate::header::{PartyRole, Player};
 use crate::outcome::{ReasonSource, scores};
 use crate::round::Round;
-use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition};
+use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, playlist_name};
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,9 +38,14 @@ pub struct MatchSummary {
     /// Queue family derived from `match_type`: `ranked`, `unranked`,
     /// `quickMatch`, `custom`, `standard` or `unknown`.
     pub queue: &'static str,
-    /// The header's `playlistcategory`, when written. Raw: not yet named.
+    /// The header's `playlistcategory`, when written (Y11S3+): an asset id
+    /// with one value per playlist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_category: Option<i64>,
+    /// The playlist's name, for the `playlistCategory` values seen:
+    /// `Ranked`, `QuickMatch`, `Unranked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist: Option<&'static str>,
     pub game_mode: GameMode,
     pub map: MapInfo,
     pub rules: Rules,
@@ -497,6 +502,7 @@ impl MatchSummary {
             match_type: first.match_type,
             queue: queue(first.match_type),
             playlist_category: (first.playlist_category != 0).then_some(first.playlist_category),
+            playlist: playlist_name(first.playlist_category),
             game_mode: first.game_mode,
             map: MapInfo::new(first.map),
             teams,
@@ -581,12 +587,12 @@ fn picks(round: &Round) -> Vec<Pick> {
 
 /// The queue family a match type belongs to.
 pub fn queue(match_type: MatchType) -> &'static str {
-    match match_type.0 {
-        1 => "quickMatch",
-        2 => "ranked",
-        3 | 4 => "custom",
-        8 => "standard",
-        9 => "unranked",
+    match match_type.name() {
+        Some("QuickMatch") => "quickMatch",
+        Some("Ranked") => "ranked",
+        Some("CustomGameLocal" | "CustomGameOnline") => "custom",
+        Some("Standard") => "standard",
+        Some("Unranked") => "unranked",
         _ => "unknown",
     }
 }
@@ -660,6 +666,12 @@ mod tests {
         }
         h.match_result = match_result;
         r
+    }
+
+    #[test]
+    fn match_type_seven_queues_as_unranked() {
+        assert_eq!(queue(MatchType::new(7, 9_901_603)), "unranked");
+        assert_eq!(queue(MatchType::new(4, 9_901_603)), "custom");
     }
 
     #[test]

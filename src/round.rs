@@ -1070,7 +1070,7 @@ impl<'a> Parser<'a> {
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
-            if matches!(h.match_type.0, 3 | 4) {
+            if h.match_type.is_custom() {
                 f.at_most(Status::Skipped).warn(
                     "custom game: the whole lobby counts as one party, so no roles are given",
                 );
@@ -2272,7 +2272,7 @@ impl<'a> Parser<'a> {
         use crate::entities::Relation;
         let objects = std::mem::take(&mut self.entity_players);
         let header = &mut self.round.header;
-        let custom = matches!(header.match_type.0, 3 | 4);
+        let custom = header.match_type.is_custom();
         let spectator = header.is_spectator == Some(true);
         let find = |players: &[Player], o: &crate::entities::PlayerObjects| {
             players

@@ -145,6 +145,15 @@ pub(super) const MAPS: &[(&str, u64)] = &[
     ("TowerY11", 454245490351),
 ];
 
+/// `(playlistcategory, name)`: the playlist a match was queued in, as Y11S3
+/// headers give it. Each match type had one value in a real folder of 30
+/// matches; Unranked's name is inferred like match type 7's.
+pub(super) const PLAYLISTS: &[(i64, &str)] = &[
+    (245225348570, "Ranked"),
+    (414625537378, "QuickMatch"),
+    (416350367764, "Unranked"),
+];
+
 /// `(role image id, operator name)`: the icon the game shows for an operator,
 /// which is all a ban slot records. Harvested from the `roleimage`/`rolename`
 /// header pairs and pick packets of the test replays; image ids change between

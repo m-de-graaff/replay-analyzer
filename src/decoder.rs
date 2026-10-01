@@ -10,6 +10,11 @@
 //! - every profile to its current revision: players short of a full team
 //!   are decoded, not partial; from Y8S4 the container, recording times and
 //!   timing rates; from Y11S3 the movement and defuser-player trust rules.
+//! - Y8S1 onward: ban icons of current operators, and stray bytes no longer
+//!   swallow object-tree records; from Y11S3 (profile Y9S4) bans from ban
+//!   slots with their team, order and votes for none, team colors, match
+//!   type 7 as Unranked, `isSpectator` false when absent, levels decoded
+//!   and teams sized by `maxnbplayersperteam`.
 
 use serde::Serialize;
 
@@ -65,37 +70,37 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y8S1",
         min_build: version::Y8S1,
-        revision: 4,
+        revision: 5,
         changes: "numeric clock; bans, loadouts, health, observation decodable",
     },
     Profile {
         name: "Y8S2",
         min_build: version::Y8S2,
-        revision: 4,
+        revision: 5,
         changes: "players matched by packet id",
     },
     Profile {
         name: "Y9S1",
         min_build: version::Y9S1,
-        revision: 4,
+        revision: 5,
         changes: "new feedback layout, text messages not decoded",
     },
     Profile {
         name: "Y9S1.3",
         min_build: version::Y9S1_UPDATE3,
-        revision: 4,
+        revision: 5,
         changes: "feedback header grew",
     },
     Profile {
         name: "Y9S3",
         min_build: version::Y9S3,
-        revision: 4,
+        revision: 5,
         changes: "caster UI ids link attacker swaps",
     },
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 5,
+        revision: 6,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

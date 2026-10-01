@@ -21,7 +21,7 @@ never committed).
 - No new dependencies.
 - JSON keys camelCase; new optional fields use `skip_serializing_if` like their neighbours.
 - `ReadMode::Header` must not decompress Y8S4+ files (`round/header` bench stays < 1 ms).
-- Never write to the game install (`D:/SteamLibrary/steamapps/common/Tom Clancy's Rainbow Six Siege`).
+- Never write to the game install folder (`MatchReplay`, `DissectTmp`): read only.
 - Never commit replay files other than the existing `test_recordings/`. Real-data tests read
   `R6_MATCH_REPLAY` and skip when it is unset.
 - Existing tests stay green; `cargo clippy --all-targets` stays warning-free.

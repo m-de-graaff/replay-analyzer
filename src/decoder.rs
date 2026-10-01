@@ -23,6 +23,10 @@
 //!   `IsDefuserStarted` with their player, the round's end from
 //!   `TimerState`, players who left count as gone, and the end reason is
 //!   checked against the game's round history.
+//! - Y9S4 (for Y11S3): the player table read from its own stream, so the
+//!   recorder and every player who spawned has a body; ids of players the
+//!   header does not list; platform, nicknames, names given at match end
+//!   and cosmetics.
 
 use serde::Serialize;
 
@@ -108,7 +112,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 7,
+        revision: 8,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

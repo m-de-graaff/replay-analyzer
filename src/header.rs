@@ -6,6 +6,7 @@ use std::str::FromStr;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Serialize, Serializer};
 
+use crate::cosmetics::Cosmetics;
 use crate::cursor::Cursor;
 pub use crate::entities::Relation;
 use crate::error::{Error, Result};
@@ -201,6 +202,52 @@ pub struct Player {
     /// Where the player's body was created, in map coordinates (Y11S3+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawn_position: Option<[f32; 3]>,
+    /// The platform the player is on, for the values whose meaning is known
+    /// (Y11S3+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
+    /// The controller's raw `PlayerPlatform`.
+    #[serde(skip)]
+    pub platform_raw: Option<u32>,
+    /// `username` is a nickname the game shows in place of the player's own
+    /// name (the profile's `UsesNickname`). `renamedTo` has the name the
+    /// game shows once the match is over, when the recording reaches it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub uses_nickname: bool,
+    /// The name the game gave the player later in the round, which it does
+    /// when the match ends: for players behind a nickname, and for console
+    /// players.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_to: Option<String>,
+    /// What the player wears and carries: uniform, headgear, weapon skins,
+    /// charms (Y11S3+, once their body exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cosmetics: Option<Cosmetics>,
+}
+
+/// The platform a player is on. PC is confirmed by the recording players
+/// seen; the consoles are told apart by the account id the controller holds
+/// beside it (`PlatformPlayerID`: empty on PC, in the range Xbox ids are
+/// numbered in for Xbox).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    Pc,
+    PlayStation,
+    Xbox,
+}
+
+impl Platform {
+    /// From the controller's `PlayerPlatform`. `None` for values not seen
+    /// on a player.
+    pub fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Pc),
+            5 => Some(Self::PlayStation),
+            7 => Some(Self::Xbox),
+            _ => None,
+        }
+    }
 }
 
 /// A player's role in the recorder's party.

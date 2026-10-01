@@ -83,7 +83,7 @@ Every round also says where it came from and how far it can be trusted:
 | `replay.version` | `Y11S3_Alpha04` split into season, year, season number and branch, plus the build number (`code`). |
 | `replay.parser` | Parser version and the decoder profile and revision chosen for the build. A decoding fix bumps the revision of the profiles it touches, so stored rounds with an older `(decoder, decoderRevision)` than `--decoders` lists for their build are the ones to re-parse. `untestedBuild` flags builds newer than any the decoders were checked against (9883691, 9901603 and 9918362, all `Y11S3_Alpha04`). |
 | `replay.container` | Y8S4+: the streams the round was recorded in (id, name hash, role where known, frames covered, snapshot blocks, record count), the compressed blocks, `recordingId`, and `complete`, false when the game did not finish writing the file. See [File format notes](#file-format-notes). |
-| `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What a replay never records (text feed messages, from Y9S1) is `notInVersion`, and a player's own recording leaving out their own body is expected, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. Of the 167 real rounds in one `MatchReplay` folder, the 8 untrusted ones were 3 unfinished files, 3 rounds that were not played out (no result), and 2 where the recorder's own body was not linked. |
+| `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What a replay never records (text feed messages, from Y9S1) is `notInVersion`, and a player who never spawned has no body to link, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. Of the 167 real rounds in one `MatchReplay` folder, the 6 untrusted ones were 3 unfinished files and 3 rounds that were not played out (no result). |
 | `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
 | `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes and the stream it was seen in, known or not. `unknownStreams` lists streams whose role is unknown and `streamsNotSeen` known ones the replay lacks, so a stream or field added by a patch stands out. |
 | `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. The game writes `isspectator` only for spectators, so it reads `false` when absent. `matchResult` appears only on the round that ends the match, as the result of the team numbered 1 (`teams[].color`): 2 won, 1 lost, 7 the game ended the match with no winner. |
@@ -98,7 +98,7 @@ A match folder adds `summary`, one record per match for match history. It is bui
 | `gameMode` | Bomb, Secure Area, Hostage, ... with the raw id. |
 | `map` | `id`, full `name`, and `base` plus `version` (`BankY10` is `Bank`, `Y10`). The game gives a map a new id when it rebuilds it, so key floor plans and callouts by `id`. The version is the year of that build; the floor plan can still be the old one (`SkyscraperY10` keeps Skyscraper's sites). |
 | `rules` | Regulation rounds and the rounds needed to win, overtime rounds and the total needed once overtime starts, players per team, and the raw `gameModeSettings` list (kept raw until each value is named). The settings, like `playlistCategory`, are asset ids: one fixed list per playlist, and the stream never refers to them. |
-| `teams` | Name, final score, starting side, and players with profile id and level. Matchmaking names the teams `YOUR TEAM` and `ENEMY TEAM` from the recorder's side; custom games carry the real names. |
+| `teams` | Name, final score, starting side, and players with profile id, level and platform: every player seen on the team in any round, so one who joined late is listed and a team can list more than five. Matchmaking names the teams `YOUR TEAM` and `ENEMY TEAM` from the recorder's side; custom games carry the real names. |
 | `recording`, `yourTeam` | Who recorded, whether as a spectator, and the index of their team (absent for spectators). |
 | `result` | Final score, `winner`, `outcome` from your side (`win`, `loss`, `draw`, `cancelled`, `decided` for spectators, `unfinished`), whether it went to overtime, `rawMatchResult`, and `endedEarly` when the game ended the match before either team reached the target (Y11S3+): a forfeit has a `winner` from `matchresult`; a match the game ended with no winner (`matchresult` 7) is `cancelled`. `unfinished` means the rounds read do not end the match, usually because the recorder left. |
 | `bans` | Each ban once, with `round`, the first round it applied to: what each team banned and when. In ranked that is the round the team's vote came before. Needs a full read. |
@@ -167,26 +167,70 @@ Every player in `players[]` carries:
 | `party` | `leader` or `member` of the recording player's party. Only the recorder's own party is in the file; custom games put the whole lobby in one party, so no roles are given there. | Y8S1+ | Decoded |
 | `entities` | Hex ids of the objects that carry the player in the packet stream: `controller` (name, operator, team, weapon-ready flag; pick and swap packets write to it), `scoreboard`, `health`, and `movement`, the body the movement stream moves. | Y8S1+ (`movement` Y11S3+) | Decoded |
 | `spawnPosition` | Where the player's body was created, in map coordinates. | Y11S3+ | Decoded |
+| `platform` | `pc`, `playstation` or `xbox`. See [Platform](#platform). | Y11S3+ | Inferred |
+| `usesNickname` | `username` is a nickname the game shows in place of the player's own name. Left out when false. | Y11S3+ | Decoded |
+| `renamedTo` | The name the game gave the player as the match ended. See [Names](#names). | Y11S3+ | Decoded |
+| `cosmetics` | Uniform, headgear, operator card, weapon skins, charms and attachments, as asset ids. See [Cosmetics](#cosmetics). | Y11S3+ | Decoded |
 
 Kill feed entries name their players' `profileID` and `targetProfileID`. From Y11S3 a kill can also carry `creditedTo`: the scoreboard credits a kill to the teammate who downed the victim when another player finished them, while the feed names the finisher. With those credits counted, the scoreboard's kill and death totals match the kill feed in every test round.
 
 `weaponReady` lists each change of the controller's weapon-ready flag (`ready`, `phase`, `elapsed`). Attackers hold it at `false` through prep, on their drones, until their body spawns; in action it drops for about a second at a time, as on reloads and weapon swaps. The meaning is inferred from that behaviour (`decodeStatus.weaponReady`).
 
-`decodeStatus` adds `profileIds`, `recorder`, `entities`, `movement`, `party` and `weaponReady`. `summary.teams[].players[]` gains `key`, `relation` and `party`, and `summary.recording.party` lists who queued with the recorder.
+`decodeStatus` adds `profileIds`, `recorder`, `entities`, `movement`, `party`, `weaponReady`, `platform`, `names` and `cosmetics`. `summary.teams[].players[]` gains `key`, `relation`, `party`, `platform`, `usesNickname` and `renamedTo`, and `summary.recording.party` lists who queued with the recorder.
 
-`--players` reads every match folder under a folder (partially: players, relations and parties) and prints a directory: per player the `key`, every username used with first and last seen, matches with and against you, matches in your party, and `queueMate` (queued with you once, or on your team in two or more matches). `you` lists the recording accounts. A match imported twice (same `matchID`) counts once. The library equivalent is `PlayerDirectory::new(&summaries)`.
+`--players` reads every match folder under a folder (partially: players, relations, parties, platform and names) and prints a directory: per player the `key`, `platform`, every username used with first and last seen (`nickname` marks one the game showed in place of the player's own, `atMatchEnd` one the game gave as a match ended), matches with and against you, matches in your party, and `queueMate` (queued with you once, or on your team in two or more matches). `username` is the latest match's name, the one given at its end when the recording has it. `you` lists the recording accounts. A match imported twice (same `matchID`) counts once. The library equivalent is `PlayerDirectory::new(&summaries)`.
 
 How the links are made (details in `src/entities.rs`):
 
 - The stream is a tree of replicated objects. Besides `23`/`22` property records, `1b <parent> <field> <child>` and `1a <field> <child>` records hang child objects off a parent. Each player has one controller object under their team's object, holding the name, operator, profile id and the header `playerid`; the scoreboard, health, inventory and a profile object hang off it.
 - The profile object carries the relation to the recorder (`05c7b949`: 1 opponent, 2 teammate, 3 teammate in the recorder's party, 5 the recorder) and the party role (`af6bb287`: 0, 1 member, 2 leader). Checked on Y8S1 ranked and quick matches (a clan-tagged five-stack, a duo with randoms), Y8S2 and Y9S1.
-- Movement is sent apart from the tree. A player table (count byte, then per player the header `playerid` and, when it changed, the object the player now controls) links each body to a player explicitly, so the link does not depend on player order. The same table records drone and camera switches.
+- Movement is sent apart from the tree. A player table links each body to a player explicitly, so the link does not depend on player order. In Y11S3 the table is a stream of its own (`aca4c435`): its snapshot is the table that opens the round and each frame record a table of what changed, per player the `playerid`, the body they move and what they look through (their drone or a camera). Every player of the round has an entry, the recorder included, so the recorder's own body is linked like any other. A player with an entry and no body never spawned: they left, or the recording ended first. `decodeStatus.movement` says so without calling it a fault. The entry layout is in `src/entities.rs`.
+- A player the header does not list (it is written before late joiners arrive) is read from their pick packet and takes the `playerid` their controller holds. A player who reconnects comes back with a new `playerid` under the same profile id, so `key` holds across the match. The controller's `HasLeft` is not output: a seat that was filled again keeps it set.
+
+### Platform
+
+The controller's `PlayerPlatform` (`7dd4fc18`) is 0, 5 or 7 for every player in the 167 real rounds and the test match. Next to it sits `PlatformPlayerID` (`e7ceb836`), a console account id:
+
+| `PlayerPlatform` | `platform` | Why |
+|---|---|---|
+| 0 | `pc` | The recording players, on PC, are 0, and every 0 has an empty `PlatformPlayerID`. |
+| 5 | `playstation` | Every 5 has a `PlatformPlayerID` that is a random-looking 64-bit number, as PlayStation account ids are. |
+| 7 | `xbox` | Every 7 has a `PlatformPlayerID` in the range Xbox ids are numbered in (`0x0009...`). |
+
+So `pc` is confirmed for the recorder and the consoles are inferred from the shape of an id, which `decodeStatus.platform` says (`inferred`). Of 238 players in the real folder, 216 were on PC, 16 on PlayStation and 6 on Xbox, each keeping one value across rounds. Whether 5 and 7 mean one console generation or the family is not known, and any other value is left out and reported. `PlatformPlayerID` itself is not output. A seat whose player left is sent again with 12; the first value read is the player's. There is no input-device or cross-play flag: the profile's `PlatformFamilyIcon` is the same for everyone.
+
+### Names
+
+A player has one name in a round: the controller's, which the header's `playername` repeats and the profile object holds twice more. Some of them are not the player's own:
+
+- The profile's `UsesNickname` (`feacf17b`) is 1 for players the game shows under a generated nickname (19 of 238 in the real folder). `usesNickname` marks them; their `profileID` is still their own.
+- As a match ends, the game writes another name to the controllers of those players and of console players: `renamedTo`. For a nickname it reads as the player's own name, for a console player as the name on their platform, both judged by how the names look. PC players under their own name are never renamed.
+
+The rename is the last thing in the last round's file, so only a recording that runs to the end of the match has it: 15 of the 30 real matches had one, and never before the final round. `summary` and `--players` carry it, so a nickname and the name behind it land on the same `key`. A seat taken over by another player also gets a new name, with a new profile; that is not a rename and is left out.
+
+### Cosmetics
+
+The movement stream creates each body, and each item a body carries, with a message listing named slots (the layout is at `Spawn` in `src/entities.rs`). Slot names are CRC-32 hashes like every other name, and each value is an asset id. `players[].cosmetics` holds:
+
+| Key | Slot | |
+|---|---|---|
+| `uniform`, `headgear` | `Uniform`, `Headgear` on the body | |
+| `operatorCard` | `OperatorCardBackground`, `OperatorCardPortrait` and up to three `...OperatorCardBadge` | |
+| `mvpAnimation` | `MVPData` | The animation shown for the match's MVP. |
+| `weapons[]` | `PrimaryWeapon` and `SecondaryWeapon` on the body give `slot` and `item`; the weapon's own message gives `skin` (`WeaponSkin`), `charm`, `attachmentSkin` (`WeaponAttachmentSkinSet`), `sight`, `barrel`, `grip` and `underbarrel` | A weapon without a charm holds a fixed id, which is left out. |
+| `gadgets[]` | `PrimaryGadget`, `SecondaryGadget`, `TertiaryGadget` and `Drone`, with the item's `Skin` | Only those that carry a skin. |
+
+That the ids are the player's own and not the operator's shows in the 167 real rounds: a player wore the same uniform and headgear on an operator in every round (1064 of 1064 player and operator pairs), while on 75 of the 76 operators played by more than one player the uniforms differed; a weapon held by several players had different skins on 213 of 214 weapons. The spectator-recorded test match carries them too.
+
+- Ids only. Replays hold no names for assets, so which uniform or charm an id is needs a table from elsewhere. Equal ids are the same item, which is enough to count and compare.
+- A body exists once the player spawns: defenders from the start, attackers at the end of prep, so a partial read has the defenders only.
+- A weapon is matched to its player by its asset; when two players carry the same one, by the list of what each body carries. 4 of 3216 weapons came out with only their `item`: no skin set, or no telling whose it was.
+- No slot says a set is an elite: `CharacterSet` and `WeaponSet` exist and are always 0.
+- The weapon `item` ids are not the ids `loadouts` uses.
 
 Not found:
 
-- **Platform.** The controller has a `PlayerPlatform` property (`7dd4fc18`): 0 for most players in a real folder of PC matches, 5 or 7 for a few. What the values stand for is not known, so it is not output. The profile object's `96ba4a74` is 3 for every player.
-- **Cosmetics.** The controller's operator asset id (`f93911f2`), the header's `heroname` and `roleimage`, and the weapon item ids are the same for every player on the same operator in the test match, so no personal uniform, headgear, skin or charm id has been identified. Pro matches may force defaults; a ranked Y11S3 replay would settle it.
-- **Other players' parties.** Only the recorder's party is recorded. Premades among other players can only be guessed from match history (`--players`).
+- **Other players' parties.** Only the recorder's party is recorded: `SquadStatus` is set for the recorder and their party and for nobody else, and no property of any player object, nor any list on the team objects, holds a value the recorder shares only with their party. Premades among other players can only be guessed from match history (`--players`).
 
 ## File format notes
 
@@ -220,7 +264,7 @@ Decompressed, each snapshot is a u64 length and the snapshot. The main stream ho
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.
 - **Temporary files.** A current install has an empty `DissectTmp` folder next to `MatchReplay`, and the process id and stream id in the reported `.tmprec` names match what round files hold. No `.tmprec` file was available, so their contents are unchecked.
-- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlayerSlotType` (1 while a player is in the slot), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet).
+- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet).
 - **Stray records.** Binary data between record runs can read as records. In one real round such a "record" covered a team object's first record and moved its properties to another object. Two rules reject them: an array record claiming an index of 65536 or more (real ones reach 64), and any record that does not name its object yet covers records that do (a `23` or `1b` and what follows) ending exactly where it ends.
 
 The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 2 ms of `endtime`. The header `datetime` is the recording PC's local time, not UTC.

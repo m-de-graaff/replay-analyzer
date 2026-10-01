@@ -16,6 +16,7 @@ use crate::decompress::{self, Decompressed};
 use crate::details::{
     Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
 };
+use crate::entities::{PLAYER_TABLE_STREAM, PlayerTables};
 use crate::error::{Error, Result};
 use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
@@ -594,6 +595,9 @@ struct Parser<'a> {
     weapon_samples: Vec<(String, bool, Option<usize>)>,
     /// Players' objects from the opening snapshot of the object tree.
     entity_players: Vec<crate::entities::PlayerObjects>,
+    /// What the player tables said (Y11S3+): who has an entry, and how many
+    /// tables were read.
+    player_tables: PlayerTables,
     /// Y11S3 ban slots from the same snapshot.
     ban_slots: Vec<crate::entities::BanSlot>,
     /// Problems found while reading bans, for `decodeStatus.bans`.
@@ -697,6 +701,7 @@ impl<'a> Parser<'a> {
             scoreboards: HashMap::new(),
             weapon_samples: Vec::new(),
             entity_players: Vec::new(),
+            player_tables: PlayerTables::default(),
             ban_slots: Vec::new(),
             ban_warnings: Vec::new(),
             scoreboard_by_name: HashMap::new(),
@@ -1138,30 +1143,66 @@ impl<'a> Parser<'a> {
                 .iter()
                 .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
                 .count();
-            // A player's own recording leaves their body out of the player
-            // table; spectator recordings link every body.
-            let own_body_missing = players.iter().any(|p| {
-                p.relation == Some(crate::entities::Relation::You)
-                    && p.entities.as_ref().is_some_and(|e| e.movement.is_none())
-            });
-            let expected = with - usize::from(own_body_missing);
-            let f = r.field(
-                "movement",
-                if moving == 0 {
-                    Status::NotInVersion
-                } else if moving < expected {
-                    Status::Partial
+            // The player table gives every player of the round an entry,
+            // the recorder included, and a body once they spawn. A player
+            // with an entry and no body never had one in this recording,
+            // which is not a fault of the read.
+            let tables = &self.player_tables;
+            let incomplete = round.container.as_ref().is_some_and(|c| !c.complete);
+            let f = r.field("movement", Status::Decoded, moving);
+            if tables.tables == 0 {
+                if tables.unread > 0 {
+                    f.at_most(Status::Missing).warn(format!(
+                        "none of the {} player tables could be read",
+                        tables.unread
+                    ));
+                } else if incomplete {
+                    f.at_most(Status::Missing)
+                        .warn("the file holds no player table linking bodies to players");
+                } else if code >= version::Y11S3 {
+                    f.at_most(Status::Missing)
+                        .warn("no player table linking bodies to players");
                 } else {
-                    Status::Decoded
-                },
-                moving,
-            );
-            if moving == 0 {
-                f.warn("no player table linking bodies to players (seen from Y11S3)");
-            } else if own_body_missing {
-                f.warn(
-                    "the recording player's own body is not linked: their own recordings leave it out of the player table",
-                );
+                    f.at_most(Status::NotInVersion)
+                        .warn("no player table linking bodies to players (seen from Y11S3)");
+                }
+            } else {
+                if tables.unread > 0 {
+                    f.at_most(Status::Partial).warn(format!(
+                        "{} of {} player tables could not be read",
+                        tables.unread,
+                        tables.tables + tables.unread
+                    ));
+                }
+                let carried = || players.iter().filter(|p| p.entities.is_some());
+                let listed = |p: &&Player| tables.players.contains(&p.id);
+                let unlisted = carried().filter(|p| !listed(p)).count();
+                if unlisted > 0 {
+                    f.at_most(Status::Partial).warn(format!(
+                        "{unlisted} players have no entry in the player table"
+                    ));
+                }
+                let bodiless = carried()
+                    .filter(listed)
+                    .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_none()))
+                    .count();
+                if bodiless > 0 && incomplete {
+                    f.at_most(Status::Partial).warn(format!(
+                        "{bodiless} players had not been given a body where the file stops"
+                    ));
+                } else if bodiless > 0 {
+                    f.warn(format!(
+                        "{bodiless} players were never given a body: they left, or the recording ended, before they spawned"
+                    ));
+                }
+                let others = (tables.players.iter())
+                    .filter(|id| !players.iter().any(|p| p.id == **id))
+                    .count();
+                if others > 0 {
+                    f.warn(format!(
+                        "{others} players in the player table are not in the header's player list: they joined after it was written, or were not part of the round"
+                    ));
+                }
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
@@ -1192,6 +1233,63 @@ impl<'a> Parser<'a> {
                 if mode == ReadMode::Partial {
                     f.warn("partial read: later changes not read");
                 }
+            }
+        }
+
+        if code >= version::Y11S3 && !header_only {
+            let known = players.iter().filter(|p| p.platform.is_some()).count();
+            let f = r.field("platform", Status::Inferred, known);
+            f.warn("PC is confirmed by the recording player; PlayStation and Xbox are told apart by the console account id the controller holds beside the platform");
+            let mut unknown: Vec<u32> = (players.iter())
+                .filter(|p| p.platform.is_none())
+                .filter_map(|p| p.platform_raw)
+                .collect();
+            unknown.sort_unstable();
+            unknown.dedup();
+            if !unknown.is_empty() {
+                f.at_most(Status::Partial).warn(format!(
+                    "platform values not seen before, left out: {unknown:?}"
+                ));
+            }
+            let nicknames = players.iter().filter(|p| p.uses_nickname).count();
+            let renamed = players.iter().filter(|p| p.renamed_to.is_some()).count();
+            let f = r.field("names", Status::Decoded, players.len());
+            if nicknames > 0 {
+                f.warn(format!(
+                    "{nicknames} players are shown under a nickname, not their own name"
+                ));
+            }
+            if renamed > 0 {
+                f.warn(format!(
+                    "{renamed} players were given another name as the match ended (`renamedTo`)"
+                ));
+            }
+            let dressed = players.iter().filter(|p| p.cosmetics.is_some()).count();
+            let f = r.field("cosmetics", Status::Decoded, dressed);
+            f.warn("asset ids only: replays hold no names for uniforms, skins or charms");
+            if mode == ReadMode::Partial {
+                f.warn("partial read: bodies created later (attackers, at the end of prep) are not read");
+            }
+            let bare = players
+                .iter()
+                .filter(|p| p.cosmetics.is_none())
+                .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
+                .count();
+            if bare > 0 {
+                f.at_most(Status::Partial).warn(format!(
+                    "the message creating the body of {bare} players was not found"
+                ));
+            }
+            let unskinned = players
+                .iter()
+                .filter_map(|p| p.cosmetics.as_ref())
+                .flat_map(|c| &c.weapons)
+                .filter(|w| w.skin.is_none())
+                .count();
+            if unskinned > 0 {
+                f.warn(format!(
+                    "{unskinned} weapons have no skin: none is set, or the weapon could not be told from another player's"
+                ));
             }
         }
 
@@ -1493,8 +1591,13 @@ impl<'a> Parser<'a> {
         if !self.round.header.recording_profile_id.is_empty() {
             c.seek(PROFILE_ID_INDICATOR)?;
             profile_id = c.string()?;
-            c.skip(5)?;
-            id = c.u64()?;
+            // In Y11S3 the `playerid` does not follow: the same bytes, the
+            // start of the next property, read as one id for every player.
+            // The controller holds it (see `apply_entities`).
+            if code < version::Y11S3 {
+                c.skip(5)?;
+                id = c.u64()?;
+            }
         }
 
         // Defender spawns come from the site packet instead.
@@ -2613,6 +2716,54 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The player tables of the round (Y11S3): the table stream's snapshot
+    /// and frame records up to `end`, or, when the streams cannot be told
+    /// apart, whatever in `start..end` is framed as a table of `ids`.
+    fn player_tables(&self, start: usize, end: usize, ids: &[u64]) -> PlayerTables {
+        let mut tables = PlayerTables::default();
+        let streams = self.round.container.as_ref().map(|c| &c.streams);
+        if let (Some(map), Some(streams)) = (&self.records, streams) {
+            let listed = streams
+                .iter()
+                .position(|s| s.name_hash == PLAYER_TABLE_STREAM);
+            if let Some(&(from, to)) = listed.and_then(|i| map.snapshots.get(i))
+                && to <= end
+            {
+                tables.read(None, &self.data[from..to]);
+            }
+            // Records follow the main stream's 16-byte header: per stream a
+            // 21-byte header, then `<frame u32> <size u32> 00000000` and the
+            // payload of each record (see `records`).
+            let mut pos = map.main_start + 16;
+            'streams: for sub in &map.streams {
+                pos += 21;
+                for &frame in &sub.frames {
+                    let size = self
+                        .data
+                        .get(pos + 4..pos + 8)
+                        .and_then(|b| b.try_into().ok())
+                        .map(u32::from_le_bytes);
+                    let Some(size) = size else { break 'streams };
+                    let (from, to) = (pos + 12, pos + 12 + size as usize);
+                    if sub.name_hash == PLAYER_TABLE_STREAM {
+                        match self.data.get(from..to).filter(|_| to <= end) {
+                            Some(payload) => tables.read(Some(frame), payload),
+                            None => break 'streams,
+                        }
+                    }
+                    pos = to;
+                }
+                if sub.name_hash == PLAYER_TABLE_STREAM {
+                    break;
+                }
+            }
+        }
+        if tables.tables == 0 && tables.unread == 0 {
+            tables = PlayerTables::scan(&self.data[start..end], ids);
+        }
+        tables
+    }
+
     /// Hands each player their objects, who they are to the recorder, their
     /// party role, and (Y11S3+) the body the movement stream moves.
     fn apply_entities(&mut self, start: usize, end: usize) {
@@ -2635,6 +2786,15 @@ impl<'a> Parser<'a> {
             if p.profile_id.is_empty() {
                 p.profile_id = o.profile_id.clone();
             }
+            // A player the header does not list comes from their pick
+            // packet, which in Y11S3 gives no id. The controller's is the
+            // id the player table lists them under.
+            if p.id == 0 {
+                p.id = o.player_id;
+            }
+            p.platform_raw = o.platform;
+            p.platform = o.platform.and_then(crate::header::Platform::from_raw);
+            p.uses_nickname = o.uses_nickname;
             p.entities = Some(crate::header::PlayerEntities {
                 controller: o.controller,
                 scoreboard: o.scoreboard,
@@ -2717,11 +2877,29 @@ impl<'a> Parser<'a> {
         if objects.is_empty() {
             return;
         }
+        // A name written to a controller on its own is the player's new
+        // name. The game does it as the match ends, so the whole stream is
+        // searched whatever the read mode.
+        let controllers: Vec<u32> = (header.players.iter())
+            .filter_map(|p| Some(p.entities.as_ref()?.controller))
+            .collect();
+        for (controller, name) in crate::entities::renames(&self.data[start..], &controllers) {
+            let player = (header.players.iter_mut()).find(|p| {
+                p.entities
+                    .as_ref()
+                    .is_some_and(|e| e.controller == controller)
+            });
+            if let Some(p) = player {
+                p.renamed_to = (name != p.username).then_some(name);
+            }
+        }
         // Bodies from the player table, in the order each player got them.
-        let body = &self.data[start..end];
-        let ids: Vec<u64> = header.players.iter().map(|p| p.id).collect();
+        let ids: Vec<u64> = (self.round.header.players.iter().map(|p| p.id))
+            .chain(objects.iter().map(|o| o.player_id))
+            .collect();
+        let tables = self.player_tables(start, end, &ids);
         let mut bodies: HashMap<u64, Vec<u32>> = HashMap::new();
-        for change in crate::entities::possessions(body, &ids) {
+        for change in &tables.changes {
             if let Some(b) = change.body {
                 let list = bodies.entry(change.player_id).or_default();
                 if list.last() != Some(&b) {
@@ -2730,8 +2908,8 @@ impl<'a> Parser<'a> {
             }
         }
         let first: Vec<u32> = bodies.values().filter_map(|l| l.first().copied()).collect();
-        let spawns = crate::entities::spawn_positions(body, &first);
-        for p in &mut header.players {
+        let spawns = crate::entities::spawn_positions(&self.data[start..end], &first);
+        for p in &mut self.round.header.players {
             let Some(list) = bodies.get(&p.id) else {
                 continue;
             };
@@ -2740,6 +2918,18 @@ impl<'a> Parser<'a> {
             }
             p.spawn_position = list.first().and_then(|b| spawns.get(b).copied());
         }
+        // What each body wears and carries, from the message that created
+        // it: the latest body a player got that has one.
+        if !bodies.is_empty() {
+            let data = &self.data[start..end];
+            let created = crate::entities::spawns(data);
+            for p in &mut self.round.header.players {
+                p.cosmetics = (bodies.get(&p.id).into_iter().flatten().rev())
+                    .find_map(|b| created.iter().find(|s| s.object == *b))
+                    .map(|body| crate::cosmetics::of(body, &created, data));
+            }
+        }
+        self.player_tables = tables;
     }
 
     fn read_weapon_ready(&mut self, c: &mut Cursor) -> Result<()> {
@@ -2761,11 +2951,17 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// Places weapon-ready changes on the timeline, dropping repeats.
+    /// Places weapon-ready changes on the timeline, dropping repeats. The
+    /// game keeps the controller of someone who left before the round, who
+    /// is not one of its players; what is written to it is left out.
     fn resolve_weapon_ready(&mut self) {
         let mut last: HashMap<&str, bool> = HashMap::new();
         let timeline = &self.round.timeline;
+        let players = &self.round.header.players;
         for (name, ready, tick) in &self.weapon_samples {
+            if !players.iter().any(|p| p.username == *name) {
+                continue;
+            }
             if last.insert(name, *ready) == Some(*ready) {
                 continue;
             }
@@ -3236,11 +3432,11 @@ fn pick_team(pick: u32, per_team: u32) -> usize {
 mod tests {
     use super::*;
     use crate::header::PlayerEntities;
+    use crate::report::FieldReport;
     use crate::types::Operator;
 
     /// A player's own recording of a 5v5 round: `players` players, each
-    /// with an operator and a controller, and every body linked but the
-    /// recorder's (player 0), as the game writes it.
+    /// with an operator, a controller and a body. Player 0 recorded.
     fn own_recording(players: usize) -> Header {
         let mut h = Header {
             code_version: version::Y9S4,
@@ -3261,7 +3457,7 @@ mod tests {
                 }),
                 entities: Some(PlayerEntities {
                     controller: 0xF000_0000 + i as u32,
-                    movement: (i != 0).then_some(0xF100_0000 + i as u32),
+                    movement: Some(0xF100_0000 + i as u32),
                     ..PlayerEntities::default()
                 }),
                 ..Player::default()
@@ -3327,16 +3523,183 @@ mod tests {
         assert_eq!(pick_team(7, 6), 1);
     }
 
+    /// The `movement` field of the report for `header`, read with `tables`
+    /// player tables of which `unread` failed, listing every player but
+    /// `unlisted`.
+    fn movement_report(
+        header: Header,
+        tables: usize,
+        unread: usize,
+        unlisted: &[u64],
+    ) -> FieldReport {
+        let mut p = Parser::new(&[], header);
+        p.player_tables = PlayerTables {
+            tables,
+            unread,
+            players: (p.round.header.players.iter().map(|p| p.id))
+                .filter(|id| !unlisted.contains(id))
+                .collect(),
+            ..PlayerTables::default()
+        };
+        p.finish_report(ReadMode::Full);
+        p.round.decode.get("movement").cloned().unwrap()
+    }
+
     #[test]
-    fn the_recorders_own_body_is_not_counted_against_movement() {
-        let r = report(own_recording(10));
-        let f = r.get("movement").unwrap();
-        assert_eq!((f.status, f.count), (Status::Decoded, 9));
-        assert!(f.warnings.iter().any(|w| w.contains("own body")), "{f:?}");
-        // Another player's missing body still is.
+    fn movement_is_decoded_when_every_player_has_a_body() {
+        let f = movement_report(own_recording(10), 40, 0, &[]);
+        assert_eq!((f.status, f.count), (Status::Decoded, 10));
+        assert!(f.warnings.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn a_player_who_never_spawned_is_not_a_fault() {
         let mut h = own_recording(10);
         h.players[3].entities.as_mut().unwrap().movement = None;
-        assert_eq!(report(h).get("movement").unwrap().status, Status::Partial);
+        let f = movement_report(h, 40, 0, &[]);
+        assert_eq!((f.status, f.count), (Status::Decoded, 9));
+        assert!(
+            f.warnings.iter().any(|w| w.contains("never given a body")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn a_player_the_table_does_not_list_or_a_table_not_read_is_a_fault() {
+        let mut h = own_recording(10);
+        h.players[3].entities.as_mut().unwrap().movement = None;
+        let f = movement_report(h, 40, 0, &[4]);
+        assert_eq!((f.status, f.count), (Status::Partial, 9));
+        assert!(f.warnings.iter().any(|w| w.contains("no entry")), "{f:?}");
+
+        let f = movement_report(own_recording(10), 40, 2, &[]);
+        assert_eq!(f.status, Status::Partial);
+        assert!(f.warnings.iter().any(|w| w.contains("2 of 42")), "{f:?}");
+    }
+
+    #[test]
+    fn a_table_can_list_players_the_header_does_not() {
+        let mut p = Parser::new(&[], own_recording(10));
+        p.player_tables = PlayerTables {
+            tables: 40,
+            players: (1..=11).collect(),
+            ..PlayerTables::default()
+        };
+        p.finish_report(ReadMode::Full);
+        let f = p.round.decode.get("movement").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 10));
+        assert!(
+            f.warnings
+                .iter()
+                .any(|w| w.contains("1 players in the player table")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn a_round_without_player_tables_has_no_movement_links() {
+        let unlinked = |code: u32| {
+            let mut h = own_recording(10);
+            h.code_version = code;
+            for p in &mut h.players {
+                p.entities.as_mut().unwrap().movement = None;
+            }
+            h
+        };
+        // Y11S3 has the table, so a round without one is missing it.
+        let f = movement_report(unlinked(version::Y11S3), 0, 0, &[]);
+        assert_eq!((f.status, f.count), (Status::Missing, 0));
+        let f = movement_report(unlinked(version::Y11S3), 0, 3, &[]);
+        assert_eq!(f.status, Status::Missing);
+        assert!(
+            f.warnings.iter().any(|w| w.contains("none of the 3")),
+            "{f:?}"
+        );
+        // No table has been seen before Y11S3.
+        let f = movement_report(unlinked(version::Y9S4), 0, 0, &[]);
+        assert_eq!(f.status, Status::NotInVersion);
+    }
+
+    /// The controller of player `i` of `own_recording`, as the snapshot
+    /// gives it, holding `player_id`.
+    fn controller(i: u32, player_id: u64) -> crate::entities::PlayerObjects {
+        crate::entities::PlayerObjects {
+            player_id,
+            username: format!("p{i}"),
+            controller: 0xF000_0000 + i,
+            ..Default::default()
+        }
+    }
+
+    /// A player the header does not list comes from their pick packet,
+    /// without an id. Their controller has the id the player table lists
+    /// them under.
+    #[test]
+    fn a_player_without_an_id_takes_their_controllers_and_is_given_their_body() {
+        let mut h = own_recording(2);
+        h.code_version = version::Y11S3;
+        h.players[1].id = 0;
+        for p in &mut h.players {
+            p.entities = None;
+        }
+        // The opening table as a snapshot holds it: its length, the count,
+        // then for each player their id, mask `01`, flags `04` and a body.
+        let mut table = vec![2];
+        for (id, body) in [(1u64, 0xF010_0001u64), (77, 0xF010_0002)] {
+            table.extend(id.to_le_bytes());
+            table.extend([0x01, 0x04]);
+            table.extend(body.to_le_bytes());
+        }
+        let mut data = (table.len() as u64).to_le_bytes().to_vec();
+        data.extend(&table);
+        let mut p = Parser::new(&data, h);
+        p.entity_players = vec![controller(0, 1), controller(1, 77)];
+
+        p.apply_entities(0, data.len());
+        p.finish_report(ReadMode::Full);
+
+        let players = &p.round.header.players;
+        let ids: Vec<u64> = players.iter().map(|p| p.id).collect();
+        assert_eq!(ids, [1, 77]);
+        let bodies: Vec<_> = players
+            .iter()
+            .map(|p| p.entities.as_ref().unwrap().movement)
+            .collect();
+        assert_eq!(bodies, [Some(0xF010_0001), Some(0xF010_0002)]);
+        let f = p.round.decode.get("movement").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 2), "{f:?}");
+    }
+
+    #[test]
+    fn an_id_the_header_gives_is_kept() {
+        let mut p = Parser::new(&[], own_recording(2));
+        // Player 1's controller is found by name and holds another id.
+        p.entity_players = vec![controller(0, 1), controller(1, 99)];
+
+        p.apply_entities(0, 0);
+
+        let players = &p.round.header.players;
+        let ids: Vec<u64> = players.iter().map(|p| p.id).collect();
+        assert_eq!(ids, [1, 2]);
+        let controller = players[1].entities.as_ref().unwrap().controller;
+        assert_eq!(controller, 0xF000_0001);
+    }
+
+    #[test]
+    fn weapon_ready_changes_of_someone_who_is_not_a_player_are_left_out() {
+        let mut p = Parser::new(&[], own_recording(2));
+        p.weapon_samples = vec![
+            ("p1".into(), false, None),
+            ("not listed".into(), false, None),
+            ("p1".into(), true, None),
+        ];
+
+        p.resolve_weapon_ready();
+
+        let changes: Vec<_> = (p.round.weapon_ready.iter())
+            .map(|w| (w.username.as_str(), w.ready))
+            .collect();
+        assert_eq!(changes, [("p1", false), ("p1", true)]);
     }
 
     #[test]

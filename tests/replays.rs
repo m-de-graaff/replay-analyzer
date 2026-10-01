@@ -1498,6 +1498,85 @@ fn y11s3_players_link_to_their_objects() {
     }
 }
 
+/// Every player of the test match is on PC under their own name, and wears
+/// and carries what their body's creation message lists.
+#[test]
+fn y11s3_players_have_a_platform_and_cosmetics() {
+    use replay_analyzer::{Platform, Status};
+    let Some(dir) = data_dir() else { return };
+    let Some(round) = y11s3(&dir, "custom_1.rec") else {
+        return;
+    };
+    let players = &round.header.players;
+    for p in players {
+        let name = &p.username;
+        assert_eq!(p.platform, Some(Platform::Pc), "{name}");
+        assert!(!p.uses_nickname && p.renamed_to.is_none(), "{name}");
+        let c = p.cosmetics.as_ref().unwrap_or_else(|| panic!("{name}"));
+        assert!(c.uniform.is_some() && c.headgear.is_some(), "{name}");
+        // Shield operators carry no primary gun.
+        assert!((1..=2).contains(&c.weapons.len()), "{name}");
+        for w in &c.weapons {
+            assert!(w.skin.is_some(), "{name}: {w:?}");
+        }
+    }
+    let wizard = players.iter().find(|p| p.username == "WIZARD.L5").unwrap();
+    let c = wizard.cosmetics.as_ref().unwrap();
+    assert_eq!(c.uniform, Some(393844871224));
+    assert_eq!(c.headgear, Some(393844871002));
+    assert_eq!(c.operator_card.badges, [414187259927]);
+    let primary = &c.weapons[0];
+    assert_eq!(primary.item, 393596493099);
+    assert_eq!(primary.skin, Some(246545425488));
+    assert_eq!(primary.charm, Some(361075170164));
+    assert_eq!(c.weapons[1].charm, None, "the placeholder is no charm");
+    for (field, status) in [
+        ("platform", Status::Inferred),
+        ("names", Status::Decoded),
+        ("cosmetics", Status::Decoded),
+    ] {
+        let f = round.decode.get(field).unwrap();
+        assert_eq!((f.status, f.count), (status, 10), "{f:?}");
+    }
+    let json = serde_json::to_value(&round).unwrap();
+    assert_eq!(json["players"][0]["platform"], "pc");
+    assert_eq!(
+        json["players"][0]["cosmetics"]["weapons"][0]["slot"],
+        "primary"
+    );
+}
+
+/// A player wears the same uniform and headgear on an operator in every
+/// round of the test match, and players on the same operator do not all
+/// wear the same: the ids are the player's own, not the operator's.
+#[test]
+fn y11s3_cosmetics_belong_to_the_player() {
+    let Some(dir) = data_dir() else { return };
+    let mut worn = std::collections::HashMap::new();
+    let mut by_operator = std::collections::HashMap::new();
+    for i in 1..=10 {
+        let Some(round) = y11s3(&dir, &format!("custom_{i}.rec")) else {
+            return;
+        };
+        for p in &round.header.players {
+            let Some(c) = &p.cosmetics else { continue };
+            let look = (c.uniform, c.headgear);
+            let operator = p.operator.to_string();
+            let before = worn.insert((p.key.clone(), operator.clone()), look);
+            assert!(
+                before.is_none_or(|b| b == look),
+                "{} changed clothes on {operator}",
+                p.username
+            );
+            by_operator
+                .entry(operator)
+                .or_insert_with(std::collections::HashSet::new)
+                .insert(look);
+        }
+    }
+    assert!(by_operator.values().any(|looks| looks.len() > 1));
+}
+
 /// The Y11S3 scoreboard's match totals agree with the kill feed, once kills
 /// the scoreboard credits to a teammate (who downed the victim) are counted
 /// for that teammate.
@@ -1681,4 +1760,331 @@ fn y11s3_sides_end_and_plant_are_decoded() {
     assert_eq!((plant.time.as_str(), plant.elapsed), ("0:00", 231.0));
     let end = info.phases.iter().find(|p| p.phase == Phase::End).unwrap();
     assert!((end.recording_start.unwrap() - end.start).abs() < 1.0);
+}
+
+/// `<match id> R<round>`, to name a real round in a failure without naming
+/// its players.
+fn real_round_name(r: &Round) -> String {
+    format!("{} R{}", r.header.match_id, r.header.round_number + 1)
+}
+
+/// Whether the game finished writing the round's file.
+fn written_whole(r: &Round) -> bool {
+    r.container.as_ref().is_some_and(|c| c.complete)
+}
+
+/// Every player of a real round has a profile id, an id no other player
+/// has, and a place relative to the one player who recorded.
+#[test]
+fn real_players_are_who_the_header_says() {
+    use replay_analyzer::Relation;
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        let name = real_round_name(r);
+        let h = &r.header;
+        let mut ids = std::collections::HashSet::new();
+        let mut profiles = std::collections::HashSet::new();
+        for (i, p) in h.players.iter().enumerate() {
+            assert!(
+                !p.profile_id.is_empty(),
+                "{name}: player {i} has no profile id"
+            );
+            assert_eq!(p.key, p.profile_id, "{name}: player {i}");
+            assert!(
+                profiles.insert(&p.profile_id),
+                "{name}: player {i} listed twice"
+            );
+            assert!(p.relation.is_some(), "{name}: player {i} has no relation");
+            // Read in full, a player's id is the one their controller holds.
+            if written_whole(r) {
+                assert_ne!(p.id, 0, "{name}: player {i} has no id");
+                assert!(ids.insert(p.id), "{name}: player {i} shares an id");
+            }
+        }
+        let you: Vec<_> = (h.players.iter())
+            .filter(|p| p.relation == Some(Relation::You))
+            .collect();
+        assert_eq!(you.len(), 1, "{name}: players who are `you`");
+        let you = you[0];
+        assert_eq!(you.profile_id, h.recording_profile_id, "{name}");
+        if written_whole(r) {
+            assert_eq!(you.id, h.recording_player_id, "{name}");
+        }
+        for (i, p) in h.players.iter().enumerate() {
+            let expected = if std::ptr::eq(p, you) {
+                Relation::You
+            } else if p.team_index == you.team_index {
+                Relation::Teammate
+            } else {
+                Relation::Opponent
+            };
+            assert_eq!(p.relation, Some(expected), "{name}: player {i}");
+            if p.party.is_some() {
+                assert_eq!(p.team_index, you.team_index, "{name}: player {i}");
+            }
+        }
+        let f = r.decode.get("recorder").unwrap();
+        assert_eq!(
+            (f.status, f.count),
+            (replay_analyzer::Status::Decoded, 1),
+            "{name}"
+        );
+        let f = r.decode.get("profileIds").unwrap();
+        assert_eq!(f.status, replay_analyzer::Status::Decoded, "{name}");
+    }
+}
+
+/// Every player of a real round is carried by objects of their own, and the
+/// player table links a body to everyone who spawned, the recorder
+/// included. A player without a body is one the table lists and never gave
+/// one, which the report says without calling it a fault.
+#[test]
+fn real_players_link_to_their_objects_and_bodies() {
+    use replay_analyzer::{Relation, Status};
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        let name = real_round_name(r);
+        let players = &r.header.players;
+        let movement = r.decode.get("movement").unwrap();
+        if !written_whole(r) {
+            // A file the game did not finish may stop before any body is
+            // given, or hold no table at all: never a clean read.
+            let bodies = players
+                .iter()
+                .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
+                .count();
+            if bodies < players.len() {
+                assert_ne!(movement.status, Status::Decoded, "{name}");
+                assert_ne!(movement.status, Status::NotInVersion, "{name}");
+            }
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut bodiless = 0;
+        for (i, p) in players.iter().enumerate() {
+            let e = (p.entities.as_ref())
+                .unwrap_or_else(|| panic!("{name}: player {i} has no objects"));
+            for id in [Some(e.controller), e.scoreboard, e.health] {
+                let id = id.unwrap_or_else(|| panic!("{name}: player {i} lacks an object"));
+                assert!(seen.insert(id), "{name}: player {i} shares object {id:08x}");
+            }
+            match e.movement {
+                Some(body) => {
+                    assert!(
+                        seen.insert(body),
+                        "{name}: player {i} shares body {body:08x}"
+                    );
+                    let pos = (p.spawn_position)
+                        .unwrap_or_else(|| panic!("{name}: player {i} has a body created nowhere"));
+                    assert!(pos.iter().all(|v| v.abs() < 1000.0), "{name}: {pos:?}");
+                }
+                None => {
+                    bodiless += 1;
+                    assert!(p.spawn_position.is_none(), "{name}: player {i}");
+                }
+            }
+        }
+        // Every table was read and lists every player.
+        assert_eq!(movement.status, Status::Decoded, "{name}: {movement:?}");
+        assert_eq!(movement.count, players.len() - bodiless, "{name}");
+        let explained = (movement.warnings.iter())
+            .any(|w| w.starts_with(&format!("{bodiless} players were never given a body")));
+        assert_eq!(bodiless > 0, explained, "{name}: {movement:?}");
+        // The recorder cannot have left their own recording: when all their
+        // teammates spawned, so did they.
+        let you = (players.iter())
+            .find(|p| p.relation == Some(Relation::You))
+            .unwrap_or_else(|| panic!("{name}: nobody recorded"));
+        let body = |p: &replay_analyzer::Player| p.entities.as_ref().and_then(|e| e.movement);
+        let team_spawned = players
+            .iter()
+            .filter(|p| p.relation == Some(Relation::Teammate))
+            .all(|p| body(p).is_some());
+        if team_spawned && players.len() > 1 {
+            assert!(
+                body(you).is_some(),
+                "{name}: the recorder's body is not linked"
+            );
+        }
+        let f = r.decode.get("entities").unwrap();
+        assert_eq!(
+            (f.status, f.count),
+            (Status::Decoded, players.len()),
+            "{name}"
+        );
+    }
+}
+
+/// What a real round says about players names players of the round: both
+/// ends of every kill, with their profile ids, and every weapon-ready
+/// change.
+#[test]
+fn real_events_name_players_of_the_round() {
+    use replay_analyzer::MatchUpdateType;
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        let name = real_round_name(r);
+        let profile = |username: &str| {
+            (r.header.players.iter())
+                .find(|p| p.username == username)
+                .map(|p| p.profile_id.as_str())
+        };
+        for (i, u) in r.match_feedback.iter().enumerate() {
+            if u.kind != MatchUpdateType::Kill {
+                continue;
+            }
+            assert_eq!(
+                profile(&u.username),
+                Some(u.profile_id.as_str()),
+                "{name}: kill {i}, killer"
+            );
+            assert_eq!(
+                profile(&u.target),
+                Some(u.target_profile_id.as_str()),
+                "{name}: kill {i}, target"
+            );
+        }
+        for (i, w) in r.weapon_ready.iter().enumerate() {
+            assert!(
+                profile(&w.username).is_some(),
+                "{name}: weapon-ready change {i}"
+            );
+        }
+    }
+}
+
+/// Across the rounds of a real match a player keeps their key, team and
+/// relation, whether or not they play every round or come back under a new
+/// `playerid`, and the summary lists everyone seen exactly once.
+#[test]
+fn real_matches_keep_their_players_apart_across_rounds() {
+    use replay_analyzer::{MatchSummary, Relation};
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for of_match in rounds.chunk_by(|a, b| a.header.match_id == b.header.match_id) {
+        let id = &of_match[0].header.match_id;
+        let mut seen = std::collections::HashMap::new();
+        for r in of_match {
+            for p in &r.header.players {
+                let first = *seen.entry(&p.key).or_insert((p.team_index, p.relation));
+                assert_eq!(first, (p.team_index, p.relation), "{}", real_round_name(r));
+            }
+        }
+        let summary = MatchSummary::new(of_match).unwrap();
+        let mut listed = std::collections::HashSet::new();
+        for (t, team) in summary.teams.iter().enumerate() {
+            for (i, p) in team.players.iter().enumerate() {
+                assert!(
+                    listed.insert(&p.key),
+                    "{id}: team {t} player {i} listed twice"
+                );
+                let known = seen.get(&p.key);
+                assert_eq!(known, Some(&(t, p.relation)), "{id}: team {t} player {i}");
+            }
+        }
+        assert_eq!(
+            listed.len(),
+            seen.len(),
+            "{id}: players seen and not listed"
+        );
+        let you: Vec<_> = (summary.teams.iter())
+            .flat_map(|t| &t.players)
+            .filter(|p| p.relation == Some(Relation::You))
+            .collect();
+        assert_eq!(you.len(), 1, "{id}");
+        assert_eq!(you[0].profile_id, summary.recording.profile_id, "{id}");
+        assert_eq!(
+            summary.your_team,
+            seen.get(&you[0].key).map(|s| s.0),
+            "{id}"
+        );
+    }
+}
+
+/// Every player of a real round is on a platform the parser knows, the
+/// recorder (who records on PC) on PC, and everyone with a body has what
+/// they wear. A player is given another name only in the round a recording
+/// ends on.
+#[test]
+fn real_players_have_a_platform_names_and_cosmetics() {
+    use replay_analyzer::{Platform, Relation, Status};
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for (n, r) in rounds.iter().enumerate() {
+        let name = real_round_name(r);
+        let platform = r.decode.get("platform").unwrap();
+        assert_eq!(platform.status, Status::Inferred, "{name}: {platform:?}");
+        let last_of_match =
+            (rounds.get(n + 1)).is_none_or(|next| next.header.match_id != r.header.match_id);
+        for (i, p) in r.header.players.iter().enumerate() {
+            assert!(p.platform.is_some(), "{name}: player {i}");
+            if p.relation == Some(Relation::You) {
+                assert_eq!(p.platform, Some(Platform::Pc), "{name}");
+                assert!(p.renamed_to.is_none(), "{name}: the recorder was renamed");
+            }
+            if let Some(to) = &p.renamed_to {
+                assert!(last_of_match, "{name}: player {i} renamed mid-match");
+                assert!(!to.is_empty() && *to != p.username, "{name}: player {i}");
+                assert!(
+                    p.uses_nickname || p.platform != Some(Platform::Pc),
+                    "{name}: player {i} is on PC under their own name"
+                );
+            }
+            let body = p.entities.as_ref().and_then(|e| e.movement);
+            assert_eq!(p.cosmetics.is_some(), body.is_some(), "{name}: player {i}");
+            if let Some(c) = &p.cosmetics {
+                assert!(c.uniform.is_some() && c.headgear.is_some(), "{name}: {i}");
+                assert!(c.weapons.len() <= 2, "{name}: player {i}");
+            }
+        }
+        let cosmetics = r.decode.get("cosmetics").unwrap();
+        assert_eq!(cosmetics.status, Status::Decoded, "{name}: {cosmetics:?}");
+    }
+}
+
+/// Across real matches a player wears one uniform and headgear per
+/// operator within a match, and keeps one platform throughout.
+#[test]
+fn real_cosmetics_and_platforms_stay_with_the_player() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut worn = std::collections::HashMap::new();
+    let mut platforms = std::collections::HashMap::new();
+    for r in rounds {
+        let name = real_round_name(r);
+        for (i, p) in r.header.players.iter().enumerate() {
+            let before = platforms.insert(p.key.clone(), p.platform);
+            assert!(
+                before.is_none_or(|b| b == p.platform),
+                "{name}: player {i} changed platform"
+            );
+            let Some(c) = &p.cosmetics else { continue };
+            let look = (c.uniform, c.headgear);
+            let key = (
+                r.header.match_id.clone(),
+                p.key.clone(),
+                p.operator.to_string(),
+            );
+            let before = worn.insert(key, look);
+            assert!(
+                before.is_none_or(|b| b == look),
+                "{name}: player {i} changed clothes"
+            );
+        }
+    }
 }

@@ -11,6 +11,7 @@
 pub mod analytics;
 pub mod census;
 pub mod container;
+pub mod cosmetics;
 mod cursor;
 pub mod decoder;
 mod decompress;
@@ -36,6 +37,7 @@ pub mod types;
 pub use analytics::MatchAnalytics;
 pub use census::Census;
 pub use container::{Container, DirectoryState, StreamInfo};
+pub use cosmetics::Cosmetics;
 pub use decoder::ParserInfo;
 pub use details::{
     Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
@@ -44,7 +46,7 @@ pub use error::{Error, Result};
 pub use feedback::{MatchUpdate, MatchUpdateType};
 pub use file::FileInfo;
 pub use format::{FormatInfo, GameVersion, Timing};
-pub use header::{Header, PartyRole, Player, PlayerEntities, Relation, Team};
+pub use header::{Header, PartyRole, Platform, Player, PlayerEntities, Relation, Team};
 pub use identity::{KnownPlayer, PlayerDirectory};
 pub use library::Library;
 pub use matches::Match;

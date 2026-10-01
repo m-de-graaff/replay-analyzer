@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Serializer};
 
 use crate::entities::Relation;
+use crate::header::Platform;
 use crate::summary::MatchSummary;
 
 /// Every player seen in a set of matches.
@@ -31,12 +32,18 @@ pub struct KnownPlayer {
     pub key: String,
     #[serde(rename = "profileID", skip_serializing_if = "String::is_empty")]
     pub profile_id: String,
-    /// The name in the latest match.
+    /// The name in the latest match: the one the game gave as that match
+    /// ended when the recording has it, since the name shown during a match
+    /// can be a nickname.
     pub username: String,
     /// Every name used, in the order first seen. More than one means the
-    /// player renamed (or, without a profile id, never happens: the name is
-    /// the key).
+    /// player renamed, plays behind a nickname, or is on a console (or,
+    /// without a profile id, never happens: the name is the key).
     pub names: Vec<NameUse>,
+    /// `pc`, `playstation` or `xbox`, in the latest match that says
+    /// (Y11S3+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
     pub matches: u32,
     /// Matches this player recorded.
     #[serde(skip_serializing_if = "is_zero")]
@@ -61,6 +68,13 @@ pub struct KnownPlayer {
 #[serde(rename_all = "camelCase")]
 pub struct NameUse {
     pub username: String,
+    /// A nickname the game showed in place of the player's own name.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub nickname: bool,
+    /// The game gave the player this name as a match ended: their own name
+    /// for a player behind a nickname. Console players get one too.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub at_match_end: bool,
     pub matches: u32,
     #[serde(serialize_with = "rfc3339")]
     pub first_seen: DateTime<Utc>,
@@ -101,21 +115,32 @@ impl PlayerDirectory {
                 });
                 e.matches += 1;
                 e.last_seen = when;
-                e.username = p.username.clone();
+                e.username = p.renamed_to.as_ref().unwrap_or(&p.username).clone();
                 if !p.profile_id.is_empty() {
                     e.profile_id = p.profile_id.clone();
                 }
-                match e.names.iter_mut().find(|n| n.username == p.username) {
-                    Some(n) => {
-                        n.matches += 1;
-                        n.last_seen = when;
+                if p.platform.is_some() {
+                    e.platform = p.platform;
+                }
+                let shown = (&p.username, p.uses_nickname, false);
+                let given = p.renamed_to.as_ref().map(|name| (name, false, true));
+                for (name, nickname, at_match_end) in [Some(shown), given].into_iter().flatten() {
+                    match e.names.iter_mut().find(|n| n.username == *name) {
+                        Some(n) => {
+                            n.matches += 1;
+                            n.last_seen = when;
+                            n.nickname |= nickname;
+                            n.at_match_end |= at_match_end;
+                        }
+                        None => e.names.push(NameUse {
+                            username: name.clone(),
+                            nickname,
+                            at_match_end,
+                            matches: 1,
+                            first_seen: when,
+                            last_seen: when,
+                        }),
                     }
-                    None => e.names.push(NameUse {
-                        username: p.username.clone(),
-                        matches: 1,
-                        first_seen: when,
-                        last_seen: when,
-                    }),
                 }
                 match p.relation {
                     Some(Relation::You) => {
@@ -216,5 +241,50 @@ mod tests {
         assert!(!d.get("p3").unwrap().queue_mate);
         assert!(!d.get("me").unwrap().queue_mate);
         assert_eq!(d.get("p3").unwrap().against_you, 1);
+    }
+
+    #[test]
+    fn a_nickname_gives_way_to_the_name_given_at_match_end() {
+        let hidden = PlayerSummary {
+            uses_nickname: true,
+            renamed_to: Some("RealName".into()),
+            platform: Some(Platform::Pc),
+            ..player("p1", "CalmOtter", Relation::Opponent, false)
+        };
+        // The recording of the second match stops before its end.
+        let unrevealed = PlayerSummary {
+            uses_nickname: true,
+            ..player("p1", "BoldHeron", Relation::Opponent, false)
+        };
+        let d =
+            PlayerDirectory::new(&[game("m1", 1, vec![hidden]), game("m2", 2, vec![unrevealed])]);
+        let p = d.get("p1").unwrap();
+        assert_eq!(
+            p.username, "BoldHeron",
+            "the latest match has no other name"
+        );
+        assert_eq!(p.platform, Some(Platform::Pc));
+        let names: Vec<_> = (p.names.iter())
+            .map(|n| (n.username.as_str(), n.nickname, n.at_match_end))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("CalmOtter", true, false),
+                ("RealName", false, true),
+                ("BoldHeron", true, false)
+            ]
+        );
+        let d = PlayerDirectory::new(&d_only_first());
+        assert_eq!(d.get("p1").unwrap().username, "RealName");
+    }
+
+    fn d_only_first() -> Vec<MatchSummary> {
+        let hidden = PlayerSummary {
+            uses_nickname: true,
+            renamed_to: Some("RealName".into()),
+            ..player("p1", "CalmOtter", Relation::Opponent, false)
+        };
+        vec![game("m1", 1, vec![hidden])]
     }
 }

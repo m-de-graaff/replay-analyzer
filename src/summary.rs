@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::details::Ban;
 use crate::entities::Relation;
-use crate::header::{PartyRole, Player};
+use crate::header::{PartyRole, Platform, Player};
 use crate::outcome::{ReasonSource, scores};
 use crate::round::Round;
 use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, playlist_name};
@@ -274,7 +274,10 @@ pub struct TeamSummary {
     /// Side played in the first round read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub starting_side: Option<TeamRole>,
-    /// Players on this team in the first round read, in header order.
+    /// Every player seen on this team, in the order first seen (header
+    /// order within a round). A player who left stays listed, and one who
+    /// joined after the first round read follows those who started it, so a
+    /// team can list more players than it has seats.
     pub players: Vec<PlayerSummary>,
 }
 
@@ -299,6 +302,18 @@ pub struct PlayerSummary {
     /// partial reads, Y8S1+, not in custom games).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub party: Option<PartyRole>,
+    /// `pc`, `playstation` or `xbox` (full and partial reads, Y11S3+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
+    /// `username` is a nickname the game shows in place of the player's
+    /// own name.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub uses_nickname: bool,
+    /// The name the game gave the player as the match ended: for players
+    /// behind a nickname, and for console players. Only in recordings that
+    /// reach the end of the match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_to: Option<String>,
 }
 
 /// The operators one player played in a round, in order. More than one when
@@ -431,30 +446,34 @@ impl MatchSummary {
             .map(|p| p.team_index)
             .filter(|&t| t < 2);
 
+        // Every player of the match as first seen: the first round's header
+        // lacks whoever joins later.
+        let mut seen: Vec<&Player> = Vec::new();
+        for p in rounds.iter().flat_map(|r| &r.header.players) {
+            if !seen.iter().any(|q| same_player(q, p)) {
+                seen.push(p);
+            }
+        }
         let teams = [0, 1].map(|t| TeamSummary {
             name: first.teams[t].name.clone(),
             score: 0,
             starting_side: first.teams[t].role,
-            players: first
-                .players
+            players: seen
                 .iter()
                 .filter(|p| p.team_index == t)
-                .map(|p| {
-                    let same = |r: &'_ Round| -> Option<Player> {
-                        r.header
-                            .players
-                            .iter()
-                            .find(|q| q.key == p.key || (q.id != 0 && q.id == p.id))
-                            .cloned()
-                    };
-                    PlayerSummary {
-                        username: p.username.clone(),
-                        key: p.key.clone(),
-                        profile_id: p.profile_id.clone(),
-                        level: rounds.iter().find_map(|r| same(r)?.level),
-                        relation: p.relation,
-                        party: rounds.iter().find_map(|r| same(r)?.party),
-                    }
+                .map(|p| PlayerSummary {
+                    username: p.username.clone(),
+                    key: p.key.clone(),
+                    profile_id: p.profile_id.clone(),
+                    level: rounds.iter().find_map(|r| player_in(r, p)?.level),
+                    relation: p.relation,
+                    party: rounds.iter().find_map(|r| player_in(r, p)?.party),
+                    platform: rounds.iter().find_map(|r| player_in(r, p)?.platform),
+                    uses_nickname: rounds
+                        .iter()
+                        .any(|r| player_in(r, p).is_some_and(|q| q.uses_nickname)),
+                    renamed_to: (rounds.iter().rev())
+                        .find_map(|r| player_in(r, p)?.renamed_to.clone()),
                 })
                 .collect(),
         });
@@ -545,6 +564,19 @@ impl MatchSummary {
             rounds: round_summaries,
         })
     }
+}
+
+/// Whether two rounds' entries are one player: by key (the profile id when
+/// the replay has one), else by `playerid`. A player who reconnects comes
+/// back under a new `playerid` and the same profile id.
+fn same_player(a: &Player, b: &Player) -> bool {
+    (!a.key.is_empty() && a.key == b.key) || (a.id != 0 && a.id == b.id)
+}
+
+/// `player` as `round` lists them.
+fn player_in<'a>(round: &'a Round, player: &Player) -> Option<&'a Player> {
+    let players = &round.header.players;
+    players.iter().find(|q| same_player(q, player))
 }
 
 fn round_summary(round: &Round, rules: &Rules) -> RoundSummary {
@@ -684,6 +716,72 @@ mod tests {
         }
         h.match_result = match_result;
         r
+    }
+
+    /// A player as a round's header lists them, with the key parsing gives.
+    fn player(id: u64, profile: &str, team: usize) -> Player {
+        Player {
+            id,
+            username: format!("name-{profile}"),
+            profile_id: profile.into(),
+            key: profile.into(),
+            team_index: team,
+            ..Player::default()
+        }
+    }
+
+    /// Who the summary lists on `team`, by key.
+    fn listed(rounds: &[Round], team: usize) -> Vec<String> {
+        let s = MatchSummary::new(rounds).unwrap();
+        s.teams[team]
+            .players
+            .iter()
+            .map(|p| p.key.clone())
+            .collect()
+    }
+
+    #[test]
+    fn players_who_join_or_leave_between_rounds_are_all_listed() {
+        let mut rounds = [
+            ranked_round(1, 0, [0, 0], [1, 0], None),
+            ranked_round(2, 0, [1, 0], [1, 1], None),
+        ];
+        // `left` plays round 1 only; `joined` takes the seat in round 2.
+        rounds[0].header.players = vec![player(7, "you", 0), player(8, "left", 1)];
+        rounds[1].header.players = vec![player(9, "joined", 1), player(7, "you", 0)];
+
+        assert_eq!(listed(&rounds, 0), ["you"]);
+        assert_eq!(listed(&rounds, 1), ["left", "joined"]);
+    }
+
+    #[test]
+    fn a_player_who_reconnects_under_a_new_id_is_listed_once() {
+        let mut rounds = [
+            ranked_round(1, 0, [0, 0], [1, 0], None),
+            ranked_round(2, 0, [1, 0], [1, 1], None),
+        ];
+        rounds[0].header.players = vec![player(7, "you", 0), player(8, "mate", 0)];
+        rounds[1].header.players = vec![player(7, "you", 0), player(31, "mate", 0)];
+        rounds[1].header.players[1].party = Some(PartyRole::Member);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let keys: Vec<_> = s.teams[0].players.iter().map(|p| &p.key).collect();
+        assert_eq!(keys, ["you", "mate"]);
+        assert_eq!(s.teams[0].players[1].party, Some(PartyRole::Member));
+    }
+
+    #[test]
+    fn players_without_an_id_are_told_apart_by_key() {
+        // Header-only reads leave players the header gives no id at 0.
+        let mut rounds = [ranked_round(1, 0, [0, 0], [1, 0], None)];
+        rounds[0].header.players = vec![player(7, "you", 0), player(0, "a", 0), player(0, "b", 0)];
+        rounds[0].header.players[2].level = Some(50);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let levels: Vec<_> = s.teams[0].players.iter().map(|p| p.level).collect();
+        assert_eq!(levels, [None, None, Some(50)]);
     }
 
     #[test]

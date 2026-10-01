@@ -314,10 +314,15 @@ enum Packet {
     WeaponReady,
     ScoreboardKills,
     ScoreboardDeaths,
+    TimerState,
+    DefuserStarted,
+    InteractionLink,
+    SlotType,
+    RoundState,
 }
 
 impl Packet {
-    const COUNT: usize = 20;
+    const COUNT: usize = 25;
 
     fn name(self) -> &'static str {
         match self {
@@ -341,11 +346,16 @@ impl Packet {
             Packet::WeaponReady => "weaponReady",
             Packet::ScoreboardKills => "scoreboardKills",
             Packet::ScoreboardDeaths => "scoreboardDeaths",
+            Packet::TimerState => "timerState",
+            Packet::DefuserStarted => "defuserStarted",
+            Packet::InteractionLink => "interactionLink",
+            Packet::SlotType => "slotType",
+            Packet::RoundState => "roundState",
         }
     }
 }
 
-const PACKETS: [(Packet, &[u8]); 19] = [
+const PACKETS: [(Packet, &[u8]); 24] = [
     (Packet::Player, &[0x22, 0x07, 0x94, 0x9B, 0xDC]),
     (Packet::AttackerSwap, &[0x22, 0xA9, 0x26, 0x0B, 0xE4]),
     (Packet::Spawn, &[0xAF, 0x98, 0x99, 0xCA]),
@@ -364,6 +374,11 @@ const PACKETS: [(Packet, &[u8]); 19] = [
     (Packet::WeaponReady, &crate::entities::WEAPON_READY),
     (Packet::ScoreboardKills, &[0x1C, 0xD2, 0xB1, 0x9D]),
     (Packet::ScoreboardDeaths, &[0xCD, 0x9C, 0x5D, 0x72]),
+    (Packet::TimerState, &TIMER_STATE),
+    (Packet::DefuserStarted, &DEFUSER_STARTED),
+    (Packet::InteractionLink, &INTERACTION_LINK),
+    (Packet::SlotType, &SLOT_TYPE),
+    (Packet::RoundState, &TEAM0_ROUND_STATE),
     (Packet::Time, &[0x1F, 0x07, 0xEF, 0xC9]),
 ];
 const LEGACY_TIME: &[u8] = &[0x1E, 0xF1, 0x11, 0xAB];
@@ -481,8 +496,38 @@ const CLOCK_GAP: f64 = 2.0;
 /// countdown text (`DefuserTimer`), which runs from 7.000 down to 0.
 const DEFUSER_ACTION: [u8; 4] = [0xE5, 0x8C, 0x06, 0xE9];
 /// A countdown that stopped at or below this many seconds finished: at ~30
-/// samples a second the last sample written is 0.000 to 0.07.
+/// samples a second the last sample written is 0.000 to 0.07. Only used when
+/// the round has no `IsDefuserStarted`: the game has completed a plant with
+/// 0.635 on the countdown and abandoned one at 0.826.
 const DEFUSER_DONE: f64 = 0.1;
+/// Y11S3+ `TimerState`, on the clock object next to the seconds: 0 running,
+/// 1 the last seconds, 3 the round is decided.
+const TIMER_STATE: [u8; 4] = [0xBB, 0x09, 0x4F, 0xD3];
+const ROUND_DECIDED: u32 = 3;
+/// The clock record writes seconds, milliseconds and state one after the
+/// other, 20 bytes from the first to the last.
+const SAME_RECORD: usize = 32;
+/// Y11S3+ `IsDefuserStarted`, on the game-mode object created when action
+/// starts: turns 1 when a plant completes and back to 0 when a disable does.
+const DEFUSER_STARTED: [u8; 4] = [0xFF, 0x39, 0xF4, 0x08];
+/// Y11S3+ field that hangs a player's defuser interaction object off their
+/// controller (`GameModeInteractionVM`), so plants and disables name a player.
+const INTERACTION_LINK: [u8; 4] = [0x27, 0xC0, 0x8D, 0xCA];
+/// Y11S3+ `PlayerSlotType`, on the controller: 1 while a player is in the
+/// slot, something else once they left.
+const SLOT_TYPE: [u8; 4] = [0xB6, 0xB7, 0x1D, 0xD2];
+/// Y11S3+ `Team0RoundState`, followed by `Team1RoundState`, on the round's
+/// entry in the match's round history. Written when the round is decided:
+/// 2 lost, 3 won by elimination with no plant, 4 won with the defuser
+/// planted, 5 won on time, 8 cancelled (both teams). The teams are the
+/// header's, in its order.
+const TEAM0_ROUND_STATE: [u8; 4] = [0x31, 0xB1, 0xAD, 0xA0];
+const TEAM1_ROUND_STATE: [u8; 5] = [0x22, 0xF1, 0x6E, 0x23, 0x61];
+const STATE_LOST: u32 = 2;
+const STATE_ELIMINATION: u32 = 3;
+const STATE_PLANTED: u32 = 4;
+const STATE_TIME: u32 = 5;
+const STATE_CANCELLED: u32 = 8;
 
 struct Parser<'a> {
     data: &'a [u8],
@@ -500,6 +545,27 @@ struct Parser<'a> {
     interactions: HashMap<u32, Interaction>,
     /// Last health each player showed before action started.
     health_before_action: HashMap<String, u32>,
+    /// Spawn vote object of each player, by username.
+    spawn_objects: HashMap<u32, String>,
+    /// Both team objects state their side (Y11S3+).
+    sides_stated: bool,
+    /// The object the clock is written on.
+    clock_object: Option<u32>,
+    /// Tick at which `TimerState` said the round was decided.
+    end_tick: Option<usize>,
+    /// `IsDefuserStarted`, once the round has shown it.
+    defuser_started: Option<bool>,
+    /// Defuser interaction object -> the player it belongs to.
+    interaction_owners: HashMap<u32, String>,
+    /// Who last started a plant and a disable.
+    last_planter: Option<String>,
+    last_disabler: Option<String>,
+    /// Players who left mid-round, with the tick.
+    left: Vec<(String, Option<usize>)>,
+    /// Tick of the latest clock gap, which a plant in the same frame undoes.
+    last_gap_tick: Option<usize>,
+    /// Each team's round state as written when the round was decided.
+    round_states: Option<[u32; 2]>,
     /// `players_read` -> username of the player picked at that count.
     pick_slots: HashMap<u32, String>,
     /// Object id -> `players_read` when the object first appeared. Players'
@@ -604,6 +670,17 @@ impl<'a> Parser<'a> {
             plant_tick: None,
             interactions: HashMap::new(),
             health_before_action: HashMap::new(),
+            spawn_objects: HashMap::new(),
+            sides_stated: false,
+            clock_object: None,
+            end_tick: None,
+            defuser_started: None,
+            interaction_owners: HashMap::new(),
+            last_planter: None,
+            last_disabler: None,
+            left: Vec::new(),
+            last_gap_tick: None,
+            round_states: None,
             pick_slots: HashMap::new(),
             health_objects: HashMap::new(),
             observers: HashMap::new(),
@@ -683,12 +760,22 @@ impl<'a> Parser<'a> {
         self.finish_bans();
         self.finish_scoreboard();
         self.finish_interactions();
-        self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
-        self.round.timeline.recording = self
+        // The first reading usually sits in the opening snapshot: the state
+        // when the recording started.
+        let recording: Vec<Option<f64>> = self
             .reading_offsets
             .iter()
-            .map(|&o| self.recording_time(o))
+            .enumerate()
+            .map(|(i, &o)| {
+                self.recording_time(o).or_else(|| {
+                    let snapshot = self.records.as_ref()?.main_start > o;
+                    (i == 0 && snapshot).then(|| self.frame_times.first().copied())?
+                })
+            })
             .collect();
+        self.round.timeline =
+            Timeline::resolve(&self.readings, self.plant_tick, self.end_tick, &recording);
+        self.round.timeline.recording = recording;
         self.place_feedback();
         self.resolve_samples();
         self.resolve_weapon_ready();
@@ -878,7 +965,12 @@ impl<'a> Parser<'a> {
         }
 
         let roles = h.teams.iter().filter(|t| t.role.is_some()).count();
-        let f = r.field("teamRoles", Status::Inferred, roles);
+        let stated = if self.sides_stated {
+            Status::Decoded
+        } else {
+            Status::Inferred
+        };
+        let f = r.field("teamRoles", stated, roles);
         if header_only {
             f.at_most(Status::Skipped);
         } else if roles < 2 {
@@ -1134,6 +1226,8 @@ impl<'a> Parser<'a> {
             "winCondition",
             if skipped {
                 Status::Skipped
+            } else if round.outcome.reason_stated {
+                Status::Decoded
             } else {
                 Status::Inferred
             },
@@ -1145,6 +1239,9 @@ impl<'a> Parser<'a> {
                     .warn("no plant, disable, wipe or time-out fits the result");
             }
             match round.outcome.reason_source {
+                crate::outcome::ReasonSource::Confirmed if round.outcome.reason_stated => f.warn(
+                    "from the round history; the kill feed, defuser state and header score agree",
+                ),
                 crate::outcome::ReasonSource::Confirmed => f.warn(
                     "from the kill feed and defuser events; winner agrees with the header score",
                 ),
@@ -1165,6 +1262,10 @@ impl<'a> Parser<'a> {
                 Status::Skipped
             } else if spans.is_empty() {
                 Status::Missing
+            } else if self.end_tick.is_some() {
+                // Y11S3+: the game states the end and the plant; action
+                // starts where the clock restarts.
+                Status::Decoded
             } else {
                 Status::Inferred
             },
@@ -1194,7 +1295,7 @@ impl<'a> Parser<'a> {
             .count();
         if unnamed > 0 {
             r.field("defuserPlayers", Status::NotInVersion, unnamed).warn(
-                "Y11S3+ defuser events record the side, not the player; named only when one player of that side was alive",
+                "defuser events whose interaction object is not linked to a player; named only when one player of that side was alive",
             );
         }
 
@@ -1288,6 +1389,11 @@ impl<'a> Parser<'a> {
             Packet::AttackerSwap => self.read_attacker_swap(c),
             Packet::Spawn => self.read_spawn(c),
             Packet::Time => self.read_time(c),
+            Packet::TimerState => self.read_timer_state(c),
+            Packet::DefuserStarted => self.read_defuser_started(c),
+            Packet::InteractionLink => self.read_interaction_link(c),
+            Packet::SlotType => self.read_slot_type(c),
+            Packet::RoundState => self.read_round_state(c),
             Packet::LegacyTime => self.read_legacy_time(c),
             Packet::Feedback => self.read_feedback(c),
             Packet::DefuserTimer => self.read_defuser_timer(c),
@@ -1359,6 +1465,7 @@ impl<'a> Parser<'a> {
         })?;
         let dissect_id = c.array::<4>()?;
         c.seek(SPAWN_INDICATOR)?;
+        let spawn_object = property_object(c);
         let mut spawn = c.string()?;
         if spawn.is_empty() {
             c.skip(10)?;
@@ -1369,6 +1476,9 @@ impl<'a> Parser<'a> {
         self.take_loadout(c.pos(), &username, operator);
         let team_index = pick_team(self.players_read, self.team_size());
         self.pick_slots.insert(self.players_read, username.clone());
+        if let Some(object) = spawn_object {
+            self.spawn_objects.insert(object, username.clone());
+        }
 
         // Caster UI id; links attacker swaps to players from Y9S3.
         let mut ui_id = 0;
@@ -1506,12 +1616,14 @@ impl<'a> Parser<'a> {
     }
 
     fn read_spawn(&mut self, c: &mut Cursor) -> Result<()> {
+        let object = property_object(c);
         let location = c.string()?;
-        c.skip(150)?;
-        let marker = c.array::<5>()?;
         if !location.contains("<br/>") {
+            self.change_spawn(object, location);
             return Ok(());
         }
+        c.skip(150)?;
+        let marker = c.array::<5>()?;
         let header = &mut self.round.header;
         if !header.site.is_empty() && marker != CURRENT_SITE {
             return Ok(());
@@ -1532,7 +1644,37 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// An attacker changing spawn in prep: the pick packet holds the spawn
+    /// voted for when the recording started (`RANDOM` until the game picks
+    /// one), and every change rewrites the name on the same vote object.
+    fn change_spawn(&mut self, object: Option<u32>, location: String) {
+        let Some(username) = object.and_then(|o| self.spawn_objects.get(&o)) else {
+            return;
+        };
+        if location.is_empty() {
+            return;
+        }
+        let header = &mut self.round.header;
+        let Some(i) = header.players.iter().position(|p| &p.username == username) else {
+            return;
+        };
+        // A defender's vote object still holds the spawn of their last
+        // attack round; their `spawn` is the site.
+        let p = &header.players[i];
+        let defends = header.teams.get(p.team_index).and_then(|t| t.role)
+            == Some(TeamRole::Defense)
+            || (p.operator != Operator::RECRUIT && p.operator.role() == Some(TeamRole::Defense));
+        if defends || p.spawn == location {
+            return;
+        }
+        tracing::debug!(%username, from = %p.spawn, to = %location, "spawn changed");
+        header.players[i].spawn = location;
+    }
+
     fn read_time(&mut self, c: &mut Cursor) -> Result<()> {
+        if self.clock_object.is_none() {
+            self.clock_object = property_object(c);
+        }
         let t = f64::from(c.u32()?);
         self.set_clock(Clock {
             seconds: t,
@@ -1573,8 +1715,169 @@ impl<'a> Parser<'a> {
                 to: clock.display.clone(),
                 missing: prev - clock.seconds - 1.0,
             });
+            self.last_gap_tick = clock.tick;
         }
         self.clock = clock;
+    }
+
+    /// Y11S3+: the clock object says the round is decided. The clock is
+    /// zeroed in the same record; when it already stood at 0:00 (time ran
+    /// out, or a plant was under way at zero) the end gets a tick of its own.
+    fn read_timer_state(&mut self, c: &mut Cursor) -> Result<()> {
+        let object = property_object(c);
+        if c.u8()? != 4 {
+            return Ok(());
+        }
+        let state = u32::from_le_bytes(c.array()?);
+        if state != ROUND_DECIDED
+            || self.end_tick.is_some()
+            || object.is_none()
+            || object != self.clock_object
+            || self.readings.is_empty()
+        {
+            return Ok(());
+        }
+        // Zeroed just before, in this record: that reading is the end.
+        let same_record = self
+            .reading_offsets
+            .last()
+            .is_some_and(|&o| self.packet_at - o <= SAME_RECORD);
+        if self.readings.last() == Some(&0.0) && same_record {
+            self.clock.tick = Some(self.readings.len() - 1);
+        } else if self.readings.last() == Some(&0.0) {
+            self.readings.push(0.0);
+            self.reading_offsets.push(self.packet_at);
+            self.clock.tick = Some(self.readings.len() - 1);
+        } else {
+            self.set_clock(Clock {
+                seconds: 0.0,
+                display: display_clock(0.0),
+                tick: None,
+            });
+        }
+        self.end_tick = self.clock.tick;
+        Ok(())
+    }
+
+    /// Y11S3+: `IsDefuserStarted` turning 1 is the plant, turning 0 again the
+    /// disable. The countdown of the interaction cannot tell: the game
+    /// completes plants with up to 0.6 s left on it, and a plant that runs
+    /// out after the round is decided changes nothing here.
+    fn read_defuser_started(&mut self, c: &mut Cursor) -> Result<()> {
+        if c.u8()? != 1 {
+            return Ok(());
+        }
+        let started = match c.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Ok(()),
+        };
+        let before = self.defuser_started.replace(started);
+        if before.unwrap_or(false) == started || self.end_tick.is_some() {
+            return Ok(());
+        }
+        let (kind, username) = if started {
+            self.planted = true;
+            self.plant_tick = self.clock.tick;
+            // The clock switches to the defuser timer in the same frame,
+            // sometimes just before this record: that jump is not a gap.
+            if self.last_gap_tick.is_some() && self.last_gap_tick == self.clock.tick {
+                self.clock_gaps.pop();
+                self.last_gap_tick = None;
+                self.defuser_clock = true;
+            }
+            (
+                MatchUpdateType::DefuserPlantComplete,
+                self.last_planter.clone(),
+            )
+        } else {
+            (
+                MatchUpdateType::DefuserDisableComplete,
+                self.last_disabler.clone(),
+            )
+        };
+        let mut u = self.update(kind, &username.unwrap_or_default());
+        u.team = self.side_team(kind);
+        self.push(u);
+        Ok(())
+    }
+
+    /// Y11S3+: `1b <controller> 00000000 <field> <interaction> ...` gives a
+    /// player their defuser interaction object, at the start of the recording
+    /// and again when action starts.
+    fn read_interaction_link(&mut self, c: &mut Cursor) -> Result<()> {
+        let head = c.behind(13);
+        if head.len() != 13 || head[0] != 0x1B || head[5..9] != [0; 4] {
+            return Ok(());
+        }
+        let controller = u32::from_le_bytes(head[1..5].try_into().expect("4 bytes"));
+        let object = u32::from_le_bytes(c.array()?);
+        if object != 0
+            && let Some(name) = self.controllers.get(&controller)
+        {
+            self.interaction_owners.insert(object, name.clone());
+        }
+        Ok(())
+    }
+
+    /// Y11S3+: the game writes how the round ended for each team. The
+    /// opening snapshot holds the whole match's history; only the write
+    /// during the round is this round's result.
+    fn read_round_state(&mut self, c: &mut Cursor) -> Result<()> {
+        if c.u8()? != 4 {
+            return Ok(());
+        }
+        let first = u32::from_le_bytes(c.array()?);
+        if c.array::<5>()? != TEAM1_ROUND_STATE || c.u8()? != 4 {
+            return Ok(());
+        }
+        let second = u32::from_le_bytes(c.array()?);
+        let decided = matches!(
+            (first, second),
+            (STATE_LOST, STATE_ELIMINATION..=STATE_TIME)
+                | (STATE_ELIMINATION..=STATE_TIME, STATE_LOST)
+                | (STATE_CANCELLED, STATE_CANCELLED)
+        );
+        if decided && self.recording_time(self.packet_at).is_some() {
+            self.round_states = Some([first, second]);
+        }
+        Ok(())
+    }
+
+    /// The player whose controller the record run at the cursor writes to.
+    /// A leaving player's controller is sent again in full, as a run that
+    /// starts `23 <controller>` or `1b <controller>` and holds child links,
+    /// which `property_object` does not walk.
+    fn controller_before(&self, c: &Cursor) -> Option<&String> {
+        const WINDOW: usize = 512;
+        let behind = c.behind(WINDOW);
+        (0..behind.len().saturating_sub(9)).rev().find_map(|i| {
+            if !matches!(behind[i], 0x23 | 0x1B) || behind[i + 5..i + 9] != [0; 4] {
+                return None;
+            }
+            let id = u32::from_le_bytes(behind[i + 1..i + 5].try_into().expect("4 bytes"));
+            self.controllers.get(&id)
+        })
+    }
+
+    /// Y11S3+: a player's slot stops holding a player: they left or lost
+    /// connection. Nothing in the kill feed says so.
+    fn read_slot_type(&mut self, c: &mut Cursor) -> Result<()> {
+        let Some(name) = self.controller_before(c) else {
+            return Ok(());
+        };
+        if c.u8()? != 4 {
+            return Ok(());
+        }
+        let slot = u32::from_le_bytes(c.array()?);
+        // The opening snapshot lists players who left in earlier rounds; the
+        // header leaves those out already.
+        let live = self.recording_time(self.packet_at).is_some();
+        if slot != 1 && live && !self.left.iter().any(|(n, _)| n == name) {
+            tracing::debug!(%name, slot, "player left");
+            self.left.push((name.clone(), self.clock.tick));
+        }
+        Ok(())
     }
 
     /// Pre-Y8S1 replays store the clock as text: `m:ss` or fractional seconds.
@@ -1658,7 +1961,13 @@ impl<'a> Parser<'a> {
         let target = c.string()?;
         if username.is_empty() {
             // No killer: the target died on their own (fall damage, etc.).
-            if !target.is_empty() {
+            // The entry is sometimes sent more than once.
+            let duplicate = self
+                .round
+                .match_feedback
+                .iter()
+                .any(|v| v.kind == MatchUpdateType::Death && v.username == target);
+            if !target.is_empty() && !duplicate {
                 let u = self.update(MatchUpdateType::Death, &target);
                 self.push(u);
             }
@@ -1740,7 +2049,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Y11S3+: a defuser interaction object starts or stops planting or
-    /// disabling. The replay does not say who holds it, only what it does.
+    /// disabling. The object belongs to one player (see `INTERACTION_LINK`).
     fn read_defuser_action(&mut self, c: &mut Cursor) -> Result<()> {
         let Some(object) = property_object(c) else {
             return Ok(());
@@ -1770,7 +2079,13 @@ impl<'a> Parser<'a> {
             },
         );
         self.finish_interaction(previous);
-        let mut u = self.update(kind, "");
+        let owner = self.interaction_owners.get(&object).cloned();
+        if kind == MatchUpdateType::DefuserPlantStart {
+            self.last_planter.clone_from(&owner);
+        } else {
+            self.last_disabler.clone_from(&owner);
+        }
+        let mut u = self.update(kind, &owner.unwrap_or_default());
         u.team = self.side_team(kind);
         self.push(u);
         Ok(())
@@ -1779,7 +2094,8 @@ impl<'a> Parser<'a> {
     /// Reports a plant or disable that ran down to zero as completed.
     fn finish_interaction(&mut self, i: Interaction) {
         let Some(started) = i.active else { return };
-        if i.remaining > DEFUSER_DONE {
+        // `IsDefuserStarted` reports completions when the round has it.
+        if i.remaining > DEFUSER_DONE || self.defuser_started.is_some() {
             return;
         }
         let kind = if started == MatchUpdateType::DefuserPlantStart {
@@ -2125,12 +2441,22 @@ impl<'a> Parser<'a> {
         // into place; the sort is stable, so stream order holds otherwise.
         match_feedback.sort_by_key(|u| u.tick);
         for u in match_feedback {
-            let at = timeline.at(u.tick);
+            let at = timeline.at_time(u.tick, u.recording_time);
             u.phase = at.phase;
             u.elapsed = at.elapsed;
             if u.tick.is_some() && at.seconds != u.time_in_seconds {
                 u.time_in_seconds = at.seconds;
                 u.time = display_clock(at.seconds);
+            }
+            // A plant read in the frame the clock switched in happened on
+            // the action clock, at its last reading.
+            if u.kind == MatchUpdateType::DefuserPlantComplete
+                && u.tick == timeline.plant_start
+                && let Some(before) = u.tick.and_then(|t| timeline.ticks.get(t.checked_sub(1)?))
+            {
+                u.phase = before.phase;
+                u.time_in_seconds = before.seconds;
+                u.time = display_clock(before.seconds);
             }
         }
     }
@@ -2154,7 +2480,7 @@ impl<'a> Parser<'a> {
         let round = &mut self.round;
         let timeline = &round.timeline;
         for s in &self.samples {
-            let at = timeline.at(s.tick);
+            let at = timeline.at_time(s.tick, recorded(s.offset));
             let time = display_clock(at.seconds);
             match &s.value {
                 SampleValue::Health(value) => {
@@ -2337,6 +2663,38 @@ impl<'a> Parser<'a> {
             for (team, color) in header.teams.iter_mut().zip(agreed) {
                 team.color = color;
             }
+        }
+        // Each team's side (`HeroTeam`), the same way. The operators picked
+        // give the same answer in every round checked; this one is stated.
+        let mut sides: [Vec<u32>; 2] = Default::default();
+        for o in &objects {
+            if let (Some(i), Some(side)) = (find(&header.players, o), o.team_side)
+                && let Some(seen) = sides.get_mut(header.players[i].team_index)
+            {
+                seen.push(side);
+            }
+        }
+        let stated = sides.map(|seen| {
+            let first = *seen.first()?;
+            let role = match first {
+                1 => TeamRole::Attack,
+                2 => TeamRole::Defense,
+                _ => return None,
+            };
+            seen.iter().all(|&s| s == first).then_some(role)
+        });
+        if let [Some(a), Some(b)] = stated
+            && a != b
+        {
+            if header.teams[0].role.is_some_and(|r| r != a) {
+                self.warnings.push(format!(
+                    "team objects say {} is on {a:?}, the operators picked say otherwise",
+                    header.teams[0].name
+                ));
+            }
+            header.teams[0].role = Some(a);
+            header.teams[1].role = Some(b);
+            self.sides_stated = true;
         }
         header.assign_relations();
         // Party roles are those of the recorder's party: only players the
@@ -2622,9 +2980,31 @@ impl<'a> Parser<'a> {
                 }
             }
         };
-        let wiped = |t: usize| {
-            outcome.players_at_start[t] > 0 && outcome.deaths[t] >= outcome.players_at_start[t]
-        };
+        // Players who left before the round was decided are gone like the
+        // dead, without a kill-feed entry.
+        let end_tick = round.timeline.end_start;
+        let mut gone = outcome.deaths;
+        for (name, tick) in &self.left {
+            let before_end = end_tick.is_none_or(|e| tick.is_none_or(|t| t < e));
+            let counted =
+                dead.contains(&name.as_str()) || outcome.down_at_start.iter().any(|d| d == name);
+            if let Some(t) = team_of(name)
+                && before_end
+                && !counted
+            {
+                gone[t] += 1;
+                let at = round.timeline.at(*tick);
+                if at.phase != Phase::Prep {
+                    last_death[t] = last_death[t].max(at.elapsed);
+                }
+                outcome.left.push(name.clone());
+            }
+        }
+        let wiped =
+            |t: usize| outcome.players_at_start[t] > 0 && gone[t] >= outcome.players_at_start[t];
+        // The clock the round ended on counted down to zero.
+        let ran_out = end_tick.is_some_and(|e| round.timeline.ticks[e].seconds <= 1.0);
+        let detonation_needs_zero = header.code_version >= version::Y11S3;
 
         // Who the events say won.
         let from_events = if outcome.disabled {
@@ -2659,12 +3039,25 @@ impl<'a> Parser<'a> {
                 };
                 h
             }
-            None => {
-                if explicit {
-                    outcome
-                        .warnings
-                        .push("header score did not change; winner taken from events".into());
+            None if explicit => {
+                // The recording stopped or the match was ended mid-round.
+                outcome.warnings.push(
+                    if self.round_states == Some([STATE_CANCELLED; 2]) {
+                        "the game cancelled the round: no winner"
+                    } else {
+                        "header score did not change: the round was not played out"
+                    }
+                    .into(),
+                );
+                outcome.reason_source = ReasonSource::Unfinished;
+                for team in &mut header.teams {
+                    team.won = false;
+                    team.win_condition = None;
                 }
+                round.outcome = outcome;
+                return;
+            }
+            None => {
                 outcome.reason_source = ReasonSource::Events;
                 from_events
             }
@@ -2683,8 +3076,8 @@ impl<'a> Parser<'a> {
                 Some(WinCondition::KilledOpponents)
             } else {
                 // Time ran out: the clock should have counted down to 0:00.
-                let end = round.timeline.end_start.map(|e| round.timeline.ticks[e]);
-                if end.is_some_and(|t| t.seconds > 1.0) {
+                let end = end_tick.map(|e| round.timeline.ticks[e]);
+                if !ran_out && end.is_some() {
                     outcome.warnings.push(format!(
                         "defenders won with attackers alive and {} left on the clock",
                         crate::feedback::display_clock(end.map_or(0.0, |t| t.seconds))
@@ -2694,8 +3087,15 @@ impl<'a> Parser<'a> {
             }
         } else if wiped(defense) {
             Some(WinCondition::KilledOpponents)
-        } else if outcome.planted {
+        } else if outcome.planted && (ran_out || !detonation_needs_zero) {
             Some(WinCondition::DefusedBomb)
+        } else if outcome.planted {
+            let end = end_tick.map_or(0.0, |e| round.timeline.ticks[e].seconds);
+            outcome.warnings.push(format!(
+                "attackers won after a plant with defenders alive and {} left on the defuser timer",
+                crate::feedback::display_clock(end)
+            ));
+            None
         } else {
             outcome.warnings.push(
                 "attackers won without a plant or eliminating the defenders (a player left?)"
@@ -2708,6 +3108,46 @@ impl<'a> Parser<'a> {
                 .warnings
                 .push("a completed disable was seen, but attackers won".into());
         }
+        // Y11S3+: the game's own verdict. It names the winner and one of
+        // three kinds of win; a win with the defuser planted is a disable for
+        // defenders and, for attackers, an elimination or a detonation, which
+        // the events tell apart.
+        let stated = self.round_states.and_then(|s| {
+            let w = s.iter().position(|&v| v != STATE_LOST)?;
+            Some((w, s[w]))
+        });
+        let reason = match stated {
+            Some((w, _)) if w != winner => {
+                outcome.warnings.push(format!(
+                    "the round history says team {w} won, the header score team {winner}"
+                ));
+                reason
+            }
+            Some((_, state)) => {
+                let fits = match state {
+                    STATE_ELIMINATION => {
+                        reason == Some(WinCondition::KilledOpponents) && !outcome.planted
+                    }
+                    STATE_TIME => reason == Some(WinCondition::Time),
+                    STATE_PLANTED => outcome.planted && reason != Some(WinCondition::Time),
+                    _ => false,
+                };
+                outcome.reason_stated = fits;
+                if fits {
+                    reason
+                } else {
+                    outcome.warnings.push(format!(
+                        "the round history gives round state {state}, the events {reason:?}; the history wins"
+                    ));
+                    match state {
+                        STATE_ELIMINATION => Some(WinCondition::KilledOpponents),
+                        STATE_TIME => Some(WinCondition::Time),
+                        _ => reason,
+                    }
+                }
+            }
+            None => reason,
+        };
 
         for (t, team) in header.teams.iter_mut().enumerate() {
             team.won = t == winner;

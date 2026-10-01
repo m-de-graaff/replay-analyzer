@@ -25,6 +25,9 @@ pub enum ReasonSource {
     /// The header's winner disagrees with the events; the header wins and
     /// the reason is the one that fits it. See `warnings`.
     Header,
+    /// The header's score did not change (Y9S4+): the round was not played
+    /// out, so it has no winner and no end reason.
+    Unfinished,
 }
 
 /// Who won the round, how, and who was there at the start. Filled on full
@@ -45,6 +48,12 @@ pub struct RoundOutcome {
     pub down_at_start: Vec<String>,
     /// Deaths per team among players alive at the start.
     pub deaths: [usize; 2],
+    /// Players alive at the start who left before the round was decided
+    /// (Y11S3+). They count as gone when deciding how the round ended.
+    pub left: Vec<String>,
+    /// The game's round history states this kind of win (Y11S3+), and the
+    /// events agree.
+    pub reason_stated: bool,
     pub warnings: Vec<String>,
 }
 
@@ -95,7 +104,8 @@ pub struct Swap {
     pub late: bool,
 }
 
-/// Swaps in the last this-many seconds of prep are late.
+/// Swaps in the last this-many seconds of prep are late. The clock shows
+/// whole seconds rounded down, so `0:09` is the first late reading.
 pub const LATE_SWAP_SECONDS: f64 = 10.0;
 
 /// The `round` block of a round's JSON.
@@ -142,6 +152,9 @@ pub struct RoundInfo {
     pub started_down: [bool; 2],
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub down_at_start: Vec<String>,
+    /// Players who left or lost connection during the round (Y11S3+).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub left: Vec<String>,
     pub lineup: Vec<LineupEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub swaps: Vec<Swap>,
@@ -185,8 +198,9 @@ impl Round {
         let number = h.round_number + 1;
         let overtime = rules.is_overtime(before);
         let overtime_number = overtime.then(|| {
+            // The header counts overtime rounds from 0.
             if h.overtime_round_number > 0 {
-                h.overtime_round_number
+                h.overtime_round_number + 1
             } else {
                 number.saturating_sub(h.rounds_per_match)
             }
@@ -217,6 +231,8 @@ impl Round {
             }
         });
         let full_team = h.max_players_per_team.unwrap_or(5) as usize;
+        // Before action starts attackers are on drones, with no body to count.
+        let full = full && self.timeline.action_start.is_some();
         let players_at_start = full.then_some(self.outcome.players_at_start);
         let started_down =
             players_at_start.map_or([false; 2], |p| [p[0] < full_team, p[1] < full_team]);
@@ -236,7 +252,7 @@ impl Round {
                 time_in_seconds: u.time_in_seconds,
                 phase: u.phase,
                 elapsed: u.elapsed,
-                late: u.phase == Phase::Prep && u.time_in_seconds <= LATE_SWAP_SECONDS,
+                late: u.phase == Phase::Prep && u.time_in_seconds < LATE_SWAP_SECONDS,
             })
             .collect();
         let lineup = h
@@ -276,7 +292,12 @@ impl Round {
             ended,
             players_at_start,
             started_down,
-            down_at_start: self.outcome.down_at_start.clone(),
+            down_at_start: if full {
+                self.outcome.down_at_start.clone()
+            } else {
+                Vec::new()
+            },
+            left: self.outcome.left.clone(),
             lineup,
             swaps,
             phases: self.timeline.spans(),

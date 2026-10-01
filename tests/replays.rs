@@ -674,16 +674,15 @@ fn y11s3_events_are_placed_on_the_recording_clock() {
             (40.0..50.0).contains(&action_start),
             "{name}: {action_start}"
         );
-        // A plant completes when its countdown reaches zero; the clock
-        // switches to the defuser timer an update or two later (34-69 ms in
-        // the test rounds), not in the same frame.
+        // A plant completes in the frame the clock switches to the defuser
+        // timer in.
         let plant = feed
             .iter()
             .find(|u| u.kind == MatchUpdateType::DefuserPlantComplete);
         let planted = spans.iter().find(|s| s.phase == Phase::Planted);
         if let (Some(plant), Some(planted)) = (plant, planted) {
             let lag = planted.recording_start.unwrap() - plant.recording_time.unwrap();
-            assert!(lag > 0.0 && lag < 0.5, "{name}: {lag}");
+            assert!(lag.abs() < 0.05, "{name}: {lag}");
         }
     }
 }
@@ -1349,7 +1348,7 @@ fn y11s3_rounds_end_and_phase_consistently() {
 }
 
 /// Y11S3 defuser objects: plants and disables with their clock, and the
-/// player named when only one of that side was alive.
+/// player whose interaction object did it.
 #[test]
 fn y11s3_defuser_plants_and_disables() {
     use replay_analyzer::MatchUpdateType::*;
@@ -1372,15 +1371,16 @@ fn y11s3_defuser_plants_and_disables() {
         r2,
         [
             (DefuserPlantComplete, "soulz1.FaZe".into(), "0:29".into()),
-            (DefuserDisableComplete, String::new(), "0:33".into()),
+            (DefuserDisableComplete, "WIZARD.L5".into(), "0:33".into()),
         ]
     );
-    // Planted as the action clock hit 0:00; disabled by the last defender.
+    // Planted 6 s after the action clock hit 0:00; disabled by the last
+    // defender.
     let r7 = events("custom_7.rec").unwrap();
     assert_eq!(
         r7,
         [
-            (DefuserPlantComplete, String::new(), "0:00".into()),
+            (DefuserPlantComplete, "WIZARD.L5".into(), "0:00".into()),
             (DefuserDisableComplete, "Handyy.FaZe".into(), "0:04".into()),
         ]
     );
@@ -1607,4 +1607,78 @@ fn relations_and_parties_are_consistent() {
             }
         }
     }
+}
+
+/// Attackers change spawn during prep: the lineup holds the last name
+/// written to their vote object, not the one in the pick packet. Each of
+/// these bodies appeared at the spawn named here.
+#[test]
+fn y11s3_spawns_follow_changes_in_prep() {
+    let Some(dir) = data_dir() else { return };
+    let spawn = |file: &str, name: &str| -> Option<String> {
+        let round = y11s3(&dir, file)?;
+        let i = round.player_index_by_username(name).unwrap();
+        Some(round.header.players[i].spawn.clone())
+    };
+    let Some(first) = spawn("custom_1.rec", "soulz1.FaZe") else {
+        return;
+    };
+    assert_eq!(first, "Alley Access");
+    assert_eq!(spawn("custom_9.rec", "PSYCHO.L5").unwrap(), "Jewelry Front");
+    // Defenders keep the site, whatever their vote object still holds from
+    // their last attack round.
+    let round = y11s3(&dir, "custom_7.rec").unwrap();
+    for p in round.header.players.iter().filter(|p| p.team_index == 1) {
+        assert_eq!(p.spawn, round.header.site, "{}", p.username);
+    }
+}
+
+/// Y11S3 states what older seasons leave to inference: each team's side, the
+/// frame the round was decided in, and the frame the defuser went live in.
+#[test]
+fn y11s3_sides_end_and_plant_are_decoded() {
+    use replay_analyzer::{MatchUpdateType, Phase, TeamRole};
+    let Some(dir) = data_dir() else { return };
+    for n in 1..=10 {
+        let Some(round) = y11s3(&dir, &format!("custom_{n}.rec")) else {
+            return;
+        };
+        assert!(round.decode.trusted, "custom_{n}: {:?}", round.decode);
+        let roles = round.decode.get("teamRoles").unwrap();
+        assert_eq!(roles.status, replay_analyzer::Status::Decoded, "custom_{n}");
+        // The game's round history states the same kind of win as the events.
+        let reason = round.decode.get("winCondition").unwrap();
+        assert_eq!(
+            reason.status,
+            replay_analyzer::Status::Decoded,
+            "custom_{n}"
+        );
+        let attack = if n <= 6 { 1 } else { 0 };
+        assert_eq!(round.header.teams[attack].role, Some(TeamRole::Attack));
+        // Every plant and disable names its player.
+        assert!(
+            round
+                .match_feedback
+                .iter()
+                .filter(|u| matches!(
+                    u.kind,
+                    MatchUpdateType::DefuserPlantStart
+                        | MatchUpdateType::DefuserPlantComplete
+                        | MatchUpdateType::DefuserDisableStart
+                        | MatchUpdateType::DefuserDisableComplete
+                ))
+                .all(|u| !u.username.is_empty()),
+            "custom_{n}"
+        );
+        assert!(round.info().left.is_empty(), "custom_{n}");
+    }
+    // Round 7: the action clock ran out during a plant, which completed 6 s
+    // later. Those seconds are on the timeline, so the round's end agrees
+    // with the recording.
+    let round = y11s3(&dir, "custom_7.rec").unwrap();
+    let info = round.info();
+    let plant = info.plant.unwrap();
+    assert_eq!((plant.time.as_str(), plant.elapsed), ("0:00", 231.0));
+    let end = info.phases.iter().find(|p| p.phase == Phase::End).unwrap();
+    assert!((end.recording_start.unwrap() - end.start).abs() < 1.0);
 }

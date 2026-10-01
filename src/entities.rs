@@ -318,6 +318,8 @@ pub struct PlayerObjects {
     pub team_object: Option<u32>,
     /// The team object's `TeamColor`: 1 or 2.
     pub team_color: Option<u32>,
+    /// The team object's `HeroTeam`: 1 attack, 2 defense.
+    pub team_side: Option<u32>,
     pub scoreboard: Option<u32>,
     pub health: Option<u32>,
     /// Raw relation to the recorder: 1 opponent, 2 teammate, 3 in the
@@ -450,6 +452,7 @@ fn player_objects(t: &Tree) -> Vec<PlayerObjects> {
                     controller: obj,
                     team_object,
                     team_color: team_object.and_then(|team| t.u32(team, TEAM_COLOR)),
+                    team_side: team_object.and_then(|team| t.u32(team, HERO_TEAM)),
                     scoreboard: t.child(obj, SCOREBOARD_FIELD),
                     health: t.child(obj, HEALTH_FIELD),
                     relation: profile.and_then(|p| t.u32(p, RELATION)),

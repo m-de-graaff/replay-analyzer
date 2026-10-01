@@ -15,6 +15,14 @@
 //!   slots with their team, order and votes for none, team colors, match
 //!   type 7 as Unranked, `isSpectator` false when absent, levels decoded
 //!   and teams sized by `maxnbplayersperteam`.
+//! - every profile: a skipped field no longer lowers `trusted`, overtime
+//!   rounds are numbered from 1, a swap at 0:10 is not late, repeated
+//!   `Death` entries are dropped. From Y9S4 a round whose score did not
+//!   change has no winner. From Y11S3 (profile Y9S4): spawns follow changes
+//!   in prep, sides come from the team objects, plants and disables from
+//!   `IsDefuserStarted` with their player, the round's end from
+//!   `TimerState`, players who left count as gone, and the end reason is
+//!   checked against the game's round history.
 
 use serde::Serialize;
 
@@ -52,55 +60,55 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "pre-Y7S2",
         min_build: 0,
-        revision: 3,
+        revision: 4,
         changes: "text clock, legacy feedback and player layout",
     },
     Profile {
         name: "Y7S2",
         min_build: version::Y7S2,
-        revision: 3,
+        revision: 4,
         changes: "player id marker changed",
     },
     Profile {
         name: "Y7S4",
         min_build: version::Y7S4,
-        revision: 3,
+        revision: 4,
         changes: "player packet carries an operator block",
     },
     Profile {
         name: "Y8S1",
         min_build: version::Y8S1,
-        revision: 5,
+        revision: 6,
         changes: "numeric clock; bans, loadouts, health, observation decodable",
     },
     Profile {
         name: "Y8S2",
         min_build: version::Y8S2,
-        revision: 5,
+        revision: 6,
         changes: "players matched by packet id",
     },
     Profile {
         name: "Y9S1",
         min_build: version::Y9S1,
-        revision: 5,
+        revision: 6,
         changes: "new feedback layout, text messages not decoded",
     },
     Profile {
         name: "Y9S1.3",
         min_build: version::Y9S1_UPDATE3,
-        revision: 5,
+        revision: 6,
         changes: "feedback header grew",
     },
     Profile {
         name: "Y9S3",
         min_build: version::Y9S3,
-        revision: 5,
+        revision: 6,
         changes: "caster UI ids link attacker swaps",
     },
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 6,
+        revision: 7,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

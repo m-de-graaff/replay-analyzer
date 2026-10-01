@@ -44,7 +44,8 @@ pub struct FieldReport {
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodeReport {
-    /// True when every field is decoded, inferred, or not in this version.
+    /// True when every field is decoded, inferred, not in this version, or
+    /// skipped: false marks a fault, not something left unread.
     pub trusted: bool,
     pub fields: Vec<FieldReport>,
     /// Problems not tied to one field.
@@ -72,10 +73,9 @@ impl DecodeReport {
     }
 
     pub fn finish(&mut self) {
-        self.trusted = self
-            .fields
-            .iter()
-            .all(|f| f.status.trusted() || f.status == Status::NotInVersion);
+        self.trusted = self.fields.iter().all(|f| {
+            f.status.trusted() || matches!(f.status, Status::NotInVersion | Status::Skipped)
+        });
     }
 }
 
@@ -89,5 +89,25 @@ impl FieldReport {
     pub fn at_most(&mut self, status: Status) -> &mut Self {
         self.status = self.status.max(status);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `trusted` marks faults: a field left unread (a partial read, a custom
+    /// game's party) is not one.
+    #[test]
+    fn a_skipped_field_does_not_lower_trust() {
+        let mut r = DecodeReport::default();
+        r.field("players", Status::Decoded, 10);
+        r.field("party", Status::Skipped, 0);
+        r.field("feedbackMessages", Status::NotInVersion, 0);
+        r.finish();
+        assert!(r.trusted);
+        r.field("kills", Status::Partial, 3);
+        r.finish();
+        assert!(!r.trusted);
     }
 }

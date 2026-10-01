@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::census::{self, Census, PacketCount};
+use crate::container::{self, Container, DirectoryState};
 use crate::cursor::Cursor;
 use crate::decoder::ParserInfo;
 use crate::decompress::{self, Decompressed};
@@ -18,9 +19,10 @@ use crate::details::{
 use crate::error::{Error, Result};
 use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
-use crate::format::{ClockGap, FormatInfo, GameVersion, Timing};
+use crate::format::{self, ClockGap, FormatInfo, GameVersion, Hole, Layout, Timing};
 use crate::header::{Header, Player};
 use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
+use crate::records::RecordMap;
 use crate::report::{DecodeReport, Status};
 use crate::stats::PlayerRoundStats;
 use crate::timeline::Timeline;
@@ -53,6 +55,8 @@ pub struct Round {
     pub parser: ParserInfo,
     /// Number of zstd frames in the file.
     pub zstd_frames: usize,
+    /// Streams and compressed blocks (Y8S4+), and whether the file is whole.
+    pub container: Option<Container>,
     /// Recording rate and holes, from the frame index and the clock.
     pub timing: Option<Timing>,
     /// Trust level of each output field.
@@ -159,16 +163,21 @@ impl Round {
             format,
             zstd_frames,
             frame_index,
+            container,
         } = read(raw)?;
         let mut parser = Parser::new(&data, header);
         parser.round.format = format;
         parser.round.zstd_frames = zstd_frames;
+        parser.round.container = container;
         parser.round.timing = frame_index.as_ref().map(Timing::from_index);
-        if let Some(index) = frame_index.filter(|i| i.out_of_order > 0) {
-            parser.round.decode.warnings.push(format!(
-                "{} frame index entries out of order",
-                index.out_of_order
-            ));
+        if let Some(index) = frame_index {
+            if index.out_of_order > 0 {
+                parser.round.decode.warnings.push(format!(
+                    "{} frame index entries out of order",
+                    index.out_of_order
+                ));
+            }
+            parser.frame_times = index.times;
         }
         Ok(parser.run(body_start, options))
     }
@@ -266,6 +275,8 @@ pub struct ReplayInfo<'a> {
     pub version: &'a GameVersion,
     pub parser: &'a ParserInfo,
     pub zstd_frames: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<&'a Container>,
 }
 
 impl Round {
@@ -276,6 +287,7 @@ impl Round {
             version: &self.version,
             parser: &self.parser,
             zstd_frames: self.zstd_frames,
+            container: self.container.as_ref(),
         }
     }
 }
@@ -448,11 +460,12 @@ const BAN_ROLE: &[u8] = &[0x18, 0xFF, 0xCA, 0x5E];
 /// How far after an icon to look for a ban slot's side. Older replays put one
 /// more object in between; player icons are thousands of bytes from a ban.
 const BAN_WINDOW: usize = 160;
-/// Y11S3+: the team that owns a ban slot, 1-based, written right after its
-/// side.
+/// Y11S3+: the `TeamColor` of the team that owns a ban slot, written right
+/// after its side. In a player's recording the player's own team is 1.
 const BAN_TEAM: [u8; 5] = [0x22, 0x2E, 0x61, 0xA2, 0xA9];
-/// Y11S3+: a player's level as decimal text, on the object carrying their
-/// name. Written once in the round's opening snapshot.
+/// Y11S3+: a player's clearance level as decimal text (`ClearanceLevelText`),
+/// on their profile object, which also carries their name. Written once in
+/// the round's opening snapshot.
 const PLAYER_LEVEL: [u8; 5] = [0x22, 0x3F, 0x0F, 0xDC, 0x1F];
 /// Name property on the same object, just before the level.
 const PLAYER_NAME: [u8; 8] = [0x75, 0x6D, 0x39, 0xD4, 0x00, 0x00, 0x00, 0x00];
@@ -515,6 +528,10 @@ struct Parser<'a> {
     weapon_samples: Vec<(String, bool, Option<usize>)>,
     /// Players' objects from the opening snapshot of the object tree.
     entity_players: Vec<crate::entities::PlayerObjects>,
+    /// Y11S3 ban slots from the same snapshot.
+    ban_slots: Vec<crate::entities::BanSlot>,
+    /// Problems found while reading bans, for `decodeStatus.bans`.
+    ban_warnings: Vec<String>,
     /// Y11S3 scoreboard values by username, and the first assists value
     /// seen (the total going into the round). Players are only known once
     /// their pick packet is read, often after their scoreboard's first
@@ -523,6 +540,15 @@ struct Parser<'a> {
     /// Scoreboard kills just credited, with where: the kill-feed entries
     /// written right after them are the kills they count.
     pending_credits: Vec<(String, usize)>,
+    /// Offset in `data` of the packet being read. Events keep it, so they can
+    /// be placed on the recording's clock once the round is read.
+    packet_at: usize,
+    /// Offset of the packet that first showed each clock reading.
+    reading_offsets: Vec<usize>,
+    /// Snapshots and frame records (Y8S4+).
+    records: Option<RecordMap>,
+    /// Seconds since the recording started, per frame.
+    frame_times: Vec<f64>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -544,6 +570,8 @@ struct Interaction {
     /// has moved on (for a plant, after the clock switched to the defuser
     /// timer).
     last_tick: Option<usize>,
+    /// Offset of that countdown value's packet.
+    last_offset: Option<usize>,
 }
 
 /// A per-player object property, resolved to a player after the stream is read.
@@ -551,6 +579,7 @@ struct Sample {
     object: u32,
     value: SampleValue,
     tick: Option<usize>,
+    offset: usize,
 }
 
 enum SampleValue {
@@ -591,8 +620,14 @@ impl<'a> Parser<'a> {
             scoreboards: HashMap::new(),
             weapon_samples: Vec::new(),
             entity_players: Vec::new(),
+            ban_slots: Vec::new(),
+            ban_warnings: Vec::new(),
             scoreboard_by_name: HashMap::new(),
             pending_credits: Vec::new(),
+            packet_at: 0,
+            reading_offsets: Vec::new(),
+            records: None,
+            frame_times: Vec::new(),
         }
     }
 
@@ -620,12 +655,18 @@ impl<'a> Parser<'a> {
             ReadMode::Partial => (self.data.len() / 3).max(start),
             ReadMode::Header => start,
         };
+        self.records = self
+            .round
+            .container
+            .as_ref()
+            .and_then(|c| RecordMap::parse(self.data, c.streams.len()));
         self.read_entities(start, end);
         let (packets, scanner) = &SCANNERS[usize::from(self.code() < version::Y8S1)];
         // Handlers run in stream order but never depend on each other's cursor.
         for (offset, pattern) in scan(scanner, &self.data[start..end]) {
             let packet = packets[pattern];
             let mut c = Cursor::new(self.data, start + offset);
+            self.packet_at = start + offset;
             self.packet_counts[packet as usize].0 += 1;
             if let Err(e) = self.dispatch(packet, &mut c) {
                 tracing::debug!(?packet, offset = start + offset, error = %e, "skipping packet");
@@ -634,14 +675,20 @@ impl<'a> Parser<'a> {
                     .get_or_insert_with(|| format!("at {}: {e}", start + offset));
             }
         }
-        if self.players_read < 10 {
+        if self.players_read < 2 * self.team_size() {
             self.derive_team_roles();
         }
         self.read_levels(start, end);
         self.apply_entities(start, end);
+        self.finish_bans();
         self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
+        self.round.timeline.recording = self
+            .reading_offsets
+            .iter()
+            .map(|&o| self.recording_time(o))
+            .collect();
         self.place_feedback();
         self.resolve_samples();
         self.resolve_weapon_ready();
@@ -650,12 +697,16 @@ impl<'a> Parser<'a> {
         if mode == ReadMode::Full {
             self.round_end();
         }
+        self.measure_records();
         if options.census {
             self.round.census = Some(census::build(
                 &self.data[start..],
+                start,
                 &self.round.header,
                 self.packet_census(),
                 &known_fields(self.code() < version::Y8S1),
+                self.records.as_ref(),
+                self.round.container.as_ref(),
             ));
         }
         self.finish_report(mode);
@@ -738,6 +789,65 @@ impl<'a> Parser<'a> {
                 crate::decoder::NEWEST_TESTED_BUILD
             ));
         }
+        let fmt = &round.format;
+        if fmt.prelude_decoded {
+            if !format::KNOWN_FORMAT_VERSIONS.contains(&fmt.format_version) {
+                f.at_most(Status::Partial).warn(format!(
+                    "format version {} is not one seen so far ({:?})",
+                    fmt.format_version,
+                    format::KNOWN_FORMAT_VERSIONS
+                ));
+            }
+            if fmt.label != format::KNOWN_LABEL {
+                f.warn(format!(
+                    "prelude label {:?} instead of {:?}",
+                    fmt.label,
+                    format::KNOWN_LABEL
+                ));
+            }
+            let expected = if fmt.format_version >= 8 {
+                Layout::Chunked
+            } else {
+                Layout::Stream
+            };
+            if fmt.layout != expected {
+                f.warn(format!(
+                    "format version {} in the {:?} layout",
+                    fmt.format_version, fmt.layout
+                ));
+            }
+        }
+
+        match &round.container {
+            Some(c) => {
+                let clean =
+                    c.complete && c.directory == DirectoryState::Valid && c.warnings.is_empty();
+                let f = r.field(
+                    "container",
+                    if clean {
+                        Status::Decoded
+                    } else {
+                        Status::Partial
+                    },
+                    c.streams.len(),
+                );
+                f.warnings.extend(c.warnings.iter().cloned());
+                if c.complete && !header_only && self.records.is_none() {
+                    f.at_most(Status::Partial).warn(
+                        "the decompressed data does not split into snapshots and frame records: \
+                         events have no recordingTime",
+                    );
+                }
+            }
+            None if fmt.layout == Layout::Stream => {
+                r.field("container", Status::NotInVersion, 0)
+                    .warn("one zstd stream (before Y8S4): streams are not mapped");
+            }
+            None => {
+                r.field("container", Status::Missing, 0)
+                    .warn("no frame index, so the stream list could not be found");
+            }
+        }
 
         let with_op = h.players.iter().filter(|p| !p.operator.is_empty()).count();
         let f = r.field("players", Status::Decoded, h.players.len());
@@ -746,11 +856,18 @@ impl<'a> Parser<'a> {
                 .warn("header only: names from the header, no operators");
         } else if h.players.is_empty() {
             f.at_most(Status::Missing);
-        } else if with_op < h.players.len() || h.players.len() != 10 {
-            f.at_most(Status::Partial).warn(format!(
-                "{} players, {with_op} with an operator",
-                h.players.len()
-            ));
+        } else {
+            let seats = h.max_players_per_team.map_or(10, |n| 2 * n as usize);
+            let n = h.players.len();
+            if with_op < n || n > seats {
+                f.at_most(Status::Partial)
+                    .warn(format!("{n} players, {with_op} with an operator"));
+            } else if n < seats {
+                // Every player listed was read; the round just had fewer.
+                f.warn(format!(
+                    "{n} players in a round for {seats}: a player left or never joined"
+                ));
+            }
         }
         for w in self.failures(&[Packet::Player, Packet::AttackerSwap]) {
             f.at_most(Status::Partial).warn(w);
@@ -867,6 +984,13 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        // A slot that could not be read, or slots and icons that disagree,
+        // may mean a ban is missing or misplaced.
+        if let Some(f) = r.get_mut("bans") {
+            for w in &self.ban_warnings {
+                f.at_most(Status::Partial).warn(w.clone());
+            }
+        }
         // Who the players are and which objects carry them.
         let players = &round.header.players;
         let with_profile = players.iter().filter(|p| !p.profile_id.is_empty()).count();
@@ -922,11 +1046,18 @@ impl<'a> Parser<'a> {
                 .iter()
                 .filter(|p| p.entities.as_ref().is_some_and(|e| e.movement.is_some()))
                 .count();
+            // A player's own recording leaves their body out of the player
+            // table; spectator recordings link every body.
+            let own_body_missing = players.iter().any(|p| {
+                p.relation == Some(crate::entities::Relation::You)
+                    && p.entities.as_ref().is_some_and(|e| e.movement.is_none())
+            });
+            let expected = with - usize::from(own_body_missing);
             let f = r.field(
                 "movement",
                 if moving == 0 {
                     Status::NotInVersion
-                } else if moving < with {
+                } else if moving < expected {
                     Status::Partial
                 } else {
                     Status::Decoded
@@ -935,10 +1066,14 @@ impl<'a> Parser<'a> {
             );
             if moving == 0 {
                 f.warn("no player table linking bodies to players (seen from Y11S3)");
+            } else if own_body_missing {
+                f.warn(
+                    "the recording player's own body is not linked: their own recordings leave it out of the player table",
+                );
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
-            if matches!(h.match_type.0, 3 | 4) {
+            if h.match_type.is_custom() {
                 f.at_most(Status::Skipped).warn(
                     "custom game: the whole lobby counts as one party, so no roles are given",
                 );
@@ -975,9 +1110,7 @@ impl<'a> Parser<'a> {
             .filter(|p| p.level.is_some())
             .count();
         if levels > 0 {
-            r.field("levels", Status::Inferred, levels).warn(
-                "probably the clearance level: stable across rounds and distinct per player, but not checked against Ubisoft's stats",
-            );
+            r.field("levels", Status::Decoded, levels);
         }
         if code >= version::Y9S1 && !skipped {
             r.field("feedbackMessages", Status::NotInVersion, 0)
@@ -1060,7 +1193,7 @@ impl<'a> Parser<'a> {
             })
             .count();
         if unnamed > 0 {
-            r.field("defuserPlayers", Status::Partial, unnamed).warn(
+            r.field("defuserPlayers", Status::NotInVersion, unnamed).warn(
                 "Y11S3+ defuser events record the side, not the player; named only when one player of that side was alive",
             );
         }
@@ -1093,6 +1226,21 @@ impl<'a> Parser<'a> {
                 f.at_most(Status::Partial)
                     .warn(format!("{} jumps in the in-game clock", t.clock_gaps.len()));
             }
+            if !t.holes.is_empty() {
+                let longest = t.holes.iter().map(|h| h.seconds).fold(0.0, f64::max);
+                f.at_most(Status::Partial).warn(format!(
+                    "{} holes in the movement stream, the longest {longest:.1} s",
+                    t.holes.len()
+                ));
+            }
+            let movement = self.records.as_ref().is_some_and(|m| {
+                m.streams
+                    .iter()
+                    .any(|s| container::stream_name(s.name_hash) == Some("movement"))
+            });
+            if self.records.is_some() && !movement {
+                f.warn("no movement stream, so holes were not looked for");
+            }
         }
         let clock = if modern {
             Packet::Time
@@ -1101,6 +1249,27 @@ impl<'a> Parser<'a> {
         };
         if !skipped && self.packet_counts[clock as usize].0 == 0 {
             f.at_most(Status::Partial).warn("no clock packets found");
+        }
+        if let Some(c) = round.container.as_ref().filter(|c| !c.complete) {
+            let at = c.truncated_at.unwrap_or_default();
+            let why = if c.main.is_none() {
+                format!(
+                    "the file stops at byte {at}, before the main stream that holds every \
+                     frame record: only the opening snapshots were written"
+                )
+            } else {
+                format!(
+                    "the file stops at byte {at}, inside the main stream: later frames are missing"
+                )
+            };
+            for f in &mut r.fields {
+                if matches!(f.status, Status::Missing | Status::Partial)
+                    && !matches!(f.field, "header" | "container" | "timing")
+                {
+                    f.warn("the file is incomplete (see warnings)");
+                }
+            }
+            r.warnings.push(why);
         }
         r.finish();
         self.round.decode = r;
@@ -1111,7 +1280,7 @@ impl<'a> Parser<'a> {
             Packet::Player => {
                 self.players_read += 1;
                 let result = self.read_player(c);
-                if self.players_read == 10 {
+                if self.players_read == 2 * self.team_size() {
                     self.derive_team_roles();
                 }
                 result
@@ -1146,7 +1315,18 @@ impl<'a> Parser<'a> {
     fn update(&self, kind: MatchUpdateType, username: &str) -> MatchUpdate {
         let mut u = MatchUpdate::new(kind, &self.clock);
         u.username = username.to_owned();
+        u.offset = Some(self.packet_at);
         u
+    }
+
+    /// Players per team: 5 unless the header says otherwise (Y11S3+
+    /// `maxnbplayersperteam`; Dual Front is 6v6).
+    fn team_size(&self) -> u32 {
+        self.round
+            .header
+            .max_players_per_team
+            .filter(|&n| n > 0)
+            .unwrap_or(5)
     }
 
     fn read_player(&mut self, c: &mut Cursor) -> Result<()> {
@@ -1187,7 +1367,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.take_loadout(c.pos(), &username, operator);
-        let team_index = usize::from(self.players_read > 5);
+        let team_index = pick_team(self.players_read, self.team_size());
         self.pick_slots.insert(self.players_read, username.clone());
 
         // Caster UI id; links attacker swaps to players from Y9S3.
@@ -1259,7 +1439,7 @@ impl<'a> Parser<'a> {
             !p.operator.is_empty()
         });
         // 5v5 unless the header says otherwise (Y11S3+ `maxnbplayersperteam`).
-        let max = 2 * header.max_players_per_team.unwrap_or(5) as usize;
+        let max = 2 * header.max_players_per_team.filter(|&n| n > 0).unwrap_or(5) as usize;
         if header.players.len() > max {
             tracing::warn!(players = header.players.len(), max, "too many players");
             warnings.push(format!("{} players, more than {max}", header.players.len()));
@@ -1373,6 +1553,7 @@ impl<'a> Parser<'a> {
         }
         if self.readings.last() != Some(&clock.seconds) {
             self.readings.push(clock.seconds);
+            self.reading_offsets.push(self.packet_at);
         }
         clock.tick = Some(self.readings.len() - 1);
         // The countdown drops one second at a time. Expected jumps: up at a
@@ -1458,6 +1639,7 @@ impl<'a> Parser<'a> {
             MatchUpdateType::Other
         };
         let mut u = MatchUpdate::new(kind, &self.clock);
+        u.offset = Some(self.packet_at);
         if kind == MatchUpdateType::Other {
             u.message = msg;
         } else {
@@ -1519,6 +1701,7 @@ impl<'a> Parser<'a> {
             {
                 i.remaining = remaining;
                 i.last_tick = self.clock.tick;
+                i.last_offset = Some(self.packet_at);
             }
             return Ok(());
         }
@@ -1583,6 +1766,7 @@ impl<'a> Parser<'a> {
                 active: Some(kind),
                 remaining: f64::INFINITY,
                 last_tick: None,
+                last_offset: None,
             },
         );
         self.finish_interaction(previous);
@@ -1611,6 +1795,7 @@ impl<'a> Parser<'a> {
         let mut u = self.update(kind, "");
         u.team = self.side_team(kind);
         u.tick = i.last_tick.or(u.tick);
+        u.offset = i.last_offset.or(u.offset);
         self.push(u);
     }
 
@@ -1655,26 +1840,94 @@ impl<'a> Parser<'a> {
             2 => TeamRole::Defense,
             _ => return Ok(()),
         };
-        let team = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
+        // The team is set once the team objects are read (`finish_bans`).
+        let color = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
             c.skip(BAN_TEAM.len())?;
-            match c.u32()? {
-                t @ 1..=2 => Some(t as usize - 1),
-                _ => None,
-            }
+            Some(c.u32()?)
         } else {
             None
         };
-        if !self.round.bans.iter().any(|b| b.icon == icon) {
+        if !self.round.bans.iter().any(|b| b.icon == Some(icon)) {
             let operator = Operator::from_role_image(icon);
-            tracing::debug!(icon, ?operator, ?role, ?team, "ban");
+            tracing::debug!(icon, ?operator, ?role, ?color, "ban");
             self.round.bans.push(Ban {
                 operator,
                 role,
-                team,
-                icon,
+                team: None,
+                icon: Some(icon),
+                slot: None,
+                no_ban: false,
+                color,
             });
         }
         Ok(())
+    }
+
+    /// Y11S3: bans come from the snapshot's ban slots, which also give each
+    /// ban's order and the votes that ended without a ban; the icons found
+    /// above are only a cross-check. Slots name the banning team by its
+    /// `TeamColor`, not by its index in the header.
+    fn finish_bans(&mut self) {
+        let slots = std::mem::take(&mut self.ban_slots);
+        let Round { header, bans, .. } = &mut self.round;
+        if slots.is_empty() {
+            for b in bans.iter_mut() {
+                b.team = b.color.and_then(|c| header.team_of_color(c));
+            }
+            return;
+        }
+        let mut from_slots = Vec::new();
+        for s in slots.iter().filter(|s| s.resolved()) {
+            let role = match s.side {
+                1 => TeamRole::Attack,
+                2 => TeamRole::Defense,
+                side => {
+                    self.ban_warnings
+                        .push(format!("ban slot {} bans side {side}", s.index));
+                    continue;
+                }
+            };
+            let no_ban = s.no_ban();
+            if !no_ban && s.icon.is_none() {
+                self.ban_warnings.push(format!(
+                    "ban slot {} is resolved but names no operator",
+                    s.index
+                ));
+                continue;
+            }
+            let icon = s.icon.filter(|_| !no_ban);
+            from_slots.push(Ban {
+                operator: icon.and_then(Operator::from_role_image),
+                role,
+                team: header.team_of_color(s.color),
+                icon,
+                slot: Some(s.index),
+                no_ban,
+                color: Some(s.color),
+            });
+        }
+        from_slots.sort_by_key(|b| (b.team.unwrap_or(usize::MAX), b.slot));
+        let in_slots: std::collections::BTreeSet<u64> =
+            from_slots.iter().filter_map(|b| b.icon).collect();
+        let in_icons: std::collections::BTreeSet<u64> =
+            bans.iter().filter_map(|b| b.icon).collect();
+        if in_slots != in_icons {
+            self.ban_warnings.push(format!(
+                "the ban slots hold {} banned operators and the icons {}; bans only the icons show are kept without a slot",
+                in_slots.len(),
+                in_icons.len()
+            ));
+        }
+        // Keep what only the icons show, after the slots, rather than lose it.
+        for b in bans
+            .iter()
+            .filter(|b| b.icon.is_some_and(|i| !in_slots.contains(&i)))
+        {
+            let mut b = b.clone();
+            b.team = b.color.and_then(|c| header.team_of_color(c));
+            from_slots.push(b);
+        }
+        *bans = from_slots;
     }
 
     /// Y11S3+ player levels from the opening snapshot: each follows the
@@ -1742,6 +1995,7 @@ impl<'a> Parser<'a> {
             object,
             value,
             tick: self.clock.tick,
+            offset: self.packet_at,
         });
     }
 
@@ -1795,10 +2049,73 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn recording_time(&self, offset: usize) -> Option<f64> {
+        recording_time(self.records.as_ref(), &self.frame_times, offset)
+    }
+
+    /// Record counts per stream, the rate the game sent updates at, and holes
+    /// in the movement stream, which has a record at every update.
+    fn measure_records(&mut self) {
+        let Some(map) = &self.records else { return };
+        if let Some(c) = self.round.container.as_mut() {
+            for s in &mut c.streams {
+                if let Some(sub) = map.streams.iter().find(|x| x.name_hash == s.name_hash) {
+                    s.records = Some(sub.frames.len() as u32);
+                    s.record_bytes = Some(sub.bytes);
+                }
+            }
+        }
+        let times = &self.frame_times;
+        let Some(timing) = self.round.timing.as_mut() else {
+            return;
+        };
+        for sub in &map.streams {
+            // Frame 0 holds the record every stream starts with.
+            let t: Vec<f64> = sub
+                .frames
+                .iter()
+                .filter(|&&f| f > 0)
+                .filter_map(|&f| times.get(f as usize).copied())
+                .collect();
+            if t.len() < MIN_RECORDS {
+                continue;
+            }
+            let span = t[t.len() - 1] - t[0];
+            match container::stream_name(sub.name_hash) {
+                Some("state") if span > 0.0 => {
+                    timing.data_rate = Some(((t.len() - 1) as f64 / span * 100.0).round() / 100.0);
+                }
+                Some("movement") => {
+                    let mut intervals: Vec<f64> = t.windows(2).map(|w| w[1] - w[0]).collect();
+                    intervals.sort_by(f64::total_cmp);
+                    let limit = (intervals[intervals.len() / 2] * HOLE_FACTOR).max(MIN_HOLE);
+                    timing.holes = t
+                        .windows(2)
+                        .filter(|w| w[1] - w[0] > limit)
+                        .map(|w| Hole {
+                            at: (w[0] * 1000.0).round() / 1000.0,
+                            seconds: ((w[1] - w[0]) * 1000.0).round() / 1000.0,
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Puts every feed entry on the round's timeline: phase, seconds since
     /// prep, and the clock it happened at (the last live second for events
     /// the game logged after resetting the clock at round end).
     fn place_feedback(&mut self) {
+        let times: Vec<Option<f64>> = self
+            .round
+            .match_feedback
+            .iter()
+            .map(|u| u.offset.and_then(|o| self.recording_time(o)))
+            .collect();
+        for (u, t) in self.round.match_feedback.iter_mut().zip(times) {
+            u.recording_time = t;
+        }
         let Round {
             timeline,
             match_feedback,
@@ -1832,6 +2149,8 @@ impl<'a> Parser<'a> {
         // Observer object -> (index of its open session, elapsed at start).
         let mut open: HashMap<u32, (usize, f64)> = HashMap::new();
         let before_action = &mut self.health_before_action;
+        let (records, frame_times) = (self.records.as_ref(), &self.frame_times);
+        let recorded = |offset: usize| recording_time(records, frame_times, offset);
         let round = &mut self.round;
         let timeline = &round.timeline;
         for s in &self.samples {
@@ -1858,6 +2177,7 @@ impl<'a> Parser<'a> {
                             time_in_seconds: at.seconds,
                             phase: at.phase,
                             elapsed: at.elapsed,
+                            recording_time: recorded(s.offset),
                         });
                     }
                 }
@@ -1879,6 +2199,7 @@ impl<'a> Parser<'a> {
                         time_in_seconds: at.seconds,
                         phase: at.phase,
                         elapsed: at.elapsed,
+                        recording_time: recorded(s.offset),
                     });
                 }
                 SampleValue::Tool(tool, device_owner) => {
@@ -1902,6 +2223,7 @@ impl<'a> Parser<'a> {
                             time,
                             time_in_seconds: at.seconds,
                             elapsed: at.elapsed,
+                            recording_time: recorded(s.offset),
                             seconds: 0.0,
                         });
                     }
@@ -1954,7 +2276,9 @@ impl<'a> Parser<'a> {
         if self.code() < version::Y8S1 {
             return;
         }
-        self.entity_players = crate::entities::players(&self.data[start..end]);
+        let snapshot = crate::entities::snapshot(&self.data[start..end]);
+        self.entity_players = snapshot.players;
+        self.ban_slots = snapshot.ban_slots;
         for o in &self.entity_players {
             self.controllers.insert(o.controller, o.username.clone());
             if let Some(sb) = o.scoreboard {
@@ -1969,7 +2293,7 @@ impl<'a> Parser<'a> {
         use crate::entities::Relation;
         let objects = std::mem::take(&mut self.entity_players);
         let header = &mut self.round.header;
-        let custom = matches!(header.match_type.0, 3 | 4);
+        let custom = header.match_type.is_custom();
         let spectator = header.is_spectator == Some(true);
         let find = |players: &[Player], o: &crate::entities::PlayerObjects| {
             players
@@ -1992,6 +2316,27 @@ impl<'a> Parser<'a> {
                 movement: None,
             });
             p.relation = (!spectator && o.relation == Some(5)).then_some(Relation::You);
+        }
+        // Each team's `TeamColor`, when all its players' team objects agree.
+        let mut colors: [Vec<u32>; 2] = Default::default();
+        for o in &objects {
+            if let (Some(i), Some(color)) = (find(&header.players, o), o.team_color)
+                && let Some(seen) = colors.get_mut(header.players[i].team_index)
+            {
+                seen.push(color);
+            }
+        }
+        let agreed = colors.map(|seen| {
+            let first = *seen.first()?;
+            (matches!(first, 1 | 2) && seen.iter().all(|&c| c == first)).then_some(first)
+        });
+        if agreed[0].is_some() && agreed[0] == agreed[1] {
+            self.warnings
+                .push("both teams' objects carry the same TeamColor".to_owned());
+        } else {
+            for (team, color) in header.teams.iter_mut().zip(agreed) {
+                team.color = color;
+            }
         }
         header.assign_relations();
         // Party roles are those of the recorder's party: only players the
@@ -2388,6 +2733,24 @@ fn property_object(c: &Cursor) -> Option<u32> {
     owning_object(c.behind(5 + 256), 5)
 }
 
+/// Seconds since the recording started for the packet at `offset`, to the
+/// frame and rounded to the millisecond. `None` for packets in a snapshot, or
+/// without frame records.
+fn recording_time(records: Option<&RecordMap>, frame_times: &[f64], offset: usize) -> Option<f64> {
+    let frame = records?.frame_at(offset)?;
+    let t = *frame_times.get(frame as usize)?;
+    Some((t * 1000.0).round() / 1000.0)
+}
+
+/// Fewer records than this say nothing about a stream's rate.
+const MIN_RECORDS: usize = 100;
+/// Movement records further apart than this, and than `HOLE_FACTOR` times
+/// their median distance (35 ms), leave a hole. The movement stream has a
+/// record at every update; the most seen between two is 69 ms. Other streams
+/// go quiet for seconds when nothing changes.
+const MIN_HOLE: f64 = 0.5;
+const HOLE_FACTOR: f64 = 10.0;
+
 /// The state object id in `23 <id> 00000000 63CC188F`, which follows the
 /// operator in a Y11S3 pick packet.
 fn state_object_after(window: &[u8]) -> Option<u32> {
@@ -2423,9 +2786,139 @@ fn owning_object(before: &[u8], marker_len: usize) -> Option<u32> {
     })
 }
 
+/// The team of the `pick`-th pick packet (from 1) of a round where each
+/// team has `per_team` players: the first team's players are picked first.
+fn pick_team(pick: u32, per_team: u32) -> usize {
+    usize::from(pick > per_team)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::header::PlayerEntities;
+    use crate::types::Operator;
+
+    /// A player's own recording of a 5v5 round: `players` players, each
+    /// with an operator and a controller, and every body linked but the
+    /// recorder's (player 0), as the game writes it.
+    fn own_recording(players: usize) -> Header {
+        let mut h = Header {
+            code_version: version::Y9S4,
+            is_spectator: Some(false),
+            max_players_per_team: Some(5),
+            ..Header::default()
+        };
+        for i in 0..players {
+            h.players.push(Player {
+                id: i as u64 + 1,
+                username: format!("p{i}"),
+                team_index: usize::from(i >= 5),
+                operator: Operator(92270642500),
+                relation: Some(if i == 0 {
+                    crate::entities::Relation::You
+                } else {
+                    crate::entities::Relation::Teammate
+                }),
+                entities: Some(PlayerEntities {
+                    controller: 0xF000_0000 + i as u32,
+                    movement: (i != 0).then_some(0xF100_0000 + i as u32),
+                    ..PlayerEntities::default()
+                }),
+                ..Player::default()
+            });
+        }
+        h
+    }
+
+    fn report(header: Header) -> DecodeReport {
+        let mut p = Parser::new(&[], header);
+        p.finish_report(ReadMode::Full);
+        p.round.decode
+    }
+
+    #[test]
+    fn a_ban_only_the_icons_show_is_kept_and_lowers_trust() {
+        let mut p = Parser::new(&[], own_recording(10));
+        // The icon scan found Mira; the slots hold only Ace.
+        p.round.bans.push(Ban {
+            operator: None,
+            role: TeamRole::Defense,
+            team: None,
+            icon: Some(39149215445),
+            slot: None,
+            no_ban: false,
+            color: Some(1),
+        });
+        p.ban_slots.push(crate::entities::BanSlot {
+            index: 0,
+            side: 1,
+            color: 2,
+            state: 3,
+            result: 1,
+            icon: Some(104189664325),
+        });
+
+        p.finish_bans();
+        p.finish_report(ReadMode::Full);
+
+        let icons: Vec<_> = p.round.bans.iter().map(|b| b.icon).collect();
+        assert_eq!(icons, [Some(104189664325), Some(39149215445)]);
+        let bans = p.round.decode.get("bans").unwrap();
+        assert_eq!(bans.status, Status::Partial);
+    }
+
+    #[test]
+    fn a_header_team_size_of_zero_means_five() {
+        let header = Header {
+            max_players_per_team: Some(0),
+            ..Header::default()
+        };
+
+        let p = Parser::new(&[], header);
+
+        assert_eq!(p.team_size(), 5);
+    }
+
+    #[test]
+    fn picks_fill_the_first_team_up_to_the_team_size() {
+        assert_eq!(pick_team(5, 5), 0);
+        assert_eq!(pick_team(6, 5), 1);
+        assert_eq!(pick_team(6, 6), 0);
+        assert_eq!(pick_team(7, 6), 1);
+    }
+
+    #[test]
+    fn the_recorders_own_body_is_not_counted_against_movement() {
+        let r = report(own_recording(10));
+        let f = r.get("movement").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 9));
+        assert!(f.warnings.iter().any(|w| w.contains("own body")), "{f:?}");
+        // Another player's missing body still is.
+        let mut h = own_recording(10);
+        h.players[3].entities.as_mut().unwrap().movement = None;
+        assert_eq!(report(h).get("movement").unwrap().status, Status::Partial);
+    }
+
+    #[test]
+    fn a_round_short_of_players_is_decoded_when_every_player_is() {
+        let f = report(own_recording(9)).get("players").cloned().unwrap();
+        assert_eq!(f.status, Status::Decoded);
+        assert!(f.warnings.iter().any(|w| w.contains("left")), "{f:?}");
+        let mut h = own_recording(10);
+        h.players[4].operator = Operator::default();
+        assert_eq!(report(h).get("players").unwrap().status, Status::Partial);
+    }
+
+    #[test]
+    fn unnamed_defuser_players_are_not_in_the_version() {
+        let mut p = Parser::new(&[], own_recording(10));
+        let mut u = p.update(MatchUpdateType::DefuserPlantStart, "");
+        u.team = Some(0);
+        p.push(u);
+        p.finish_report(ReadMode::Full);
+        let f = p.round.decode.get("defuserPlayers").unwrap();
+        assert_eq!((f.status, f.count), (Status::NotInVersion, 1));
+    }
 
     /// `scan` relies on markers never overlapping: no marker may contain
     /// another, or end with the start of another.

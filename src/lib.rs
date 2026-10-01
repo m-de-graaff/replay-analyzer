@@ -10,6 +10,7 @@
 
 pub mod analytics;
 pub mod census;
+pub mod container;
 mod cursor;
 pub mod decoder;
 mod decompress;
@@ -21,8 +22,10 @@ pub mod file;
 pub mod format;
 pub mod header;
 pub mod identity;
+pub mod library;
 pub mod matches;
 pub mod outcome;
+pub mod records;
 pub mod report;
 pub mod round;
 pub mod stats;
@@ -32,6 +35,7 @@ pub mod types;
 
 pub use analytics::MatchAnalytics;
 pub use census::Census;
+pub use container::{Container, DirectoryState, StreamInfo};
 pub use decoder::ParserInfo;
 pub use details::{
     Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
@@ -42,6 +46,7 @@ pub use file::FileInfo;
 pub use format::{FormatInfo, GameVersion, Timing};
 pub use header::{Header, PartyRole, Player, PlayerEntities, Relation, Team};
 pub use identity::{KnownPlayer, PlayerDirectory};
+pub use library::Library;
 pub use matches::Match;
 pub use outcome::{ReasonSource, RoundInfo, RoundOutcome};
 pub use report::{DecodeReport, Status};

@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use replay_analyzer::matches::{FolderReport, find_match_folders};
 use replay_analyzer::{Match, ReadMode, ReadOptions, Round, decompressed_bytes, file};
-use serde::Serialize;
 
 /// Parse Rainbow Six Siege replays (.rec files or match folders) into JSON.
 #[derive(Parser)]
@@ -34,13 +33,19 @@ struct Cli {
     #[arg(long)]
     census: bool,
     /// List the match folders under a folder (headers only, fast): rounds,
-    /// missing rounds, skipped files, versions and file hashes.
+    /// missing and unfinished rounds, game sessions, duplicates, leftover
+    /// temporary recordings, versions and file hashes.
     #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census"])]
     list: bool,
     /// Every player across the match folders under a folder: stable key,
     /// name history, matches with and against you, and likely queue-mates.
     #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list"])]
     players: bool,
+    /// Print the decoder profiles and tested builds: a stored round whose
+    /// `(decoder, decoderRevision)` differs from its build's profile here
+    /// would decode differently now.
+    #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list", "players"])]
+    decoders: bool,
     /// Log debug information to stderr.
     #[arg(short, long)]
     debug: bool,
@@ -73,14 +78,18 @@ fn main() -> Result<()> {
         census: cli.census,
     };
 
-    if cli.players {
+    if cli.decoders {
+        write_json(&mut out, &replay_analyzer::decoder::table(), cli.pretty)?;
+    } else if cli.players {
         let dir = cli.input.as_ref().filter(|_| is_dir);
         let dir = dir.context("--players needs a folder")?;
         write_json(&mut out, &players(dir)?, cli.pretty)?;
     } else if cli.list {
         let dir = cli.input.as_ref().filter(|_| is_dir);
         let dir = dir.context("--list needs a folder")?;
-        write_json(&mut out, &list(dir)?, cli.pretty)?;
+        let library = replay_analyzer::library::scan(dir, ReadMode::Header)
+            .with_context(|| format!("no folder with .rec files under {}", dir.display()))?;
+        write_json(&mut out, &library, cli.pretty)?;
     } else if is_dir {
         let dir = cli.input.as_ref().expect("is_dir implies input");
         if cli.dump || cli.partial {
@@ -258,6 +267,12 @@ fn print_summary(s: &replay_analyzer::MatchSummary) {
 }
 
 fn print_folder(f: &FolderReport) {
+    if let Some(n) = &f.name {
+        println!(
+            "Folder:           created {} (local time), game process {}",
+            n.local_time, n.process_id
+        );
+    }
     println!(
         "Rounds:           {:?} of {} files{}",
         f.rounds,
@@ -279,35 +294,6 @@ fn print_folder(f: &FolderReport) {
     }
 }
 
-/// One line per round in `--list` output.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListedRound<'a> {
-    file: Option<&'a replay_analyzer::FileInfo>,
-    round: u32,
-    #[serde(rename = "matchID")]
-    match_id: &'a str,
-    timestamp: String,
-    version: &'a replay_analyzer::GameVersion,
-    parser: &'a replay_analyzer::ParserInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    frames: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sample_rate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    gaps: Option<usize>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ListedFolder<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    summary: Option<replay_analyzer::MatchSummary>,
-    #[serde(flatten)]
-    folder: &'a FolderReport,
-    round_list: Vec<ListedRound<'a>>,
-}
-
 /// The player directory for every match folder under `root`. Rounds are read
 /// partially: enough for players, relations and parties.
 fn players(root: &std::path::Path) -> Result<replay_analyzer::PlayerDirectory> {
@@ -322,43 +308,4 @@ fn players(root: &std::path::Path) -> Result<replay_analyzer::PlayerDirectory> {
         bail!("no folder with .rec files under {}", root.display());
     }
     Ok(replay_analyzer::PlayerDirectory::new(&summaries))
-}
-
-/// Header-only summaries of every match folder under `root`.
-fn list(root: &std::path::Path) -> Result<serde_json::Value> {
-    let mut out = Vec::new();
-    for dir in find_match_folders(root)? {
-        let m = match Match::open_with(&dir, ReadMode::Header) {
-            Ok(m) => m,
-            Err(e) => {
-                out.push(serde_json::json!({ "path": dir.display().to_string(), "error": e.to_string() }));
-                continue;
-            }
-        };
-        let folder = m.folder.as_ref().expect("open_with sets folder");
-        let round_list = m
-            .rounds
-            .iter()
-            .map(|r| ListedRound {
-                file: r.file.as_ref(),
-                round: r.header.round_number + 1,
-                match_id: &r.header.match_id,
-                timestamp: r.header.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                version: &r.version,
-                parser: &r.parser,
-                frames: r.timing.as_ref().map(|t| t.frames),
-                sample_rate: r.timing.as_ref().map(|t| t.sample_rate),
-                gaps: r.timing.as_ref().map(|t| t.gaps.len()),
-            })
-            .collect();
-        out.push(serde_json::to_value(ListedFolder {
-            summary: m.summary(),
-            folder,
-            round_list,
-        })?);
-    }
-    if out.is_empty() {
-        bail!("no folder with .rec files under {}", root.display());
-    }
-    Ok(serde_json::Value::Array(out))
 }

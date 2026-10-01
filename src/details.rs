@@ -4,23 +4,38 @@ use serde::Serialize;
 
 use crate::types::{ObservationTool, Operator, TeamRole};
 
-/// An operator banned for this round.
+/// An operator banned for this round, or (Y11S3+) a ban slot whose vote
+/// ended without a ban.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ban {
     /// `None` when the icon is not in the role image table (usually a replay
-    /// from an older season, whose icons have other ids).
+    /// from an older season, whose icons have other ids), or for `noBan`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<Operator>,
     /// The side the banned operator plays on.
     pub role: TeamRole,
     /// Index of the team that owns the ban slot, i.e. the team that banned
-    /// the operator (Y11S3+). Slots are listed in the game's order, so bans
-    /// of one team keep their slot order.
+    /// the operator (Y11S3+). Bans are listed by team, then by slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<usize>,
     /// The operator's role image id, which is all the replay records.
-    pub icon: u64,
+    /// `None` for `noBan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<u64>,
+    /// Y11S3+: the slot's place in its team's ban list, from 0: the order the
+    /// team banned in. In ranked a team bans once before each round of a
+    /// half, into the next slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// Y11S3+: the team's vote ended without a ban, so the slot holds no
+    /// operator.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_ban: bool,
+    /// The slot's `TeamColor`, which `team` is derived from: the game numbers
+    /// a player's own team 1 in their recording, whatever its header index.
+    #[serde(skip)]
+    pub color: Option<u32>,
 }
 
 /// Where in the round something happened. Inferred from the clock: prep
@@ -63,6 +78,9 @@ pub struct HealthUpdate {
     /// Seconds since the prep phase started; see `Round::phases`.
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -85,6 +103,9 @@ pub struct LifeEvent {
     pub phase: Phase,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, to the frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
 }
 
 /// A stretch of time a player spent looking through an observation device.
@@ -104,6 +125,10 @@ pub struct ObservationSession {
     /// Seconds since the prep phase started, when the session started.
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub elapsed: f64,
+    /// Seconds since the recording started, when the session started, to the
+    /// frame (Y8S4+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_time: Option<f64>,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub seconds: f64,
 }

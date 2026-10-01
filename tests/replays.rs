@@ -490,6 +490,10 @@ fn decode_status_reports_what_can_be_trusted() {
             Status::Inferred
         };
         assert_eq!(status("result"), result, "{}", path.display());
+        // The level's property is named ClearanceLevelText.
+        if round.header.code_version >= replay_analyzer::types::version::Y11S3 {
+            assert_eq!(status("levels"), Status::Decoded, "{}", path.display());
+        }
         let partial = Round::open(&path, ReadMode::Partial).unwrap();
         assert_eq!(
             partial.decode.get("result").unwrap().status,
@@ -536,9 +540,602 @@ fn census_counts_known_and_unknown_fields() {
         );
         assert!(c.fields.iter().any(|f| f.known == Some("health")));
         assert!(c.unknown_fields > 50, "{}", path.display());
+        // Every stream is there; two have known roles, the rest are listed
+        // as unknown so a new one after a patch stands out.
+        assert!(c.streams_not_seen.is_empty(), "{:?}", c.streams_not_seen);
+        let listed = round.container.as_ref().map_or(0, |c| c.streams.len());
+        assert_eq!(c.unknown_streams.len(), listed - 2, "{}", path.display());
+        // Fields say where they live: health updates in the state stream,
+        // picks in the opening snapshots.
+        let stream_of = |name: &str| {
+            let f = c.fields.iter().find(|f| f.known == Some(name)).unwrap();
+            f.stream.clone()
+        };
+        assert_eq!(stream_of("health").as_deref(), Some("state"));
+        assert_eq!(stream_of("player").as_deref(), Some("snapshot"));
         let time = c.packets.iter().find(|p| p.name.ends_with("ime")).unwrap();
         assert!(time.seen > 100);
     }
+}
+
+#[test]
+fn y11s3_container_maps_every_byte() {
+    use replay_analyzer::DirectoryState;
+    let Some(dir) = data_dir() else { return };
+    let mut ids = Vec::new();
+    for path in replays(&dir, "valid") {
+        let raw = std::fs::read(&path).unwrap();
+        if !raw.starts_with(b"dissect") {
+            continue;
+        }
+        let round = Round::from_bytes(&raw, ReadMode::Full).unwrap();
+        let c = round
+            .container
+            .as_ref()
+            .expect("Y8S4+ files have a container");
+        assert!(c.complete, "{}: {:?}", path.display(), c.warnings);
+        assert!(
+            c.warnings.is_empty(),
+            "{}: {:?}",
+            path.display(),
+            c.warnings
+        );
+        assert_eq!(c.directory, DirectoryState::Valid);
+        assert_eq!(c.streams.len(), 10, "{}", path.display());
+        let named: Vec<_> = c.streams.iter().filter_map(|s| s.name).collect();
+        assert!(
+            named.contains(&"state") && named.contains(&"movement"),
+            "{named:?}"
+        );
+        // Every block was decompressed, and nothing else.
+        assert_eq!(c.frames.len(), round.zstd_frames);
+        let data = replay_analyzer::decompressed_bytes(&raw).unwrap();
+        assert_eq!(data.len() as u64, c.raw_bytes);
+        // Listing a folder finds the same map without decompressing; only
+        // the record counts need the decompressed data.
+        let fast = Round::from_bytes(&raw, ReadMode::Header).unwrap();
+        let mut without_records = c.clone();
+        for s in &mut without_records.streams {
+            assert!(s.records.is_some(), "{}: {}", path.display(), s.hash);
+            (s.records, s.record_bytes) = (None, None);
+        }
+        assert_eq!(fast.container, Some(without_records));
+        assert_eq!(
+            round.decode.get("container").unwrap().status,
+            replay_analyzer::Status::Decoded
+        );
+        ids.push((c.recording_id.unwrap(), c.streams.len() as u32));
+    }
+    // The test rounds were recorded one after another by one game session:
+    // each takes its main id and ten stream ids from the same counter.
+    ids.sort_unstable();
+    for w in ids.windows(2) {
+        assert_eq!(w[1].0, w[0].0 + 1 + w[0].1, "{ids:?}");
+    }
+}
+
+#[test]
+fn y11s3_events_are_placed_on_the_recording_clock() {
+    use replay_analyzer::{MatchUpdateType, Phase};
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Full).unwrap();
+        if round.container.is_none() {
+            continue;
+        }
+        let name = path.display();
+        let t = round.timing.as_ref().unwrap();
+        // The game sends updates about 28 times a second, whatever the frame
+        // rate of the recording.
+        let rate = t.data_rate.expect("state stream records");
+        assert!((25.0..32.0).contains(&rate), "{name}: {rate}");
+        assert!(t.holes.is_empty(), "{name}: {:?}", t.holes);
+        let c = round.container.as_ref().unwrap();
+        for stream in ["state", "movement"] {
+            let s = c.streams.iter().find(|s| s.name == Some(stream)).unwrap();
+            assert!(
+                s.records.unwrap() > 1000,
+                "{name}: {stream} {:?}",
+                s.records
+            );
+        }
+
+        let feed = &round.match_feedback;
+        let times: Vec<f64> = feed.iter().map(|u| u.recording_time.unwrap()).collect();
+        assert!(
+            times.iter().all(|&s| (0.0..=t.duration).contains(&s)),
+            "{name}"
+        );
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "{name}: {times:?}");
+        assert!(
+            round.health.iter().all(|h| h.recording_time.is_some()),
+            "{name}"
+        );
+
+        // The round clock and the frame index measure the same seconds, so a
+        // kill's recording time minus its whole seconds since prep started
+        // stays within a second across the round.
+        let offsets: Vec<f64> = feed
+            .iter()
+            .filter(|u| u.kind == MatchUpdateType::Kill && u.phase == Phase::Action)
+            .map(|u| u.recording_time.unwrap() - u.elapsed)
+            .collect();
+        let (lo, hi) = offsets
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), &o| (lo.min(o), hi.max(o)));
+        assert!(offsets.is_empty() || hi - lo < 1.0, "{name}: {offsets:?}");
+
+        let spans = round.timeline.spans();
+        let action = spans.iter().find(|s| s.phase == Phase::Action).unwrap();
+        let prep = spans.iter().find(|s| s.phase == Phase::Prep).unwrap();
+        assert_eq!(prep.recording_end, action.recording_start, "{name}");
+        let action_start = action.recording_start.unwrap();
+        assert!(
+            (40.0..50.0).contains(&action_start),
+            "{name}: {action_start}"
+        );
+        // A plant completes when its countdown reaches zero; the clock
+        // switches to the defuser timer an update or two later (34-69 ms in
+        // the test rounds), not in the same frame.
+        let plant = feed
+            .iter()
+            .find(|u| u.kind == MatchUpdateType::DefuserPlantComplete);
+        let planted = spans.iter().find(|s| s.phase == Phase::Planted);
+        if let (Some(plant), Some(planted)) = (plant, planted) {
+            let lag = planted.recording_start.unwrap() - plant.recording_time.unwrap();
+            assert!(lag > 0.0 && lag < 0.5, "{name}: {lag}");
+        }
+    }
+}
+
+/// Real files the game failed to finish end on a block header whose packed
+/// size is 0xFFFFFFFF, right after the snapshots. Build one from a test round.
+fn unfinished_copy(raw: &[u8]) -> Vec<u8> {
+    let round = Round::from_bytes(raw, ReadMode::Header).unwrap();
+    let c = round.container.unwrap();
+    // The main stream's descriptor is 56 bytes before its data.
+    let cut = c.main.unwrap().offset as usize - 56;
+    let mut out = raw[..cut].to_vec();
+    out.extend(b"200VRPMC");
+    out.extend(10_822_076u32.to_le_bytes());
+    out.extend(u32::MAX.to_le_bytes());
+    out
+}
+
+#[test]
+fn a_file_cut_inside_a_block_reads_up_to_the_cut() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    let path = dir.join("valid/Y11S3/custom_1.rec");
+    if !path.is_file() {
+        return;
+    }
+    let raw = std::fs::read(&path).unwrap();
+    // Three megabytes in: inside the main stream, in the middle of a block.
+    let round = Round::from_bytes(&raw[..3_000_000], ReadMode::Full).unwrap();
+    let c = round.container.as_ref().unwrap();
+    assert!(!c.complete);
+    assert!(c.main.is_some());
+    assert!(
+        round
+            .decode
+            .warnings
+            .iter()
+            .any(|w| w.contains("inside the main stream")),
+        "{:?}",
+        round.decode.warnings
+    );
+    assert_eq!(
+        round.decode.get("container").unwrap().status,
+        Status::Partial
+    );
+    assert_eq!(round.header.players.len(), 10);
+}
+
+#[test]
+fn a_file_the_game_did_not_finish_is_reported_incomplete() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    let path = dir.join("valid/Y11S3/custom_1.rec");
+    if !path.is_file() {
+        return;
+    }
+    let raw = unfinished_copy(&std::fs::read(&path).unwrap());
+    for mode in [ReadMode::Header, ReadMode::Full] {
+        let round = Round::from_bytes(&raw, mode).unwrap();
+        let c = round.container.as_ref().unwrap();
+        assert!(!c.complete);
+        assert!(c.main.is_none());
+        assert!(c.streams.iter().all(|s| s.snapshot.is_some()));
+        assert_eq!(
+            round.decode.get("container").unwrap().status,
+            Status::Partial
+        );
+        assert!(
+            round
+                .decode
+                .warnings
+                .iter()
+                .any(|w| w.contains("before the main stream")),
+            "{:?}",
+            round.decode.warnings
+        );
+        assert!(!round.decode.trusted);
+    }
+    // A full read still gets the header and players from the snapshots, and
+    // says why the kill feed is empty.
+    let round = Round::from_bytes(&raw, ReadMode::Full).unwrap();
+    assert_eq!(round.header.players.len(), 10);
+    let kills = round.decode.get("kills").unwrap();
+    assert_eq!(kills.status, Status::Missing);
+    assert!(
+        kills.warnings.iter().any(|w| w.contains("incomplete")),
+        "{:?}",
+        kills.warnings
+    );
+}
+
+/// A `MatchReplay` folder as the game writes it, from `R6_MATCH_REPLAY`.
+/// Its contents change as matches are played, so tests on it check what
+/// must hold for any such folder.
+fn match_replay_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("R6_MATCH_REPLAY")?);
+    dir.is_dir().then_some(dir)
+}
+
+#[test]
+fn game_named_folders_and_files_agree_with_their_headers() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let folders = replay_analyzer::matches::find_match_folders(&root).unwrap();
+    assert!(!folders.is_empty());
+    for dir in folders {
+        let m = replay_analyzer::Match::open_with(&dir, ReadMode::Header).unwrap();
+        let f = m.folder.as_ref().unwrap();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(f.name.is_some(), "{name} is not a game folder name");
+        // Every warning is about the match, never about names or ids.
+        for w in &f.warnings {
+            assert!(
+                !w.contains("named for another") && !w.contains("according to its header"),
+                "{name}: {w}"
+            );
+        }
+        assert!(f.skipped.is_empty(), "{name}: {:?}", f.skipped);
+        for r in &m.rounds {
+            let file = Path::new(&r.file.as_ref().unwrap().file_name);
+            let round = replay_analyzer::file::round_from_file_name(file);
+            assert_eq!(round, Some(r.header.round_number + 1), "{}", file.display());
+            let owner = replay_analyzer::file::match_of_file_name(file);
+            assert_eq!(owner, Some(name.as_str()), "{}", file.display());
+            let c = r.container.as_ref().unwrap();
+            let listed = f.incomplete.iter().any(|i| Path::new(i) == file);
+            assert_eq!(!c.complete, listed, "{}", file.display());
+            assert!(c.recording_id.is_some(), "{}", file.display());
+        }
+    }
+}
+
+/// A game install as the game lays it out: `MatchReplay/Match-.../` round
+/// files, a `DissectTmp` folder next to it, and leftovers in both.
+#[test]
+fn a_library_scan_finds_sessions_copies_and_leftovers() {
+    use replay_analyzer::library::{self, DuplicateKind};
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.join("custom_2.rec").is_file() {
+        return;
+    }
+    let game = std::env::temp_dir().join(format!("ra-library-{}", std::process::id()));
+    let root = game.join("MatchReplay");
+    let a = "Match-2026-09-12_22-00-00-4242";
+    let b = "Match-2026-09-12_23-00-00-4242";
+    for f in [a, b] {
+        std::fs::create_dir_all(root.join(f)).unwrap();
+    }
+    std::fs::create_dir_all(game.join("DissectTmp")).unwrap();
+    std::fs::copy(
+        src.join("custom_1.rec"),
+        root.join(a).join(format!("{a}-R01.rec")),
+    )
+    .unwrap();
+    std::fs::copy(
+        src.join("custom_2.rec"),
+        root.join(a).join(format!("{a}-R02.rec")),
+    )
+    .unwrap();
+    // The same round again in another folder, once byte for byte and once
+    // with its last byte changed (like another player's recording of it).
+    std::fs::copy(
+        src.join("custom_1.rec"),
+        root.join(b).join(format!("{b}-R01.rec")),
+    )
+    .unwrap();
+    let mut other = std::fs::read(src.join("custom_2.rec")).unwrap();
+    *other.last_mut().unwrap() ^= 0xFF;
+    std::fs::write(root.join(b).join(format!("{b}-R02.rec")), other).unwrap();
+    let leftover = "P4242_600_Y2026_M9_D12_H23_M30_FrameDataStream.tmprec";
+    std::fs::write(game.join("DissectTmp").join(leftover), b"x").unwrap();
+    std::fs::write(
+        game.join("P4242_601_Y2026_M9_D12_H23_M30_StaticData.tmprec"),
+        b"",
+    )
+    .unwrap();
+
+    let lib = library::scan(&root, ReadMode::Header);
+    std::fs::remove_dir_all(&game).unwrap();
+    let lib = lib.unwrap();
+
+    assert_eq!(lib.folders.len(), 2);
+    assert!(lib.folders.iter().all(|f| f.error.is_none()));
+    let kinds: Vec<_> = lib.duplicates.iter().map(|d| d.kind).collect();
+    assert_eq!(kinds, [DuplicateKind::SameFile, DuplicateKind::SameRound]);
+    assert!(lib.duplicates.iter().all(|d| d.files.len() == 2));
+    let temps: Vec<_> = lib
+        .temporary
+        .iter()
+        .map(|t| (t.process_id, t.stream_id))
+        .collect();
+    // Sorted by path: DissectTmp's leftover, then the game folder's.
+    assert_eq!(temps, [(Some(4242), Some(600)), (Some(4242), Some(601))]);
+    assert_eq!(lib.temporary[0].size, Some(1));
+    // Both folders come from process 4242. The copies in the second folder
+    // reuse the first folder's ids, so the ids start over: two sessions.
+    assert_eq!(lib.sessions.len(), 2);
+    assert!(lib.sessions.iter().all(|s| s.process_id == 4242));
+    assert_eq!(lib.sessions[0].folders, [a]);
+    assert!(
+        lib.warnings.iter().any(|w| w.contains("temporary")),
+        "{:?}",
+        lib.warnings
+    );
+}
+
+#[test]
+fn a_real_library_accounts_for_every_round() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let lib = replay_analyzer::library::scan(&root, ReadMode::Header).unwrap();
+    assert!(lib.folders.iter().all(|f| f.error.is_none()));
+    let named: Vec<_> = lib
+        .folders
+        .iter()
+        .filter(|f| f.folder.name.is_some())
+        .collect();
+    let in_sessions: usize = lib.sessions.iter().map(|s| s.folders.len()).sum();
+    assert_eq!(in_sessions, named.len());
+    let rounds: usize = named.iter().map(|f| f.round_list.len()).sum();
+    assert_eq!(lib.sessions.iter().map(|s| s.rounds).sum::<usize>(), rounds);
+    // The game never writes a round twice.
+    assert!(lib.duplicates.is_empty(), "{:?}", lib.duplicates);
+    // Leftover temporary recordings, if any, are named as players reported.
+    for t in &lib.temporary {
+        assert!(t.process_id.is_some() && t.kind.is_some(), "{t:?}");
+    }
+}
+
+/// Every real round read in full, match by match: read once, shared by the
+/// tests that need it.
+fn real_rounds() -> Option<&'static [Round]> {
+    static ROUNDS: std::sync::OnceLock<Option<Vec<Round>>> = std::sync::OnceLock::new();
+    ROUNDS
+        .get_or_init(|| {
+            let root = match_replay_dir()?;
+            let mut rounds = Vec::new();
+            for dir in replay_analyzer::matches::find_match_folders(&root).unwrap() {
+                let m = replay_analyzer::Match::open_with(&dir, ReadMode::Full).unwrap();
+                rounds.extend(m.rounds);
+            }
+            Some(rounds)
+        })
+        .as_deref()
+}
+
+/// Each team bans operators of the side it plays against, so a ban credited
+/// to the team playing the banned operator's side is credited to the wrong
+/// team.
+#[test]
+fn real_bans_are_made_by_the_team_on_the_other_side() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut wrong = Vec::new();
+    for r in rounds {
+        for b in &r.bans {
+            let Some(team) = b.team else { continue };
+            if r.header.teams[team].role == Some(b.role) {
+                wrong.push(format!(
+                    "{} R{}: {:?}",
+                    r.header.match_id,
+                    r.header.round_number + 1,
+                    b
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} bans credited to the wrong team, e.g. {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(3)]
+    );
+}
+
+/// Fails when a ban icon is missing from `ROLE_IMAGES`, or names an operator
+/// of the other side.
+#[test]
+fn real_bans_name_an_operator_of_the_banned_side() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let wrong: Vec<_> = rounds
+        .iter()
+        .flat_map(|r| &r.bans)
+        .filter(|b| !b.no_ban && b.operator.and_then(|o| o.role()) != Some(b.role))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} bans, e.g. {:?}",
+        wrong.len(),
+        wrong.first()
+    );
+}
+
+/// Each team fills its ban slots in order, so a round's bans of one team
+/// are slots 0, 1, 2 with none missing.
+#[test]
+fn real_ban_slots_fill_in_order() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        for team in [Some(0), Some(1)] {
+            let slots: Vec<_> = r
+                .bans
+                .iter()
+                .filter(|b| b.team == team)
+                .map(|b| b.slot)
+                .collect();
+            let expected: Vec<_> = (0..slots.len() as u32).map(Some).collect();
+            assert_eq!(
+                slots,
+                expected,
+                "{} R{} team {team:?}",
+                r.header.match_id,
+                r.header.round_number + 1
+            );
+        }
+    }
+}
+
+/// The slots and the banned-operator icons near them are two reads of the
+/// same bans.
+#[test]
+fn real_ban_slots_agree_with_their_icons() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        let bans = r.decode.get("bans").unwrap();
+        assert!(
+            bans.warnings.is_empty(),
+            "{} R{}: {:?}",
+            r.header.match_id,
+            r.header.round_number + 1,
+            bans.warnings
+        );
+    }
+}
+
+/// In a player's own recording, the game numbers the player's team 1.
+#[test]
+fn real_recorders_team_has_team_color_one() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut checked = 0;
+    for r in rounds {
+        let Some(you) = r.header.recording_player() else {
+            continue;
+        };
+        let colors = r.header.teams.each_ref().map(|t| t.color);
+        if colors == [None, None] {
+            continue; // a file cut before its team objects
+        }
+        assert_eq!(
+            colors[you.team_index],
+            Some(1),
+            "{} R{}",
+            r.header.match_id,
+            r.header.round_number + 1
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+/// Every real match folder, headers only, with its rounds.
+fn real_matches() -> Option<Vec<replay_analyzer::Match>> {
+    let root = match_replay_dir()?;
+    let folders = replay_analyzer::matches::find_match_folders(&root).unwrap();
+    Some(
+        folders
+            .iter()
+            .map(|dir| replay_analyzer::Match::open_with(dir, ReadMode::Header).unwrap())
+            .collect(),
+    )
+}
+
+/// `matchresult` is the recorder's result in their own recording: 2 won, 1
+/// lost, 7 ended with no winner.
+#[test]
+fn real_outcomes_agree_with_matchresult() {
+    use replay_analyzer::summary::Outcome;
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        let s = m.summary().unwrap();
+        let Some(value) = s.result.raw_match_result else {
+            continue;
+        };
+        if s.recording.spectator {
+            continue;
+        }
+        let expected = match value {
+            2 => Outcome::Win,
+            1 => Outcome::Loss,
+            7 => Outcome::Cancelled,
+            other => panic!("{}: matchresult {other} not seen before", s.match_id),
+        };
+        assert_eq!(s.result.outcome, expected, "{}", s.match_id);
+    }
+}
+
+/// The game writes `isspectator` only for spectators, so a recording
+/// without it is a player's, even when its header lacks the player (a file
+/// cut during prep has no attackers in its header).
+#[test]
+fn real_player_recordings_are_not_listed_as_spectators() {
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        if m.rounds.iter().all(|r| r.header.is_spectator != Some(true)) {
+            let s = m.summary().unwrap();
+            assert!(!s.recording.spectator, "{}", s.match_id);
+        }
+    }
+}
+
+/// Fails when the game adds a map or gives one a new world id: name it in
+/// `MAPS`, from its sites and spawns.
+#[test]
+fn real_maps_have_names() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let lib = replay_analyzer::library::scan(&root, ReadMode::Header).unwrap();
+    let unnamed: Vec<_> = lib
+        .folders
+        .iter()
+        .filter_map(|f| f.summary.as_ref())
+        .filter(|s| s.map.base.is_none())
+        .map(|s| s.map.id)
+        .collect();
+    assert!(unnamed.is_empty(), "unnamed map ids: {unnamed:?}");
 }
 
 #[test]

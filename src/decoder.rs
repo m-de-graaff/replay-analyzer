@@ -27,6 +27,8 @@
 //!   recorder and every player who spawned has a body; ids of players the
 //!   header does not list; platform, nicknames, names given at match end
 //!   and cosmetics.
+//! - Y11S3 (profile Y9S4): loadouts from the HUD slots and entity
+//!   descriptors, with attachments, ammunition and ability and gadget counts.
 
 use serde::Serialize;
 
@@ -112,7 +114,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 8,
+        revision: 9,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

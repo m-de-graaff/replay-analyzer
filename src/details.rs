@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::loadout::{Counted, Weapon};
 use crate::types::{ObservationTool, Operator, TeamRole};
 
 /// An operator banned for this round, or (Y11S3+) a ban slot whose vote
@@ -133,9 +134,9 @@ pub struct ObservationSession {
     pub seconds: f64,
 }
 
-/// The equipment a player spawned with on one operator. Ids only: replays
-/// carry no item names.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// The equipment a player spawned with on one operator. Replays carry ids
+/// only; names come from the lookup table.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Loadout {
     pub username: String,
@@ -144,4 +145,27 @@ pub struct Loadout {
     pub weapons: Vec<u64>,
     /// The operator's ability, then their secondary gadget.
     pub gadgets: Vec<u64>,
+    /// Y11S3, for the operator the player spawned with: the primary and
+    /// secondary with their attachments and ammunition. A shield operator's
+    /// primary is the shield.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<Weapon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<Weapon>,
+    /// Y11S3: the ability and the secondary gadget, with how many the
+    /// player had and when the count dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ability: Option<Counted>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gadget: Option<Counted>,
+}
+
+impl Loadout {
+    pub fn new(username: &str, operator: Operator) -> Self {
+        Loadout {
+            username: username.to_owned(),
+            operator,
+            ..Loadout::default()
+        }
+    }
 }

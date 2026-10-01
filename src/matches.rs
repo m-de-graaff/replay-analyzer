@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::analytics::MatchAnalytics;
 use crate::error::{Error, Result};
 use crate::file::{self, FileInfo, MatchFolderName, TempRecording};
+use crate::loadout::LoadoutChange;
 use crate::round::{ReadOptions, Round};
 use crate::stats::{PlayerMatchStats, match_stats};
 use crate::summary::MatchSummary;
@@ -193,6 +194,12 @@ impl Match {
     /// Side, site, spawn, operator and end-reason breakdowns.
     pub fn analytics(&self) -> MatchAnalytics {
         MatchAnalytics::new(&self.rounds)
+    }
+
+    /// Y11S3: per player, the rounds their loadout differs from their
+    /// previous round on the same side.
+    pub fn loadout_changes(&self) -> Vec<LoadoutChange> {
+        crate::loadout::changes(&self.rounds)
     }
 }
 
@@ -407,6 +414,8 @@ impl Serialize for Match {
             #[serde(skip_serializing_if = "Option::is_none")]
             folder: Option<&'a FolderReport>,
             analytics: MatchAnalytics,
+            #[serde(rename = "loadoutChanges", skip_serializing_if = "Vec::is_empty")]
+            loadout_changes: Vec<LoadoutChange>,
             rounds: &'a [Round],
             stats: Vec<PlayerMatchStats>,
         }
@@ -414,6 +423,7 @@ impl Serialize for Match {
             summary: self.summary(),
             folder: self.folder.as_ref(),
             analytics: self.analytics(),
+            loadout_changes: self.loadout_changes(),
             rounds: &self.rounds,
             stats: self.player_stats(),
         }

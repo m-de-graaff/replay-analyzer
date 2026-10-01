@@ -10,6 +10,7 @@ use std::fmt;
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
+pub use tables::{AttachmentInfo, attachment_info, item_kind, item_name};
 use tables::{MAPS, OPERATORS, PLAYLISTS, ROLE_IMAGES};
 
 /// Serializes as `{"name": ..., "id": ...}`.
@@ -204,6 +205,16 @@ impl TeamRole {
     }
 }
 
+/// The loadout slot an item id belongs in (Y11S3 HUD item ids).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ItemKind {
+    Primary,
+    Secondary,
+    Ability,
+    Gadget,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum WinCondition {
     KilledOpponents,
@@ -274,6 +285,16 @@ mod tests {
         let icon = |id| Operator::from_role_image(id).and_then(Operator::name);
         assert_eq!(icon(445433447900), Some("Dokkaebi"));
         assert_eq!(icon(104189663973), Some("Iana"));
+    }
+
+    #[test]
+    fn names_items_and_attachments() {
+        assert_eq!(item_name(1366019616), Some("MP7"));
+        assert_eq!(item_kind(1366019616), Some(ItemKind::Primary));
+        assert_eq!(item_name(1), None);
+        assert_eq!(attachment_info(238373620035).name, Some("Laser"));
+        assert!(attachment_info(238373621282).name.is_some());
+        assert_eq!(attachment_info(1), AttachmentInfo::default());
     }
 
     #[test]

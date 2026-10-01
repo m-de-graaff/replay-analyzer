@@ -2088,3 +2088,296 @@ fn real_cosmetics_and_platforms_stay_with_the_player() {
         }
     }
 }
+
+/// The loadout of `name` on the operator they spawned with.
+fn loadout_of<'a>(round: &'a Round, name: &str) -> &'a replay_analyzer::Loadout {
+    let i = round.player_index_by_username(name).unwrap();
+    let operator = round.header.players[i].operator;
+    let mut found = round
+        .loadouts
+        .iter()
+        .filter(|l| l.username == name && l.operator == operator);
+    let loadout = found.next().unwrap_or_else(|| panic!("{name}: no loadout"));
+    assert!(found.next().is_none(), "{name}: two loadouts on {operator}");
+    loadout
+}
+
+/// Loadouts of custom_1, checked against the bytes: the HUD objects of the
+/// state stream and the entity descriptors of the movement stream.
+#[test]
+fn y11s3_loadouts_carry_attachments_and_counts() {
+    use replay_analyzer::loadout::Ammo;
+    use replay_analyzer::{Phase, Status};
+    let Some(dir) = data_dir() else { return };
+    let Some(round) = y11s3(&dir, "custom_1.rec") else {
+        return;
+    };
+    let id = |a: &Option<replay_analyzer::loadout::Named>| a.map(|a| a.id);
+
+    // Fenrir: an MP7 with five attachments, four mines, one camera.
+    let l = loadout_of(&round, "WIZARD.L5");
+    assert_eq!(l.weapons, [1366019616, 1366019412]);
+    assert_eq!(l.gadgets, [396493597839, 243267468233]);
+    let w = l.primary.as_ref().unwrap();
+    assert_eq!((w.id, w.name), (Some(1366019616), Some("MP7")));
+    assert_eq!(w.asset, Some(393596493099));
+    assert_eq!(
+        [&w.sight, &w.barrel, &w.grip, &w.underbarrel, &w.magazine].map(id),
+        [
+            Some(258614298894),
+            Some(258614298875),
+            Some(238373621281),
+            Some(238373621282),
+            Some(238373621288)
+        ]
+    );
+    assert!(!w.shield);
+    let ammo = Ammo {
+        magazine_size: Some(30),
+        start: 181,
+        end: 151,
+        fired: 30,
+    };
+    assert_eq!(w.ammo, Some(ammo));
+    assert_eq!(l.secondary.as_ref().unwrap().asset, Some(398874672307));
+    let ability = l.ability.as_ref().unwrap();
+    assert_eq!(ability.id, Some(396493597839));
+    let c = ability.counts.as_ref().unwrap();
+    assert_eq!((c.start, c.end, c.max), (4, 1, Some(4)));
+    assert_eq!((c.used, c.gained, c.regenerates), (3, 0, false));
+    let left: Vec<u32> = c.uses.iter().map(|u| u.count).collect();
+    assert_eq!(left, [3, 2, 1]);
+    // Two mines went down in prep, one in action, on the round's timeline.
+    let phases: Vec<Phase> = c.uses.iter().map(|u| u.phase).collect();
+    assert_eq!(phases, [Phase::Prep, Phase::Prep, Phase::Action]);
+    for u in &c.uses {
+        let recorded = u.recording_time.unwrap();
+        assert!((recorded - u.elapsed).abs() < 2.0, "{u:?}");
+    }
+    let gadget = l.gadget.as_ref().unwrap();
+    assert_eq!(gadget.id, Some(243267468233));
+    let c = gadget.counts.as_ref().unwrap();
+    assert_eq!((c.start, c.end, c.used, c.uses.len()), (1, 0, 1, 1));
+
+    // Wamai's disks refill: six come back, seven are thrown.
+    let c = loadout_of(&round, "pino.L5").ability.as_ref().unwrap();
+    let c = c.counts.as_ref().unwrap();
+    assert!(c.regenerates && c.max.is_none());
+    assert_eq!((c.start, c.end, c.used, c.gained), (1, 0, 7, 6));
+    let left: Vec<u32> = c.uses.iter().map(|u| u.count).collect();
+    assert_eq!(left, [6, 5, 4, 3, 2, 1, 0]);
+
+    // Clash has no primary gun: the slot holds her shield.
+    let l = loadout_of(&round, "PSYCHO.L5");
+    let shield = l.primary.as_ref().unwrap();
+    assert!(shield.shield);
+    assert_eq!(shield.id, Some(419258819322));
+    assert!(shield.asset.is_none() && shield.sight.is_none() && shield.ammo.is_none());
+    assert_eq!(l.weapons, [139558932060]);
+    assert_eq!(l.gadgets, [419258819322, 133651070258]);
+    assert_eq!(l.secondary.as_ref().unwrap().asset, Some(238373640573));
+
+    // Grim's launcher sits in the ability slot as a weapon: its count is
+    // its ammunition.
+    let c = loadout_of(&round, "vitaking.FaZe")
+        .ability
+        .as_ref()
+        .unwrap();
+    assert_eq!(c.id, Some(374667788026));
+    let c = c.counts.as_ref().unwrap();
+    assert_eq!((c.start, c.end, c.used, c.max), (5, 0, 5, None));
+
+    // Blackbeard's shield is both his primary and his ability.
+    let l = loadout_of(&round, "kds.FaZe");
+    assert!(l.primary.as_ref().unwrap().shield);
+    assert_eq!(l.gadgets, [395972905309, 133651070436]);
+
+    let f = round.decode.get("loadouts").unwrap();
+    assert_eq!((f.status, f.count), (Status::Decoded, 10));
+    assert!(f.warnings.is_empty(), "{f:?}");
+
+    let json = serde_json::to_value(&round).unwrap();
+    let wizard = &json["loadouts"][0];
+    assert_eq!(wizard["username"], "WIZARD.L5");
+    assert_eq!(wizard["primary"]["sight"]["id"], 258614298894u64);
+    assert_eq!(wizard["primary"]["ammo"]["magazineSize"], 30);
+    assert_eq!(wizard["ability"]["uses"][0]["phase"], "Prep");
+    assert_eq!(wizard["ability"]["max"], 4);
+    // Unnamed attachments carry their id only; a shield has no asset.
+    assert!(wizard["primary"]["sight"].get("name").is_none());
+    assert_eq!(json["loadouts"][1]["primary"]["shield"], true);
+    assert!(json["loadouts"][1]["primary"].get("asset").is_none());
+}
+
+/// What holds for a loadout wherever it comes from. Returns whether a gun
+/// with its asset was found.
+fn check_loadout(l: &replay_analyzer::Loadout, context: &str) -> bool {
+    let mut gun = false;
+    for w in [&l.primary, &l.secondary].into_iter().flatten() {
+        if w.shield {
+            assert!(w.asset.is_none() && w.ammo.is_none(), "{context}: {w:?}");
+            continue;
+        }
+        gun |= w.asset.is_some_and(|a| a != 0);
+        if let Some(a) = &w.ammo {
+            assert!(a.start >= a.end, "{context}: {a:?}");
+            assert!(a.fired >= a.start - a.end, "{context}: {a:?}");
+        }
+    }
+    for c in [&l.ability, &l.gadget].into_iter().flatten() {
+        let Some(n) = &c.counts else { continue };
+        // Counts are unsigned, so none is negative; the drops and rises
+        // account for the whole change.
+        assert_eq!(
+            i64::from(n.start) - i64::from(n.used) + i64::from(n.gained),
+            i64::from(n.end),
+            "{context}: {c:?}"
+        );
+        assert!(n.uses.len() <= n.used as usize, "{context}: {c:?}");
+        assert!(n.uses.windows(2).all(|w| w[0].elapsed <= w[1].elapsed));
+        assert_ne!(n.max, Some(99), "{context}: {c:?}");
+    }
+    gun
+}
+
+/// Every player of every Y11S3 test round has a decoded loadout.
+#[test]
+fn y11s3_loadouts_hold_for_every_round() {
+    use replay_analyzer::Status;
+    let Some(dir) = data_dir() else { return };
+    for path in replays(&dir, "valid") {
+        let round = Round::open(&path, ReadMode::Full).unwrap();
+        if round.header.code_version < replay_analyzer::types::version::Y11S3 {
+            assert!(round.loadouts.iter().all(|l| l.primary.is_none()));
+            continue;
+        }
+        let f = round.decode.get("loadouts").unwrap();
+        assert_eq!((f.status, f.count), (Status::Decoded, 10), "{f:?}");
+        for p in &round.header.players {
+            let context = format!("{} {}", path.display(), p.username);
+            let l = loadout_of(&round, &p.username);
+            assert!(
+                check_loadout(l, &context),
+                "{context}: no gun with an asset"
+            );
+            // Guns in the test rounds are never refilled.
+            for w in [&l.primary, &l.secondary].into_iter().flatten() {
+                if !w.shield {
+                    let a = w
+                        .ammo
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{context}: no ammo"));
+                    assert_eq!(a.start - a.fired, a.end, "{context}");
+                    assert!(w.id.is_some() && w.linked, "{context}: {w:?}");
+                }
+            }
+            assert!(l.ability.is_some() && l.gadget.is_some(), "{context}");
+            // The id lists follow the slots.
+            let guns: Vec<u64> = [&l.primary, &l.secondary]
+                .into_iter()
+                .flatten()
+                .filter(|w| !w.shield)
+                .filter_map(|w| w.id)
+                .collect();
+            assert_eq!(l.weapons, guns, "{context}");
+        }
+        // A partial read stops before the HUD settles: no detail.
+        let partial = Round::open(&path, ReadMode::Partial).unwrap();
+        assert!(partial.loadouts.iter().all(|l| l.primary.is_none()));
+    }
+    // Striker has no ability: the slot holds the first of two gadgets, and
+    // the gadget slot the second.
+    if let Some(round) = y11s3(&dir, "custom_3.rec") {
+        let i = round.player_index_by_username("soulz1.FaZe").unwrap();
+        assert_eq!(round.header.players[i].operator.name(), Some("Striker"));
+        let l = loadout_of(&round, "soulz1.FaZe");
+        assert_eq!(l.ability.as_ref().unwrap().id, Some(133651070288));
+        assert_eq!(l.gadget.as_ref().unwrap().id, Some(133651070436));
+        assert_eq!(l.gadgets, [133651070288, 133651070436]);
+    }
+}
+
+/// A match folder lists what each player changed since their previous round
+/// on the same side.
+#[test]
+fn y11s3_loadout_changes_compare_rounds_on_the_same_side() {
+    let Some(dir) = data_dir() else { return };
+    let src = dir.join("valid/Y11S3");
+    if !src.is_dir() {
+        return;
+    }
+    let m = replay_analyzer::Match::open(&src).unwrap();
+    let changes = m.loadout_changes();
+    assert!(!changes.is_empty());
+    let side_of = |number: u32, name: &str| {
+        let r = &m.rounds[number as usize - 1];
+        let i = r.player_index_by_username(name).unwrap();
+        r.header.teams[r.header.players[i].team_index].role
+    };
+    for c in &changes {
+        assert!(c.previous_round < c.round && !c.changes.is_empty(), "{c:?}");
+        assert_eq!(side_of(c.round, &c.username), Some(c.side), "{c:?}");
+        assert_eq!(side_of(c.previous_round, &c.username), Some(c.side));
+    }
+    // Grim kept his guns in round 5 and took another gadget.
+    let c = changes
+        .iter()
+        .find(|c| c.username == "vitaking.FaZe" && c.round == 5)
+        .unwrap();
+    assert_eq!((c.previous_round, c.side), (4, TeamRole::Attack));
+    let json = serde_json::to_value(&c.changes).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([{
+            "field": "gadget",
+            "from": {"id": 263047965420u64, "name": "Hard Breach Charge"},
+            "to": {"id": 387197346354u64, "name": "Impact EMP Grenade"},
+        }])
+    );
+    let json = serde_json::to_value(&m).unwrap();
+    assert_eq!(
+        json["loadoutChanges"].as_array().unwrap().len(),
+        changes.len()
+    );
+}
+
+/// Real rounds: loadouts add up, and nearly every player of a finished file
+/// has a gun with its entity found.
+#[test]
+fn real_loadouts_add_up() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let (mut players, mut with_gun) = (0, 0);
+    for r in rounds {
+        let complete = r.container.as_ref().is_some_and(|c| c.complete);
+        if r.header.code_version < replay_analyzer::types::version::Y11S3 || !complete {
+            continue;
+        }
+        let name = r
+            .file
+            .as_ref()
+            .map(|f| f.file_name.clone())
+            .unwrap_or_default();
+        let f = r.decode.get("loadouts").unwrap();
+        assert!(f.count <= r.header.players.len(), "{name}: {f:?}");
+        for p in &r.header.players {
+            players += 1;
+            let context = format!("{name} {}", p.username);
+            let found = r
+                .loadouts
+                .iter()
+                .rfind(|l| l.username == p.username && l.operator == p.operator);
+            let Some(l) = found else { continue };
+            with_gun += usize::from(check_loadout(l, &context));
+            if l.primary.is_some() || l.secondary.is_some() {
+                assert!(!l.weapons.is_empty(), "{context}: {l:?}");
+            }
+        }
+    }
+    assert!(players > 0);
+    // Players who never spawned (a round that ended in prep, a player who
+    // left) have no body, so no gun entity.
+    assert!(with_gun * 20 >= players * 19, "{with_gun} of {players}");
+}

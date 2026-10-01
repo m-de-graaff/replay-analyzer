@@ -45,7 +45,7 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `players[].level` | The clearance level, from the round's opening snapshot (the game's property is `ClearanceLevelText`). Replays hold no rank, rank points or reputation; see [Limits](#limits-worth-knowing). | Y11S3+ |
 | `teams[].color` | The game's number for the team (`TeamColor`, 1 or 2), from its team object. Ban slots and `matchresult` name teams by it: in a player's own recording the player's team is always 1, whatever its index in the header. | Y11S3+ |
 | `matchFeedback[].weapon` | Id of the gun or gadget behind each kill. | Y8S1+ |
-| `loadouts` | Guns and gadgets per player, once per operator played, so attacker swaps get their own entry. Ids only: replays carry no item names. Kill `weapon` ids match these. | Y8S1+ |
+| `loadouts` | Guns and gadgets per player, once per operator played, so attacker swaps get their own entry: `weapons` and `gadgets` are item ids, and kill `weapon` ids match them. From Y11S3 the entry of the operator a player spawned with adds `primary` and `secondary` (name, attachments, ammunition) and `ability` and `gadget` (how many the player had, and when each was used). See [Loadouts](#loadouts). | Y8S1+ (detail Y11S3+) |
 | `health` | Every health change in the action phase, with the clock. | Y8S1+ |
 | `lifeEvents` | Downs (DBNO) and revives. | Y8S1+ |
 | `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
@@ -71,6 +71,8 @@ Each round also carries a `round` block with the round itself in one place:
 Every kill feed entry, health change, life event and observation session carries `phase` and `elapsed` (seconds since prep started), so everything sits on one timeline across the prep, action and defuser clocks. From Y8S4 they also carry `recordingTime`: seconds since the recording started, to the frame, taken from the frame record the packet sits in. Round phases carry `recordingStart` and `recordingEnd` the same way, and `timing.startedAt` turns either into UTC. In every test round a kill's `recordingTime` minus its `elapsed` stays within a second across the round, so the round clock and the recording agree; where the clock cannot say (a new timer taking over, the clock standing at `0:00` while a plant finishes) `elapsed` takes the whole seconds from the recording. `time` stays the in-game clock: whole seconds, counting down, restarting at the plant. Events the game logs after resetting the clock at round end keep the last live second, so the kill that ended a round at 0:12 reads `0:12`, not `0:00`.
 
 From Y11S3 each player has a defuser interaction object, hung off their controller, whose countdown runs from 7.000 towards 0; it starts a `DefuserPlantStart` or `DefuserDisableStart` with that player's name. The countdown does not decide anything: the game has completed a plant with 0.635 on it and abandoned one at 0.826. What does is `IsDefuserStarted` on the game-mode object, which turns 1 in the frame a plant completes (the clock switches to the defuser timer in that frame) and back to 0 when a disable completes. A plant that runs out after the round is decided leaves it at 0 and is not a plant. The round's end is `TimerState` 3 on the clock object, written in the frame the round is decided: when time ran out, or a plant was under way at `0:00`, that is up to several seconds after the clock's last reading.
+
+A match folder adds `loadoutChanges` (Y11S3+): per player, each round whose loadout differs from the player's previous round on the same side, as `username`, `round`, `previousRound`, `side` and `changes[]` of `{field, from, to}`. `field` is `operator`, `primary`, `secondary`, `gadget`, an attachment such as `primary.sight`, or `ability` for the operators who choose a gadget in that slot; `from` and `to` are `{id, name}` (null for an empty slot). Attachments are compared only on the same gun.
 
 A match folder adds `analytics`: per team attack and defense records, rounds started a player down, plants, disables and prep swaps (late ones counted apart); per site the defense win rate overall and per team; per attacker spawn and team the pick and round win rates; per operator and team rounds, win rate, kills, deaths, headshots and how often it was swapped to; and a count of rounds per end reason and winning side. `summary.rounds[]` also gains `winProbability`, `endReason` and `playersAtStart`.
 
@@ -154,6 +156,43 @@ As recorded in the 25 ranked and unranked matches of a real folder:
 - The 12-round custom test match bans two operators per team at the start of each half and a third in the half's fourth round.
 
 Per-player votes, the timing of the ban phase and the operator pick phase (hovers, lock order) are not recorded: the ban phase ends before the recording starts, and a file refers only to operators that were played or banned. `summary.bans` lists each ban once with the first round it applied to.
+
+## Loadouts
+
+From Y11S3, the `loadouts[]` entry of the operator a player spawned with carries the whole loadout. Entries of operators an attacker swapped away from keep `weapons` and `gadgets` only.
+
+| Key | What it holds |
+|---|---|
+| `primary`, `secondary` | `id` (the item id kill feed `weapon` ids use) with its `name`, the gun's `asset` id, and its attachments `sight`, `barrel`, `grip`, `underbarrel` and `magazine`, each `{id, name}` and absent when the gun has no such slot. An attachment whose name is worked out rather than read has `inferred: true`, and a sight has `magnified` when that is known (see below). `ammo` holds `magazineSize`, the rounds in the gun and in reserve at spawn (`start`) and at the end (`end`), and `fired`, every drop of that total added up. A shield operator's `primary` is the shield: `shield: true`, no asset, attachments or ammunition. |
+| `ability`, `gadget` | `id` and `name`, the count at spawn (`start`) and at the end (`end`), the most the slot holds (`max`), `used` and `gained` (every drop and every rise of the count added up, so `start - used + gained` is `end`), and `uses[]`: each drop with the `count` left after it and the `time`, `phase`, `elapsed` and `recordingTime` health changes carry. Abilities that refill over time have `regenerates: true` and no `max`. |
+
+`weapons` and `gadgets` of that entry are filled from the same slots: guns, primary first, then the ability and the gadget.
+
+Where the data lives:
+
+- **The HUD, in the `state` stream.** Each controller links a `PlayerLoadoutViewModel` with one field per slot: primary, secondary, ability, gadget and drone. A slot is a `WeaponViewModel`, whose `WeaponAmmoViewModel` carries `TotalAmmo` and `MagazineSize`, or a `GadgetViewModel` with `Ammo` and `MaxAmmo`, and links the item id. The field says what an item is, not its class: a shield sits in the primary field as a gadget, a launcher (Grim, Hibana) in the ability field as a weapon with its ammunition as the count, and Striker and Sentry carry a gadget in the ability field. An attacker's swap in prep links new slots, so the last link of each field counts. A gadget's count is set up before its owner spawns; the count in force when `MaxAmmo` first shows is the start.
+- **Entities, in the `movement` stream.** Each entity is created with a descriptor (`617385fe`) that lists its asset and its slots. A body's slots name the assets it carries; a gun's slots name its attachments. A body belongs to the player whose `playerid` ends one of its movement messages, which also links the recording player's own body. A gun belongs to the body whose slot holds its asset; when two players carry the same gun, the body id inside the gun's first movement messages tells them apart.
+
+Names come from a lookup table of 200 item ids, each matched to its name by which operators carry it.
+
+Attachment names come from a second table, built from 174 rounds (971 ids):
+
+- **Read from the file:** an id for which no attachment entity is ever created is an empty slot: no laser, no grip, a pistol's iron sights. An underbarrel that does have an entity is a laser. These names carry no `inferred`.
+- **Inferred:** every attachment entity can carry a skin, and a skin id is shared by every gun's copy of one attachment model, which groups per-gun ids into models. Within a gun's id block the barrels come in one order (suppressor, flash hider, compensator, muzzle brake, extended barrel), which names the barrel models; grips are named by which guns offer them. These carry `inferred: true`: 239 barrel ids, 54 grip ids (vertical or angled; the horizontal grip is not identified), 5 lasers.
+- **Sights:** only iron sights and one magnified model (`Magnified 2.5x`, inferred) have names. Which 1x sight is the red dot, holographic or reflex is not known, so most sights have an `id` and `magnified` (false for a model that also fits guns limited to 1x sights) and no name. Magazines have no names.
+
+No in-game check has confirmed an inferred name.
+
+What is and is not recorded:
+
+- **Attachment ids are options of one gun.** The same sight on two guns has two ids, and the file names none of them; the names above come from a table. Zoom is not written: it follows from the sight's id.
+- **Abilities without a count show no use.** Skopos's shells never show a `MaxAmmo`, so they have an `id` and nothing else. An attacker who never spawned (a round that ended in prep, or a player gone before action) has slots without counts and no body, so no attachments.
+- **A count dropping means used, not deployed.** The count is what the HUD shows, and anything that lowers it is a use; the file does not say whether the gadget ended up placed. A rise is counted in `gained`.
+- **Attackers' prep drones are not counted.** The drone slot is not read.
+- **Skins, charms, headgear and uniforms** sit in the same descriptors; `players[].cosmetics` carries them (see [Cosmetics](#cosmetics)).
+- **Only full reads decode this**, and only files the game finished writing: the HUD settles as the round goes on.
+
+Of 1,661 player-rounds in a real folder of 167 rounds, the 1,631 in finished files all have a loadout. Every gun has its attachments (1,577 primaries and 1,626 secondaries; 49 primaries are shields) except for 5 players who never spawned. 1,621 abilities and 1,626 gadgets have counts; the rest are Skopos's (5) and those 5 players'. `decodeStatus.loadouts` counts the players whose loadout was found and warns about each body or gun that could not be linked.
 
 ## Players and identity
 
@@ -308,4 +347,4 @@ Reproduce with `cargo build --release` and `R6_DISSECT=… REPLAY_TOOL=… bench
 
 `cargo test` checks the replays in `test_recordings/valid/` against facts known from the game, compares output against a `.rec.json` expectation where one sits next to a replay, and checks that everything in `test_recordings/invalid/` is rejected. It also re-packs a replay into the Y8S4+ chunked layout to cover that path. Set `R6_TEST_DATA` to test against another folder. Replay tests are skipped when the data is missing.
 
-Set `R6_MATCH_REPLAY` to a game `MatchReplay` folder to also check real match folders: file and folder names agree with the headers, every round lands in one session, and nothing is found twice. The folder changes as matches are played, so these tests check what holds for any such folder.
+Set `R6_MATCH_REPLAY` to a game `MatchReplay` folder to also check real match folders: file and folder names agree with the headers, every round lands in one session, nothing is found twice, and loadout counts add up. The folder changes as matches are played, so these tests check what holds for any such folder.

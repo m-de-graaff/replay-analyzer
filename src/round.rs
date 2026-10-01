@@ -619,6 +619,9 @@ struct Parser<'a> {
     records: Option<RecordMap>,
     /// Seconds since the recording started, per frame.
     frame_times: Vec<f64>,
+    /// Y11S3: how many players' loadouts were resolved, with what was not
+    /// found, for `decodeStatus.loadouts`.
+    loadout_status: Option<crate::loadout::Decoded>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -710,6 +713,7 @@ impl<'a> Parser<'a> {
             reading_offsets: Vec::new(),
             records: None,
             frame_times: Vec::new(),
+            loadout_status: None,
         }
     }
 
@@ -787,6 +791,7 @@ impl<'a> Parser<'a> {
         self.name_defuser_players();
         self.link_feed_profiles();
         if mode == ReadMode::Full {
+            self.resolve_loadouts();
             self.round_end();
         }
         self.measure_records();
@@ -1081,6 +1086,24 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        // Y11S3: loadouts count the players whose HUD loadout was found.
+        if let (Some(l), Some(f)) = (&self.loadout_status, r.get_mut("loadouts")) {
+            f.count = l.resolved;
+            if l.resolved < l.expected {
+                f.status = if l.resolved == 0 {
+                    Status::Missing
+                } else {
+                    Status::Partial
+                };
+                f.warn(format!(
+                    "{} of {} players' loadouts resolved",
+                    l.resolved, l.expected
+                ));
+            }
+            for w in &l.warnings {
+                f.warn(w.clone());
+            }
+        }
         // A slot that could not be read, or slots and icons that disagree,
         // may mean a ban is missing or misplaced.
         if let Some(f) = r.get_mut("bans") {
@@ -2402,10 +2425,9 @@ impl<'a> Parser<'a> {
             return;
         }
         self.round.loadouts.push(Loadout {
-            username: username.to_owned(),
-            operator,
             weapons: weapons.iter().map(|i| i.id).collect(),
             gadgets: gadgets.iter().map(|i| i.id).collect(),
+            ..Loadout::new(username, operator)
         });
     }
 
@@ -2470,6 +2492,32 @@ impl<'a> Parser<'a> {
 
     fn recording_time(&self, offset: usize) -> Option<f64> {
         recording_time(self.records.as_ref(), &self.frame_times, offset)
+    }
+
+    /// Y11S3: each player's guns with attachments and ammunition, and their
+    /// ability and gadget counts, from the HUD objects of the state stream
+    /// and the entities of the movement stream (see [`crate::loadout`]).
+    /// The HUD ends on the operator a player spawned with, so only a full
+    /// read has it.
+    fn resolve_loadouts(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let players = &self.round.header.players;
+        let mut decoded =
+            crate::loadout::decode(self.data, map, &container.streams, players, &clock);
+        for (i, detail) in std::mem::take(&mut decoded.details) {
+            crate::loadout::apply(&mut self.round.loadouts, &players[i], detail);
+        }
+        self.loadout_status = Some(decoded);
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes

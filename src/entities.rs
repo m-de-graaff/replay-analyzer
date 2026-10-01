@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use aho_corasick::AhoCorasick;
 
 /// A property hash as it appears in the stream.
-type Hash = [u8; 4];
+pub(crate) type Hash = [u8; 4];
 
 const PLAYER_ID: Hash = [0xEE, 0xD4, 0x45, 0xC8];
 const NAME: Hash = [0x07, 0x94, 0x9B, 0xDC];
@@ -147,7 +147,7 @@ impl<'a> Tree<'a> {
     }
 }
 
-fn u32_at(d: &[u8], i: usize) -> Option<u32> {
+pub(crate) fn u32_at(d: &[u8], i: usize) -> Option<u32> {
     Some(u32::from_le_bytes(d.get(i..i + 4)?.try_into().ok()?))
 }
 
@@ -159,7 +159,7 @@ fn zero4(d: &[u8], i: usize) -> bool {
     d.get(i..i + 4) == Some(&[0; 4])
 }
 
-enum Record {
+pub(crate) enum Record {
     /// `23`: object, hash, value range.
     Set(u32, Hash, usize, usize),
     /// `22` or `26`: hash, value range.
@@ -178,7 +178,7 @@ enum Record {
 const MAX_INDEX: u32 = 1 << 16;
 
 /// The record at `i` and where the next one starts.
-fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
+pub(crate) fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
     let index_ok = |at: usize| u32_at(d, at).is_some_and(|x| x < MAX_INDEX);
     let value = |at: usize| -> Option<(usize, usize, usize)> {
         let size = *d.get(at)? as usize;
@@ -216,14 +216,10 @@ fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
     }
 }
 
-/// Reads the records in `data`. Between runs of records sit binary blocks;
-/// a run counts when it has two records or starts by naming its object.
-fn tree(data: &[u8]) -> Tree<'_> {
-    let mut t = Tree {
-        data,
-        objects: HashMap::new(),
-    };
-    let mut current: Option<u32> = None;
+/// Calls `visit` with the offset of every record in `data`, in order.
+/// Between runs of records sit binary blocks; a run counts when it has two
+/// records or starts by naming its object.
+pub(crate) fn for_each_record(data: &[u8], mut visit: impl FnMut(usize, Record)) {
     let mut i = 0;
     while i < data.len() {
         let Some((first, mut next)) = record(data, i) else {
@@ -246,46 +242,56 @@ fn tree(data: &[u8]) -> Tree<'_> {
             continue;
         }
         for (at, r) in run {
-            match r {
-                Record::Set(obj, hash, from, to) => {
-                    current = Some(obj);
-                    add_prop(&mut t, obj, hash, from, to);
-                }
-                Record::Prop(hash, from, to) => {
-                    if let Some(obj) = current {
-                        add_prop(&mut t, obj, hash, from, to);
-                    }
-                }
-                Record::ParentChild(parent, field, child) => {
-                    current = Some(parent);
-                    if child != 0 {
-                        t.objects
-                            .entry(parent)
-                            .or_default()
-                            .children
-                            .push((field, child));
-                    }
-                }
-                Record::Child(field, child) => {
-                    if let (Some(parent), true) = (current, child != 0) {
-                        t.objects
-                            .entry(parent)
-                            .or_default()
-                            .children
-                            .push((field, child));
-                    }
-                }
-                Record::Element(field, index, child) => {
-                    if let (Some(parent), true) = (current, child != 0) {
-                        let o = t.objects.entry(parent).or_default();
-                        o.children.push((field, child));
-                        o.elements.push((field, index, child, at));
-                    }
-                }
-            }
+            visit(at, r);
         }
         i = next;
     }
+}
+
+/// Reads the records in `data` into a tree.
+fn tree(data: &[u8]) -> Tree<'_> {
+    let mut t = Tree {
+        data,
+        objects: HashMap::new(),
+    };
+    let mut current: Option<u32> = None;
+    for_each_record(data, |at, r| match r {
+        Record::Set(obj, hash, from, to) => {
+            current = Some(obj);
+            add_prop(&mut t, obj, hash, from, to);
+        }
+        Record::Prop(hash, from, to) => {
+            if let Some(obj) = current {
+                add_prop(&mut t, obj, hash, from, to);
+            }
+        }
+        Record::ParentChild(parent, field, child) => {
+            current = Some(parent);
+            if child != 0 {
+                t.objects
+                    .entry(parent)
+                    .or_default()
+                    .children
+                    .push((field, child));
+            }
+        }
+        Record::Child(field, child) => {
+            if let (Some(parent), true) = (current, child != 0) {
+                t.objects
+                    .entry(parent)
+                    .or_default()
+                    .children
+                    .push((field, child));
+            }
+        }
+        Record::Element(field, index, child) => {
+            if let (Some(parent), true) = (current, child != 0) {
+                let o = t.objects.entry(parent).or_default();
+                o.children.push((field, child));
+                o.elements.push((field, index, child, at));
+            }
+        }
+    });
     t
 }
 

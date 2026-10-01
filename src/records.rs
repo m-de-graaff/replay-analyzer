@@ -141,6 +141,20 @@ impl RecordMap {
         }
     }
 
+    /// Index into `streams` of the stream with this name hash.
+    pub fn stream_index(&self, name_hash: [u8; 4]) -> Option<usize> {
+        self.streams.iter().position(|s| s.name_hash == name_hash)
+    }
+
+    /// `(frame, start, end)` of every record of the stream at `stream`
+    /// (index into `streams`), in frame order.
+    pub fn records_of(&self, stream: usize) -> impl Iterator<Item = (u32, usize, usize)> + '_ {
+        self.spans
+            .iter()
+            .filter(move |s| s.stream as usize == stream)
+            .map(|s| (s.frame, s.start, s.end))
+    }
+
     /// The snapshot or record holding `offset`. `None` in the main stream's
     /// headers.
     pub fn locate(&self, offset: usize) -> Option<Located> {

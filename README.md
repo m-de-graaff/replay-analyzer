@@ -8,6 +8,7 @@ replay-analyzer Match-2024-05-04/ -o match.json   # every round in a match folde
 replay-analyzer R01.rec --info          # short header summary
 replay-analyzer R01.rec --partial       # header and players only (faster)
 replay-analyzer R01.rec --census        # also count every packet and field seen
+replay-analyzer R01.rec --movement      # also every player's position, view and posture at every update
 replay-analyzer MatchReplay/ --list     # every match folder, game session, unfinished or unsaved round, copy and leftover
 replay-analyzer MatchReplay/ --players  # every player across matches: name history, you, queue-mates
 replay-analyzer --decoders              # decoder profiles and tested builds, to find rounds worth re-parsing
@@ -60,6 +61,8 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`. | Y8S1+ (detail Y11S3+) |
 | `weaponActivity`, `shots`, `bulletHits`, `throws`, `meleeHits`, `shieldActions` | What players held, fired, reloaded, threw and struck. See [Weapons and shooting](#weapons-and-shooting). | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
+| `activity` | Who carried the defuser, plants and disables with their outcome, what each player held, reloads and ability signals. See [Activity](#activity). | Y11S3+ |
+| `movement` | With `--movement`: position, view direction, stance, lean, aiming, gait, rappel, falls, what each player looked through and what they placed. See [Movement](#movement). | Y11S3+ |
 
 Each round also carries a `round` block with the round itself in one place:
 
@@ -471,6 +474,88 @@ What the list does not hold:
 `friendlyFire[]` lists each player whose reverse friendly fire was on in the round: `activeAtStart` when it carried over from an earlier round, and `on` and `off` with their times. It is the game's own flag (`IsReverseFriendlyFireActive`). It turned on for the killer after all 12 team kills in the real folder, and 5 times with no kill, after damage to a teammate. Team damage itself is only in `hits`, where `teamDamage` counts the hits a teammate is named for.
 
 `decodeStatus` adds `combat` (hits read) and `vitals` (players with a maximum health).
+
+## Movement
+
+`--movement` adds a `movement` block (Y11S3+, full reads): where every player is, where they look and what their body is doing, at every update the game recorded. It is left out by default because it is large, about 3 MB of JSON a round. The library equivalent is `ReadOptions { movement: true, .. }` and `Round::movement`.
+
+`movement.players[]` holds one track per player. A track starts when the game shows the body (defenders at the start, attackers as prep ends) and ends with the first sample of the dead body.
+
+| Key | What it holds | How |
+|---|---|---|
+| `time` | Seconds since the recording started, one per sample: the `recordingTime` every other event carries, so kills, health and phases line up with it. | Decoded |
+| `x`, `y`, `z` | Metres, in the map's coordinates, at the player's feet; `z` is the height. | Decoded |
+| `yaw`, `pitch` | Where the player looks, in degrees. Yaw 0 looks along +y and 90 along -x; pitch is positive upwards. | Decoded |
+| `speed` | Metres a second over the ground, from the positions of the last quarter second. | Derived |
+| `stance` | `standing`, `crouched` or `prone`. | Decoded |
+| `aiming` | Whether the player aims down sights. | Decoded |
+| `gait` | `still`, `creeping`, `walking`, `running`, `sprinting`, or `animated` while an animation moves the body. | Decoded |
+| `doing` | `nothing`, `vaulting`, `onDrone`, `downed`, `dead`, `rappelling`, `reviving` (both the player revived and the one reviving) and `interacting` (the 8 seconds of a defuser disable, and half-second stretches whose cause is not known). | Decoded; `reviving` and `interacting` seen on few events |
+| `deploying` | Whether the hands are putting something in place: a reinforcement, a barricade, a gadget. | Inferred |
+| `airborne`, `falls` | Whether the player is in the air, and each stretch in the air that ended a metre or more lower, with the `drop`. A hatch or a window is a drop of a storey; the file does not say which it was. | Decoded, derived |
+| `rope`, `inverted` | On a rope: `attaching`, `mounting`, `hanging`, `moving`, `stopping`, `running` (fast travel: down, or along the wall and round corners), `flipping`, `entering` (through a window), `entryAborted`, `leaving`; `off` otherwise. `inverted` is whether the player hangs head down. | Order decoded, names inferred |
+| `lean` | `left`, `right` or `none`. | Inferred, unchecked |
+
+`time` to `speed` are columns: element `i` of each belongs to sample `i`. The others are lists of `{time, value}`, a value holding from its `time` until the next entry, so a state costs nothing while it does not change. A value the tables do not know reads `{"other": n}`.
+
+`movement.views[]` lists what each player looked through when not their own eyes: `username`, `kind` (`drone`, `camera`, or `teammate` for a dead player following one), the `device` id, its `owner`, `fixed` for a camera of the map, a camera's `position`, and `start` and `end`. One entry per device, where `observation` merges a run of cameras into one session.
+
+`movement.placements[]` lists what players put in place: `kind` (`reinforcement`, `barricade`, `gadget`), who, the `asset` and `object` ids, the `position`, the `time` the placing started and the `end`, when the player's hands were done with it. A reinforcement takes 4.5 seconds and a barricade 2.9; one that ends sooner was given up.
+
+Where the data lives:
+
+- **The movement stream** holds one message per object and update. A message starts with a byte of flags, one for the transform and one for each class the object was created with, and the sections follow without lengths, so a body reads only because all five of its sections are understood. The layout is at the top of `src/movement.rs`. Every field is sent only when it changes; a sample carries the last value forward.
+- **No message has a time.** A sample belongs to the frame of its record, and the frame index gives the seconds. A body has at most one message per record: about 28 samples a second, 35 ms apart, in a spectator's recording and in a player's own alike, whatever the frame rate of the index.
+- **Posture is one block.** Each body sends a 722-byte block of its character's state with nearly every update. Stance, aiming, gait and the rest are numbers at fixed offsets in it (listed at `State` in `src/movement.rs`).
+- **Drones and placed things name their player** in a section of their own, which is how a drone gets its owner and a reinforcement the player who put it up.
+
+How it was checked, on the ten test rounds:
+
+- Every update of every body reads to its last byte (about 630,000 messages with four real recordings added), and each track starts at the body's `spawnPosition`. No two samples of a track are more than 2 metres apart.
+- At a kill the killer's yaw points at the victim within 10 degrees in over nine of ten kills; the rest are gadget kills and flicks. More than four of five killers were aiming a quarter second before.
+- A victim's track ends within a second of the kill, and a downed player reads `downed` at the down.
+- Standing players are faster than crouched ones, and those faster than prone ones. Only attackers rappel; only defenders reinforce, and nine of ten reinforcements take the 4.5 seconds.
+- Every view session resolves to a device and, unless it is a camera of the map, to its owner. That held for 1,665 sessions in 18 real rounds too.
+
+What is not there, or not known:
+
+- **No room names.** The game's callout ("2F Aviator Room") is not recorded for players: every per-player property, every text in the file and every record type of the state stream were searched in 31 rounds. Room text exists only for two abilities, the room of each of Fenrir's mines and of each enemy Solid Snake's radar marks. A player's room has to come from their position and a table per map.
+- **No floor.** `z` is the height; which floor that is needs the map's floor heights from outside the file.
+- **Lean is unchecked.** The value sits next to the stance, takes three values, flips from side to side directly and clears on a sprint, but it is set far more than expected (four tenths of all samples in the test match) and nothing in the file tells a lean from a side the weapon is held to. Compare it with a moment you know before relying on it; `decodeStatus.lean` says `inferred`.
+- **Planting is not a `doing` value.** It shows as `deploying`; who planted and when is in `activity.interactions`.
+- **Thrown gadgets have no placement.** Grenades, launchers and thrown devices name no player in the movement stream; the loadout's `uses[]` gives the time.
+- **Rope names are read from movement.** The values come in the same order on every rope checked; calling one a flip or an entry is a reading of how the body moves during it.
+
+## Activity
+
+From Y11S3 a full read adds `activity`: what the HUD objects of the state stream say each player did. Every entry names the player and carries seconds since the recording started, like `recordingTime`.
+
+| Key | What it holds | How |
+|---|---|---|
+| `defuser[]` | Each stretch a player carried the defuser: `username`, `start`, and `end` unless they still had it when the file ended. It ends at a plant, at the carrier's death or down, or when it is dropped; compare `end` with the kill feed and `interactions` to tell which. | Decoded (`HasDefuser`) |
+| `interactions[]` | Each plant or disable: `username`, `kind`, `start`, `end` and `outcome`: `Completed`, `Aborted` (given up, or the player died) or `Unfinished` (the round was decided first). | Decoded (`DefuserInteractionType`, `IsDefuserStarted`) |
+| `equipped[]` | Each change of what a player holds: `Nothing`, `Drone`, `Primary`, `Secondary`, `Ability` or `Gadget`. `Nothing` is a player busy with their hands: placing, reinforcing, planting, between two weapons. | Decoded (`EquippedWeaponType`) |
+| `reloads[]` | Each reload starting and ending, per weapon. | Decoded (`IsReloading`) |
+| `ability[]` | Each change of a signal on the ability or gadget slot: `slot`, `signal` and `value`. See below. | Mostly inferred |
+| `reinforcementPool[]` | The reinforcements a defending team has left. It drops when a player starts one and rises when one is given up; `movement.placements` says who. | Decoded |
+
+Ability signals:
+
+| `signal` | Meaning | |
+|---|---|---|
+| `Equipped` | The item is in hand, or a toggled ability is running: for Vigil it is 1 exactly while the cloak drains. | Checked on Vigil and Thermite |
+| `Cooldown` | 2 while the ability cools down. | Checked |
+| `Active` | A placed device is armed and waiting. | Inferred |
+| `GaugeState` | For abilities with a gauge (Vigil, Caveira, Nøkk, Warden, Clash, Solis): 0 idle, 1 draining, 2 locked after use, 3 refilling. | Inferred |
+| `Extended` | Montagne's shield is extended. | By name |
+| `ShieldEquipped` | Blackbeard's shield is up. | By name |
+| `DeviceState`, `Tracking`, `Activating`, `ScreenActive`, `CallState` | Solis, Deimos, Thatcher and Dokkaebi: the game's own property names, values as written. | By name |
+
+"By name" means the property's hash is the CRC-32 of that name and it changes while the operator uses the ability; the values were not checked against the game. Operators not listed show their ability only as `Equipped` and as the count dropping in `loadouts[].ability.uses`. No property says that Glaz's scope or IQ's scanner is on, or that Jackal or Lion is scanning.
+
+Checked on the ten test rounds and 167 real ones: only attackers carry the defuser and never two at once, every plant starts with the carrier, and every plant or disable the kill feed completes has a `Completed` interaction by the same player.
+
+Not recorded: what a player interacts with beyond the defuser. No per-player property names an interaction or its progress. Reinforcing, barricading and placing come from the movement stream (`movement.placements`, `deploying`); a revive shows as `doing: reviving` on both players, and the state stream names no reviver.
 
 ## Players and identity
 

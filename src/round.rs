@@ -8,6 +8,7 @@ use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::activity::Activity;
 use crate::census::{self, Census, PacketCount};
 use crate::container::{self, Container, DirectoryState};
 use crate::cursor::Cursor;
@@ -22,6 +23,7 @@ use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
 use crate::format::{self, ClockGap, FormatInfo, GameVersion, Hole, Layout, Timing};
 use crate::header::{Header, Player};
+use crate::movement::Movement;
 use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
 use crate::records::RecordMap;
 use crate::report::{DecodeReport, Status};
@@ -88,6 +90,12 @@ pub struct Round {
     /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
     /// every hit a player took (see [`crate::combat`]).
     pub combat: Option<crate::combat::Combat>,
+    /// Y11S3: who carried the defuser, plants and disables, what each
+    /// player held and what their abilities did (full reads).
+    pub activity: Option<Activity>,
+    /// Y11S3: every player's position, view and state at every update
+    /// (only with `ReadOptions::movement`).
+    pub movement: Option<Movement>,
 }
 
 /// How far apart, in seconds, the timeline's entry for a kill, down or
@@ -148,6 +156,8 @@ pub struct ReadOptions {
     pub mode: ReadMode,
     /// Also count every packet marker and property hash in the stream.
     pub census: bool,
+    /// Also read every player's movement (full reads, Y11S3+).
+    pub movement: bool,
 }
 
 impl From<ReadMode> for ReadOptions {
@@ -155,6 +165,7 @@ impl From<ReadMode> for ReadOptions {
         ReadOptions {
             mode,
             census: false,
+            movement: false,
         }
     }
 }
@@ -293,6 +304,10 @@ impl Serialize for Round {
             timing: Option<&'a Timing>,
             #[serde(skip_serializing_if = "Option::is_none")]
             census: Option<&'a Census>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            activity: Option<&'a Activity>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            movement: Option<&'a Movement>,
         }
         let vitals = self.vitals.as_ref();
         Output {
@@ -323,6 +338,8 @@ impl Serialize for Round {
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
             census: self.census.as_ref(),
+            activity: self.activity.as_ref(),
+            movement: self.movement.as_ref(),
         }
         .serialize(s)
     }
@@ -861,6 +878,10 @@ impl<'a> Parser<'a> {
             self.resolve_vitals();
             self.join_combat();
             self.round_end();
+            self.resolve_activity();
+            if options.movement {
+                self.resolve_movement();
+            }
         }
         self.measure_records();
         if options.census {
@@ -1328,6 +1349,42 @@ impl<'a> Parser<'a> {
                         "{others} players in the player table are not in the header's player list: they joined after it was written, or were not part of the round"
                     ));
                 }
+            }
+            if let Some(a) = &round.activity {
+                r.field("defuserCarrier", Status::Decoded, a.defuser.len());
+                r.field("defuserInteractions", Status::Decoded, a.interactions.len());
+                r.field("equipped", Status::Decoded, a.equipped.len());
+                // What most ability values mean is read from a few
+                // operators' behaviour.
+                r.field("ability", Status::Inferred, a.ability.len());
+            }
+            if let Some(m) = &round.movement {
+                let tracked = m.players.iter().filter(|t| !t.time.is_empty()).count();
+                let samples: usize = m.players.iter().map(|t| t.time.len()).sum();
+                let unread: usize = m.players.iter().map(|t| t.unread).sum();
+                let f = r.field("tracks", Status::Decoded, tracked);
+                if unread > 0 {
+                    f.warn(format!(
+                        "{unread} updates of players' bodies could not be read, next to {samples} that could"
+                    ));
+                }
+                // One in a hundred lost leaves holes worth knowing about.
+                if unread * 100 > samples {
+                    f.at_most(Status::Partial);
+                }
+                // The side a player leans to is read from how the value
+                // behaves; no round has been checked against the game.
+                let leaning = m.players.iter().filter(|t| t.lean.len() > 1).count();
+                r.field("lean", Status::Inferred, leaning);
+                let f = r.field("views", Status::Decoded, m.views.len());
+                let ownerless = m.views.iter().filter(|v| !v.fixed && v.owner.is_none());
+                let ownerless = ownerless.count();
+                if ownerless > 0 {
+                    f.warn(format!(
+                        "{ownerless} sessions are on a device whose owner could not be found"
+                    ));
+                }
+                r.field("placements", Status::Decoded, m.placements.len());
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
@@ -2791,6 +2848,48 @@ impl<'a> Parser<'a> {
                 _ => DownOutcome::DownAtEnd,
             });
         }
+    }
+
+    /// Y11S3: what the state stream says each player did (see
+    /// [`crate::activity`]).
+    fn resolve_activity(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let players = &self.round.header.players;
+        let activity = crate::activity::decode(
+            self.data,
+            map,
+            &container.streams,
+            players,
+            &self.frame_times,
+        );
+        self.round.activity = Some(activity);
+    }
+
+    /// Y11S3: every player's track, from the movement stream (see
+    /// [`crate::movement`]).
+    fn resolve_movement(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let data = self.data;
+        let blocks =
+            crate::loadout::blocks(map, &container.streams, crate::loadout::MOVEMENT_STREAM)
+                .filter_map(|(start, end, frame)| Some((data.get(start..end)?, frame)));
+        let movement = crate::movement::decode(
+            blocks,
+            &self.round.header.players,
+            &self.player_tables.views,
+            &self.frame_times,
+        );
+        self.round.movement = Some(movement);
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes

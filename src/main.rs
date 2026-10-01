@@ -32,6 +32,11 @@ struct Cli {
     /// not.
     #[arg(long)]
     census: bool,
+
+    /// Add every player's position, view direction and state at every
+    /// update (Y11S3+). Large: about 28 samples a second per player.
+    #[arg(long)]
+    movement: bool,
     /// List the match folders under a folder (headers only, fast): rounds,
     /// missing and unfinished rounds, game sessions, duplicates, leftover
     /// temporary recordings, versions and file hashes.
@@ -76,6 +81,7 @@ fn main() -> Result<()> {
             ReadMode::Full
         },
         census: cli.census,
+        movement: cli.movement,
     };
 
     if cli.decoders {

@@ -535,11 +535,30 @@ pub struct Possession {
     pub view: Option<u32>,
 }
 
+/// A player starting to look through something, or going back to their own
+/// eyes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewChange {
+    pub player_id: u64,
+    /// Frame of the table's record; `None` for the opening table.
+    pub frame: Option<u32>,
+    /// The object looked through; 0 for the player's own eyes. Fixed map
+    /// cameras have ids longer than 32 bits.
+    pub view: u64,
+    /// The kind in force: 0 own eyes, 1 camera, 2 the view of a teammate
+    /// the dead player follows, 4 drone. Sent only when it changes.
+    pub kind: u8,
+}
+
 /// What a round's player tables say.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PlayerTables {
     /// Each body or view a player was given, in stream order.
     pub changes: Vec<Possession>,
+    /// Each change of what a player looks through, in stream order.
+    pub views: Vec<ViewChange>,
+    /// The kind of view each player last had.
+    pub(crate) kinds: HashMap<u64, u8>,
     /// Tables read.
     pub tables: usize,
     /// Records of the table stream that did not read as a table.
@@ -564,6 +583,17 @@ impl PlayerTables {
         for e in entries {
             if !self.players.contains(&e.player_id) {
                 self.players.push(e.player_id);
+            }
+            if let Some(kind) = e.kind {
+                self.kinds.insert(e.player_id, kind);
+            }
+            if let Some(view) = e.view {
+                self.views.push(ViewChange {
+                    player_id: e.player_id,
+                    frame,
+                    view,
+                    kind: self.kinds.get(&e.player_id).copied().unwrap_or(0),
+                });
             }
             let (body, view) = (e.body.and_then(object), e.view.and_then(object));
             if body.is_some() || view.is_some() {
@@ -627,6 +657,8 @@ struct TableEntry {
     body: Option<u64>,
     /// The view reference, when the entry sets it; 0 for none.
     view: Option<u64>,
+    /// The kind of the view, when the entry sets it (see [`ViewChange`]).
+    kind: Option<u8>,
 }
 
 /// Mask bits that each add one byte to an entry. `08` and `10` come with
@@ -673,11 +705,13 @@ fn table_entry(d: &[u8]) -> Option<(TableEntry, &[u8])> {
     {
         return None;
     }
-    take((mask & ENTRY_BYTES).count_ones() as usize)?;
+    // One byte per bit, in bit order; the last is the kind of the view.
+    let bytes = take((mask & ENTRY_BYTES).count_ones() as usize)?;
     let mut entry = TableEntry {
         player_id,
         body: None,
         view: None,
+        kind: bytes.last().copied().filter(|_| mask & 0x80 != 0),
     };
     if flags & VIEW_SET != 0 {
         entry.view = u64_of(take(8)?);

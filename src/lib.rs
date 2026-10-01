@@ -8,6 +8,7 @@
 //! # Ok::<(), replay_analyzer::Error>(())
 //! ```
 
+pub mod activity;
 pub mod analytics;
 pub mod census;
 pub mod combat;
@@ -28,6 +29,7 @@ pub mod library;
 pub mod loadout;
 pub mod matches;
 pub mod melee;
+pub mod movement;
 pub mod outcome;
 pub mod records;
 pub mod report;

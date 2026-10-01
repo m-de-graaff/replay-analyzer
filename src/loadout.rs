@@ -93,7 +93,7 @@ const ITEM_ID: Hash = [0x0E, 0x9E, 0xBE, 0x88];
 const REGENERATES: u32 = 99;
 
 /// Movement payload types: an entity's descriptor, and its updates.
-const DESCRIPTOR: Hash = [0x61, 0x73, 0x85, 0xFE];
+pub(crate) const DESCRIPTOR: Hash = [0x61, 0x73, 0x85, 0xFE];
 pub(crate) const UPDATE: Hash = [0x60, 0x73, 0x85, 0xFE];
 /// Body slots that hold a gun's asset.
 pub(crate) const PRIMARY_WEAPON: Hash = [0x64, 0xDC, 0xCF, 0xC2];
@@ -468,6 +468,9 @@ pub(crate) fn distinct(samples: impl Iterator<Item = Sample>) -> Vec<Sample> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Descriptor {
     pub entity: u64,
+    /// The classes of the entity's components, in the order its updates
+    /// write them.
+    pub classes: Vec<Hash>,
     pub asset: u64,
     /// `(slot, item)`; an item of 0 is an empty slot.
     pub slots: Vec<(Hash, u64)>,
@@ -511,6 +514,9 @@ pub(crate) fn descriptor(payload: &[u8]) -> Option<Descriptor> {
     if hashes > MAX_HASHES {
         return None;
     }
+    let classes = (0..hashes)
+        .map(|i| payload.get(57 + 4 * i..61 + 4 * i)?.try_into().ok())
+        .collect::<Option<Vec<Hash>>>()?;
     let mut at = 57 + 4 * hashes;
     let asset = u64_at(at)?;
     let count = u32_at(at + 12)? as usize;
@@ -527,6 +533,7 @@ pub(crate) fn descriptor(payload: &[u8]) -> Option<Descriptor> {
         .collect::<Option<Vec<_>>>()?;
     Some(Descriptor {
         entity: u64_at(4)?,
+        classes,
         asset,
         slots,
     })
@@ -945,6 +952,26 @@ pub(crate) fn blocks(
         .flat_map(|i| map.records_of(i))
         .map(|(frame, start, end)| (start, end, Some(frame)));
     snapshot.into_iter().chain(records)
+}
+
+/// The item ids the HUD names in each player's ability and gadget slots, in
+/// the order of the players. They are the ids `loadouts` gives the two.
+pub(crate) fn hud_items(input: &Input) -> Vec<[Option<u64>; 2]> {
+    let mut hud = Hud::default();
+    for (start, end, frame) in input.blocks(STATE_STREAM) {
+        if let Some(block) = input.data.get(start..end) {
+            hud.read(block, start, frame);
+        }
+    }
+    (input.players.iter())
+        .map(|p| {
+            let view = p.entities.as_ref().and_then(|e| hud.view(e.controller));
+            [ABILITY_FIELD, GADGET_FIELD].map(|field| {
+                let (slot, _) = hud.slot_object(view?, field)?;
+                hud.item(slot)
+            })
+        })
+        .collect()
 }
 
 /// Reads every player's loadout from the state and movement streams.

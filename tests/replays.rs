@@ -914,6 +914,25 @@ fn a_real_library_accounts_for_every_round() {
     }
 }
 
+/// Fails when the game adds a map or gives one a new world id: name it in
+/// `MAPS`, from its sites and spawns.
+#[test]
+fn real_maps_have_names() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let lib = replay_analyzer::library::scan(&root, ReadMode::Header).unwrap();
+    let unnamed: Vec<_> = lib
+        .folders
+        .iter()
+        .filter_map(|f| f.summary.as_ref())
+        .filter(|s| s.map.base.is_none())
+        .map(|s| s.map.id)
+        .collect();
+    assert!(unnamed.is_empty(), "unnamed map ids: {unnamed:?}");
+}
+
 #[test]
 fn temporary_recordings_are_refused() {
     let dir = std::env::temp_dir().join(format!("ra-tmprec-{}", std::process::id()));

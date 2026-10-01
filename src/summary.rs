@@ -56,7 +56,8 @@ pub struct MatchSummary {
 }
 
 /// A map, keyed by id: reworked maps get new ids (`Bank` vs `BankY10`), so
-/// floor plans and callouts should be looked up by `id`, not by `base`.
+/// floor plans and callouts should be looked up by `id`, not by `base`. A
+/// new id marks a new world build; its floor plan can still be the old one.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapInfo {
@@ -67,7 +68,8 @@ pub struct MapInfo {
     /// `BankY10`. `None` when the id is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
-    /// The rework suffix (`Y10`), `None` for the original layout.
+    /// The year suffix of the world build (`Y10`), `None` for the original
+    /// build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }

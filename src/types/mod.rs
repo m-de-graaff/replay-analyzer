@@ -203,6 +203,15 @@ mod tests {
     }
 
     #[test]
+    fn names_current_maps_and_ban_icons() {
+        assert_eq!(Map(419965653950).name(), Some("CalypsoCasino"));
+        assert_eq!(Map(398899676157).name(), Some("FortressY10"));
+        let icon = |id| Operator::from_role_image(id).and_then(Operator::name);
+        assert_eq!(icon(445433447900), Some("Dokkaebi"));
+        assert_eq!(icon(104189663973), Some("Iana"));
+    }
+
+    #[test]
     fn serializes_name_and_id() {
         let json = serde_json::to_string(&Map(259816839773)).unwrap();
         assert_eq!(json, r#"{"name":"Chalet","id":259816839773}"#);

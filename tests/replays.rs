@@ -956,6 +956,34 @@ fn real_bans_are_made_by_the_team_on_the_other_side() {
     );
 }
 
+/// In a player's own recording, the game numbers the player's team 1.
+#[test]
+fn real_recorders_team_has_team_color_one() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut checked = 0;
+    for r in &rounds {
+        let Some(you) = r.header.recording_player() else {
+            continue;
+        };
+        let colors = r.header.teams.each_ref().map(|t| t.color);
+        if colors == [None, None] {
+            continue; // a file cut before its team objects
+        }
+        assert_eq!(
+            colors[you.team_index],
+            Some(1),
+            "{} R{}",
+            r.header.match_id,
+            r.header.round_number + 1
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
 /// Fails when the game adds a map or gives one a new world id: name it in
 /// `MAPS`, from its sites and spawns.
 #[test]

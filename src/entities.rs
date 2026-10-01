@@ -126,8 +126,14 @@ enum Record {
     Child(Hash, u32),
 }
 
+/// Array indices are small (64 at most in real rounds). Binary data between
+/// runs can read as an array record whose value ends on a real record, which
+/// would swallow the records it covers; its "index" gives it away.
+const MAX_INDEX: u32 = 1 << 16;
+
 /// The record at `i` and where the next one starts.
 fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
+    let index_ok = |at: usize| u32_at(d, at).is_some_and(|x| x < MAX_INDEX);
     let value = |at: usize| -> Option<(usize, usize, usize)> {
         let size = *d.get(at)? as usize;
         let end = at + 1 + size;
@@ -145,7 +151,7 @@ fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
             let (from, to, next) = value(i + 5)?;
             Some((Record::Prop(hash_at(d, i + 1)?, from, to), next))
         }
-        0x26 => {
+        0x26 if index_ok(i + 5) => {
             let (from, to, next) = value(i + 9)?;
             Some((Record::Prop(hash_at(d, i + 1)?, from, to), next))
         }
@@ -156,7 +162,7 @@ fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
             Record::ParentChild(u32_at(d, i + 1)?, hash_at(d, i + 9)?, u32_at(d, i + 13)?),
             i + 25,
         )),
-        0x1e if zero4(d, i + 13) && i + 21 <= d.len() => {
+        0x1e if zero4(d, i + 13) && i + 21 <= d.len() && index_ok(i + 5) => {
             Some((Record::Child(hash_at(d, i + 1)?, u32_at(d, i + 9)?), i + 21))
         }
         _ => None,
@@ -493,6 +499,41 @@ mod tests {
         assert_eq!(p[0].username, "abc");
         assert_eq!(p[0].player_id, 7);
         assert_eq!(p[0].scoreboard, Some(0xF000_0002));
+    }
+
+    #[test]
+    fn a_stray_array_record_does_not_swallow_the_next_object() {
+        let team: u32 = 0xF000_0010;
+        let mut d = vec![];
+        // A controller with its player id and team object.
+        d.extend([0x23, 1, 0, 0, 0xF0, 0, 0, 0, 0]);
+        d.extend(PLAYER_ID);
+        d.push(8);
+        d.extend(7u64.to_le_bytes());
+        d.push(0x22);
+        d.extend(TEAM);
+        d.push(8);
+        d.extend(u64::from(team).to_le_bytes());
+        // Bytes that read as an array element with an impossible index, whose
+        // value covers the team object's first record and ends where its
+        // color is written (seen in a real round at offset 2774).
+        let mut team_record = vec![0x23];
+        team_record.extend(team.to_le_bytes());
+        team_record.extend([0; 4]);
+        team_record.extend([0x10, 0x9F, 0x20, 0x30, 1, 0]);
+        d.push(0x26);
+        d.extend([0xCA, 0x8C, 0xD8, 0x71]);
+        d.extend(0x69A8_FC11u32.to_le_bytes());
+        d.push(team_record.len() as u8);
+        d.extend(&team_record);
+        d.push(0x22);
+        d.extend(TEAM_COLOR);
+        d.push(4);
+        d.extend(1u32.to_le_bytes());
+
+        let p = players(&d);
+
+        assert_eq!(p[0].team_color, Some(1));
     }
 
     #[test]

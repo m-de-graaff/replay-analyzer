@@ -92,10 +92,10 @@ const REGENERATES: u32 = 99;
 
 /// Movement payload types: an entity's descriptor, and its updates.
 const DESCRIPTOR: Hash = [0x61, 0x73, 0x85, 0xFE];
-const UPDATE: Hash = [0x60, 0x73, 0x85, 0xFE];
+pub(crate) const UPDATE: Hash = [0x60, 0x73, 0x85, 0xFE];
 /// Body slots that hold a gun's asset.
-const PRIMARY_WEAPON: Hash = [0x64, 0xDC, 0xCF, 0xC2];
-const SECONDARY_WEAPON: Hash = [0xB4, 0xA5, 0xD8, 0x70];
+pub(crate) const PRIMARY_WEAPON: Hash = [0x64, 0xDC, 0xCF, 0xC2];
+pub(crate) const SECONDARY_WEAPON: Hash = [0xB4, 0xA5, 0xD8, 0x70];
 /// Gun slots that hold an attachment.
 const SIGHT: Hash = [0xA0, 0x73, 0x6B, 0x48];
 const BARREL: Hash = [0x81, 0x32, 0xCD, 0x9D];
@@ -126,7 +126,7 @@ pub struct Named {
 }
 
 impl Named {
-    fn item(id: u64) -> Self {
+    pub(crate) fn item(id: u64) -> Self {
         Named {
             id,
             name: item_name(id),
@@ -287,7 +287,7 @@ pub(crate) struct Hud {
 impl Hud {
     /// Reads the records of one snapshot or frame record. `base` is where
     /// `block` starts in the data.
-    fn read(&mut self, block: &[u8], base: usize, frame: Option<u32>) {
+    pub(crate) fn read(&mut self, block: &[u8], base: usize, frame: Option<u32>) {
         let hash_at = |at: usize| -> Option<Hash> { block.get(at..at + 4)?.try_into().ok() };
         // Each record block names its object before writing to it.
         let mut current: Option<u32> = None;
@@ -465,7 +465,7 @@ pub(crate) struct Descriptor {
 
 impl Descriptor {
     /// The item in `slot`; `None` when the entity has no such slot.
-    fn slot(&self, slot: Hash) -> Option<u64> {
+    pub(crate) fn slot(&self, slot: Hash) -> Option<u64> {
         self.slots.iter().find(|s| s.0 == slot).map(|s| s.1)
     }
 
@@ -578,7 +578,7 @@ impl Entities {
     /// `playerid`s. The stream is most of a replay, so its blocks are read
     /// in parallel: once for descriptors and owners, and once more for the
     /// updates of the guns the bodies carry.
-    fn read(data: &[u8], blocks: &[(usize, usize)], players: &[u64]) -> Entities {
+    pub(crate) fn read(data: &[u8], blocks: &[(usize, usize)], players: &[u64]) -> Entities {
         let block = |&(start, end): &(usize, usize)| data.get(start..end).unwrap_or_default();
         let mut e = Entities::default();
         let found: Vec<Found> = blocks
@@ -657,7 +657,17 @@ impl Entities {
         e
     }
 
-    fn get(&self, entity: u64) -> Option<&Descriptor> {
+    /// The bodies, in stream order.
+    pub(crate) fn bodies(&self) -> &[u64] {
+        &self.bodies
+    }
+
+    /// The `playerid` that ends one of `entity`'s updates.
+    pub(crate) fn owner(&self, entity: u64) -> Option<u64> {
+        self.owners.get(&entity).copied()
+    }
+
+    pub(crate) fn get(&self, entity: u64) -> Option<&Descriptor> {
         self.latest.get(&entity).map(|&i| &self.descriptors[i])
     }
 
@@ -676,7 +686,7 @@ impl Entities {
     }
 
     /// The first body whose id one of `entity`'s early updates contains.
-    fn parent(&self, data: &[u8], entity: u64) -> Option<u64> {
+    pub(crate) fn parent(&self, data: &[u8], entity: u64) -> Option<u64> {
         self.early.get(&entity)?.iter().find_map(|&(from, to)| {
             let update = data.get(from..to)?;
             self.bodies

@@ -51,15 +51,18 @@ pub struct Header {
         skip_serializing_if = "Option::is_none"
     )]
     pub start_time: Option<DateTime<Utc>>,
-    /// Whether a spectator recorded the match (Y11S3+ `isspectator`).
+    /// Whether a spectator recorded the match (Y11S3+ `isspectator`, which
+    /// the game writes only when true). `None` before Y11S3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_spectator: Option<bool>,
     /// Y11S3+ `maxnbplayersperteam`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_players_per_team: Option<u32>,
-    /// Y11S3+ `matchresult`, written only on the round that decides the
-    /// match. Its value matched the winning team's index in the one sample
-    /// seen, so it is kept raw.
+    /// Y11S3+ `matchresult`, written only on the round that ends the match:
+    /// the result of the team the game numbers 1 (see `Team::color`), which
+    /// is the recorder's team in a player's recording. 2 won, 1 lost (all 26
+    /// finished matches of a real folder agree); 7 the game ended the match
+    /// with no winner (seen once).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_result: Option<u32>,
     /// When the recording stopped, UTC (Y11S3+ `endtime`).
@@ -498,7 +501,11 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
             .unwrap_or(0),
         match_id: get("id").unwrap_or_default().to_owned(),
         start_time: millis(get("starttime")),
-        is_spectator: get("isspectator").map(|v| v == "1"),
+        // Y11S3 headers, the first with `starttime`, write `isspectator` only
+        // for spectators.
+        is_spectator: get("isspectator")
+            .map(|v| v == "1")
+            .or(get("starttime").map(|_| false)),
         max_players_per_team: get("maxnbplayersperteam").and_then(|v| v.parse().ok()),
         match_result: get("matchresult").and_then(|v| v.parse().ok()),
         end_time: millis(get("endtime")),
@@ -525,6 +532,59 @@ mod tests {
             }],
             ..Header::default()
         }
+    }
+
+    /// The header properties of a ranked recording with `extra` added, as
+    /// the file stores them (`u64` length, then the bytes), and their count.
+    fn properties(extra: &[(&str, &str)]) -> (Vec<u8>, u32) {
+        let mut pairs = vec![
+            ("version", "Y11S3_Alpha04"),
+            ("code", "9901603"),
+            ("datetime", "2026-09-29-01-41-49"),
+            ("matchtype", "2"),
+            ("worldid", "413779563590"),
+            ("recordingplayerid", "7"),
+            ("gamemodeid", "327933806"),
+            ("roundspermatch", "6"),
+            ("roundspermatchovertime", "3"),
+            ("roundnumber", "0"),
+            ("overtimeroundnumber", "0"),
+            ("teamname0", "YOUR TEAM"),
+            ("startingteamscore0", "0"),
+            ("teamname1", "ENEMY TEAM"),
+            ("startingteamscore1", "0"),
+            ("teamscore0", "0"),
+            ("teamscore1", "0"),
+        ];
+        pairs.extend_from_slice(extra);
+        let mut d = Vec::new();
+        for s in pairs.iter().flat_map(|(k, v)| [k, v]) {
+            d.extend((s.len() as u64).to_le_bytes());
+            d.extend(s.as_bytes());
+        }
+        (d, pairs.len() as u32)
+    }
+
+    fn read(extra: &[(&str, &str)]) -> Header {
+        let (d, count) = properties(extra);
+        read_properties(&mut Cursor::new(&d, 0), Some(count)).unwrap()
+    }
+
+    #[test]
+    fn a_y11s3_header_without_isspectator_is_a_players_recording() {
+        let h = read(&[("starttime", "1790638909220")]);
+        assert_eq!(h.is_spectator, Some(false));
+    }
+
+    #[test]
+    fn isspectator_marks_a_spectators_recording() {
+        let h = read(&[("starttime", "1790638909220"), ("isspectator", "1")]);
+        assert_eq!(h.is_spectator, Some(true));
+    }
+
+    #[test]
+    fn an_older_header_leaves_spectator_unknown() {
+        assert_eq!(read(&[]).is_spectator, None);
     }
 
     #[test]

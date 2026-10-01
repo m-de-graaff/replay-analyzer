@@ -315,6 +315,9 @@ pub enum Outcome {
     Draw,
     /// The match was decided but the recording player was not on a team.
     Decided,
+    /// The game ended the match without a winner (`matchresult` 7): seen
+    /// once, when the server stopped a ranked match before a round began.
+    Cancelled,
     /// Not decided in the rounds read.
     #[default]
     Unfinished,
@@ -336,11 +339,14 @@ pub struct MatchResult {
     /// rounds are missing from the folder.
     pub complete: bool,
     /// The game says the match is over (Y11S3+ `matchresult`) although
-    /// neither team reached the rounds needed to win: a forfeit or an
-    /// abandoned match. Inferred; `None` when the replay cannot tell.
+    /// neither team reached the rounds needed to win: a forfeit, which has
+    /// a `winner`, or a match the game ended without one (`cancelled`).
+    /// `None` when the replay cannot tell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_early: Option<bool>,
-    /// The raw Y11S3+ `matchresult` value of the deciding round.
+    /// The raw Y11S3+ `matchresult` value of the deciding round: the result
+    /// of the team the game numbers 1 (the recorder's, in a player's own
+    /// recording): 2 won, 1 lost, 7 ended with no winner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_match_result: Option<u32>,
 }
@@ -437,22 +443,29 @@ impl MatchSummary {
             rounds.iter().map(|r| round_summary(r, &rules)).collect();
         let final_score = round_summaries.last().map_or([0; 2], |r| r.score_after);
 
-        let raw_match_result = rounds.iter().find_map(|r| r.header.match_result);
-        let decided_by_game = raw_match_result.is_some();
+        let deciding = rounds.iter().find(|r| r.header.match_result.is_some());
+        let raw_match_result = deciding.and_then(|r| r.header.match_result);
         let mut winner = rules.winner(final_score);
         let draw = winner.is_none() && rules.is_draw(final_score);
-        let ended_early = if winner.is_none() && !draw && decided_by_game {
-            // Neither side reached the target, yet the game ended the match.
-            // `matchresult` matched the winner's index in the one sample seen.
-            winner = raw_match_result.map(|v| v as usize).filter(|&t| t < 2);
-            Some(true)
-        } else if decided_by_game {
-            Some(false)
-        } else {
-            None
+        let ended_early = match raw_match_result {
+            None => None,
+            Some(_) if winner.is_some() || draw => Some(false),
+            // Neither side reached the target, yet the game ended the match:
+            // `matchresult` is the result of the team it numbers 1.
+            Some(value) => {
+                let first = deciding.and_then(|r| r.header.team_of_color(1));
+                winner = match value {
+                    2 => first,
+                    1 => first.map(|t| t ^ 1),
+                    _ => None,
+                };
+                Some(true)
+            }
         };
-        let complete = winner.is_some() || draw;
+        let cancelled = ended_early == Some(true) && raw_match_result == Some(7);
+        let complete = winner.is_some() || draw || cancelled;
         let outcome = match (winner, your_team) {
+            _ if cancelled => Outcome::Cancelled,
             (Some(w), Some(y)) if w == y => Outcome::Win,
             (Some(_), Some(_)) => Outcome::Loss,
             (Some(_), None) => Outcome::Decided,
@@ -617,6 +630,61 @@ mod tests {
                 r
             })
             .collect()
+    }
+
+    /// Round `number` of a ranked match (6 rounds and 3 overtime), recorded
+    /// by a player of `your_team`, going from `before` to `after`.
+    fn ranked_round(
+        number: u32,
+        your_team: usize,
+        before: [u32; 2],
+        after: [u32; 2],
+        match_result: Option<u32>,
+    ) -> Round {
+        let mut r = Round::default();
+        let h = &mut r.header;
+        h.code_version = crate::types::version::Y9S4;
+        h.rounds_per_match = 6;
+        h.rounds_per_match_overtime = 3;
+        h.round_number = number - 1;
+        h.recording_player_id = 7;
+        h.players.push(Player {
+            id: 7,
+            username: "recorder".into(),
+            team_index: your_team,
+            ..Player::default()
+        });
+        for t in 0..2 {
+            h.teams[t].starting_score = before[t];
+            h.teams[t].score = after[t];
+        }
+        h.match_result = match_result;
+        r
+    }
+
+    #[test]
+    fn a_match_ended_early_goes_to_the_team_matchresult_names() {
+        // The recorder's team (1) trails 1-2, and the game says it won.
+        let rounds = [ranked_round(3, 1, [1, 1], [1, 2], Some(2))];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!(
+            (r.winner, r.outcome, r.ended_early),
+            (Some(1), Outcome::Win, Some(true))
+        );
+    }
+
+    #[test]
+    fn matchresult_seven_is_a_match_ended_without_a_winner() {
+        let rounds = [ranked_round(4, 0, [1, 2], [1, 2], Some(7))];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!(
+            (r.winner, r.outcome, r.ended_early, r.complete),
+            (None, Outcome::Cancelled, Some(true), true)
+        );
     }
 
     #[test]

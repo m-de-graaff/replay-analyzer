@@ -1059,6 +1059,62 @@ fn real_recorders_team_has_team_color_one() {
     assert!(checked > 0);
 }
 
+/// Every real match folder, headers only, with its rounds.
+fn real_matches() -> Option<Vec<replay_analyzer::Match>> {
+    let root = match_replay_dir()?;
+    let folders = replay_analyzer::matches::find_match_folders(&root).unwrap();
+    Some(
+        folders
+            .iter()
+            .map(|dir| replay_analyzer::Match::open_with(dir, ReadMode::Header).unwrap())
+            .collect(),
+    )
+}
+
+/// `matchresult` is the recorder's result in their own recording: 2 won, 1
+/// lost, 7 ended with no winner.
+#[test]
+fn real_outcomes_agree_with_matchresult() {
+    use replay_analyzer::summary::Outcome;
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        let s = m.summary().unwrap();
+        let Some(value) = s.result.raw_match_result else {
+            continue;
+        };
+        if s.recording.spectator {
+            continue;
+        }
+        let expected = match value {
+            2 => Outcome::Win,
+            1 => Outcome::Loss,
+            7 => Outcome::Cancelled,
+            other => panic!("{}: matchresult {other} not seen before", s.match_id),
+        };
+        assert_eq!(s.result.outcome, expected, "{}", s.match_id);
+    }
+}
+
+/// The game writes `isspectator` only for spectators, so a recording
+/// without it is a player's, even when its header lacks the player (a file
+/// cut during prep has no attackers in its header).
+#[test]
+fn real_player_recordings_are_not_listed_as_spectators() {
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        if m.rounds.iter().all(|r| r.header.is_spectator != Some(true)) {
+            let s = m.summary().unwrap();
+            assert!(!s.recording.spectator, "{}", s.match_id);
+        }
+    }
+}
+
 /// Fails when the game adds a map or gives one a new world id: name it in
 /// `MAPS`, from its sites and spawns.
 #[test]

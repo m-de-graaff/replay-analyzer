@@ -81,20 +81,34 @@ fn ban_decisions(rounds: &[Round]) -> Vec<BanDecision> {
     let mut out: Vec<BanDecision> = Vec::new();
     for r in rounds {
         for b in &r.bans {
-            let seen = out.iter().any(|d| {
-                let d = &d.ban;
-                (d.team, d.role, d.slot, d.icon, d.no_ban)
-                    == (b.team, b.role, b.slot, b.icon, b.no_ban)
-            });
-            if !seen {
-                out.push(BanDecision {
+            match out.iter_mut().find(|d| ban_key(&d.ban) == ban_key(b)) {
+                // A later round may know the team an earlier one could not.
+                Some(d) => d.ban.team = d.ban.team.or(b.team),
+                None => out.push(BanDecision {
                     round: r.header.round_number + 1,
                     ban: b.clone(),
-                });
+                }),
             }
         }
     }
     out
+}
+
+/// What makes a ban the same one in another round. A slot's `TeamColor`
+/// stays the same through a recording, while its team index needs that
+/// round's team objects; bans without a color fall back to the index.
+type BanKey = (
+    Option<u32>,
+    Option<usize>,
+    TeamRole,
+    Option<u32>,
+    Option<u64>,
+    bool,
+);
+
+fn ban_key(b: &Ban) -> BanKey {
+    let team = if b.color.is_some() { None } else { b.team };
+    (b.color, team, b.role, b.slot, b.icon, b.no_ban)
 }
 
 /// A map, keyed by id: reworked maps get new ids (`Bank` vs `BankY10`), so
@@ -459,7 +473,10 @@ impl MatchSummary {
             // Neither side reached the target, yet the game ended the match:
             // `matchresult` is the result of the team it numbers 1.
             Some(value) => {
-                let first = deciding.and_then(|r| r.header.team_of_color(1));
+                // In a player's recording, the team numbered 1 is theirs.
+                let first = deciding
+                    .and_then(|r| r.header.team_of_color(1))
+                    .or(your_team);
                 winner = match value {
                     2 => first,
                     1 => first.map(|t| t ^ 1),
@@ -689,6 +706,17 @@ mod tests {
     }
 
     #[test]
+    fn an_early_end_goes_to_your_team_when_the_last_header_lacks_you() {
+        let mut last = ranked_round(3, 1, [1, 1], [1, 2], Some(2));
+        last.header.players.clear();
+        let rounds = [ranked_round(2, 1, [1, 0], [1, 1], None), last];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!((r.winner, r.outcome), (Some(1), Outcome::Win));
+    }
+
+    #[test]
     fn matchresult_seven_is_a_match_ended_without_a_winner() {
         let rounds = [ranked_round(4, 0, [1, 2], [1, 2], Some(7))];
 
@@ -713,6 +741,19 @@ mod tests {
 
         let bans: Vec<_> = s.bans.iter().map(|d| (d.round, d.ban.slot)).collect();
         assert_eq!(bans, [(1, Some(0)), (2, Some(1))]);
+    }
+
+    #[test]
+    fn a_ban_whose_team_a_later_round_cannot_tell_is_listed_once() {
+        let mira = ban(39149215445, 0);
+        let mut team_unknown = mira.clone();
+        team_unknown.team = None;
+        let rounds = rounds_with_bans(&[vec![team_unknown], vec![mira]]);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let bans: Vec<_> = s.bans.iter().map(|d| (d.round, d.ban.team)).collect();
+        assert_eq!(bans, [(1, Some(0))]);
     }
 
     #[test]

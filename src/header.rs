@@ -279,11 +279,15 @@ impl Header {
     /// recorder's team in a player's recording, and team 0 in a spectator's
     /// (as in the one spectator match seen).
     pub fn team_of_color(&self, color: u32) -> Option<usize> {
+        if !matches!(color, 1 | 2) {
+            return None;
+        }
         if let Some(i) = self.teams.iter().position(|t| t.color == Some(color)) {
             return Some(i);
         }
-        if !matches!(color, 1 | 2) || self.teams.iter().any(|t| t.color.is_some()) {
-            return None;
+        // One team's decoded color gives the other team the other one.
+        if let Some(i) = self.teams.iter().position(|t| t.color.is_some()) {
+            return Some(i ^ 1);
         }
         let first = if self.is_spectator == Some(true) {
             0
@@ -606,6 +610,13 @@ mod tests {
         h.teams[0].color = Some(1);
         h.teams[1].color = Some(2);
         assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn one_decoded_team_color_gives_the_other_team_the_other_color() {
+        let mut h = recorded_by_team(0);
+        h.teams[1].color = Some(1);
+        assert_eq!(h.team_of_color(2), Some(0));
     }
 
     #[test]

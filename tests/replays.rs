@@ -914,15 +914,21 @@ fn a_real_library_accounts_for_every_round() {
     }
 }
 
-/// Every real round read in full, match by match.
-fn real_rounds() -> Option<Vec<Round>> {
-    let root = match_replay_dir()?;
-    let mut rounds = Vec::new();
-    for dir in replay_analyzer::matches::find_match_folders(&root).unwrap() {
-        let m = replay_analyzer::Match::open_with(&dir, ReadMode::Full).unwrap();
-        rounds.extend(m.rounds);
-    }
-    Some(rounds)
+/// Every real round read in full, match by match: read once, shared by the
+/// tests that need it.
+fn real_rounds() -> Option<&'static [Round]> {
+    static ROUNDS: std::sync::OnceLock<Option<Vec<Round>>> = std::sync::OnceLock::new();
+    ROUNDS
+        .get_or_init(|| {
+            let root = match_replay_dir()?;
+            let mut rounds = Vec::new();
+            for dir in replay_analyzer::matches::find_match_folders(&root).unwrap() {
+                let m = replay_analyzer::Match::open_with(&dir, ReadMode::Full).unwrap();
+                rounds.extend(m.rounds);
+            }
+            Some(rounds)
+        })
+        .as_deref()
 }
 
 /// Each team bans operators of the side it plays against, so a ban credited
@@ -935,7 +941,7 @@ fn real_bans_are_made_by_the_team_on_the_other_side() {
         return;
     };
     let mut wrong = Vec::new();
-    for r in &rounds {
+    for r in rounds {
         for b in &r.bans {
             let Some(team) = b.team else { continue };
             if r.header.teams[team].role == Some(b.role) {
@@ -985,7 +991,7 @@ fn real_ban_slots_fill_in_order() {
         eprintln!("skipping: R6_MATCH_REPLAY not set");
         return;
     };
-    for r in &rounds {
+    for r in rounds {
         for team in [Some(0), Some(1)] {
             let slots: Vec<_> = r
                 .bans
@@ -1013,7 +1019,7 @@ fn real_ban_slots_agree_with_their_icons() {
         eprintln!("skipping: R6_MATCH_REPLAY not set");
         return;
     };
-    for r in &rounds {
+    for r in rounds {
         let bans = r.decode.get("bans").unwrap();
         assert!(
             bans.warnings.is_empty(),
@@ -1033,7 +1039,7 @@ fn real_recorders_team_has_team_color_one() {
         return;
     };
     let mut checked = 0;
-    for r in &rounds {
+    for r in rounds {
         let Some(you) = r.header.recording_player() else {
             continue;
         };

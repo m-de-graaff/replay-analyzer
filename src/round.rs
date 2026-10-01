@@ -1291,7 +1291,7 @@ impl<'a> Parser<'a> {
                     n,
                 );
                 f.warn(
-                    "the controller flag reads as weapon-ready: attackers hold 0 through prep until their body spawns, and it drops briefly (median about 1 s) during action, as on reloads and swaps",
+                    "the controller flag is CanFire: attackers hold 0 through prep until their body spawns, and in action it drops while a drone or gadget is in hand, not on reloads or swaps between guns",
                 );
                 if mode == ReadMode::Partial {
                     f.warn("partial read: later changes not read");

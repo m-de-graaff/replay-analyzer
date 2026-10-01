@@ -50,6 +50,7 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `lifeEvents` | Downs (DBNO) and revives. | Y8S1+ |
 | `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
 | `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. | Y8S1+ |
+| `weaponActivity`, `shots`, `bulletHits`, `throws`, `meleeHits`, `shieldActions` | What players held, fired, reloaded, threw and struck. See [Weapons and shooting](#weapons-and-shooting). | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
 
 Each round also carries a `round` block with the round itself in one place:
@@ -132,7 +133,7 @@ The library equivalent is `library::scan(path, ReadMode::Header)`.
 - **`endedEarly`** comes from `matchresult`. A forfeit, where a team surrenders, should carry 1 or 2 like a normal ending and so get a winner, but no forfeit has been seen. Value 7 has been seen once: the server ended a ranked match 0.03 s into round 4, with no clock, both teams marked as losing and a system notice no other round has. The cause, which the file does not say, may be a ban of a cheating player, which ends a match for everyone.
 - **Dual Front** (6v6, respawns) has not been seen in a replay, and no source says whether it records one. Pick packets are split into teams by `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
 
-- Replays record a player's health, never who caused a change, so there is damage taken but no damage dealt.
+- Replays record a player's health, never who caused a change. From Y11S3 `bulletHits` matches each bullet hit to the shot that made it; other damage has no source but the kill feed.
 - Older replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
 - Observation tool ids 1 (drone), 2 (camera), 6 (Black Eye), 8 (Flores drone) and 9 (shock drone) are confirmed; 3 is a second camera kind seen on defenders with a camera gadget. Others print as `ObservationTool(n)`.
 - No round in the test match or the real folder ends with the defuser going off, so `DefusedBomb` is untested from Y11S3: it is given when attackers win after a plant with defenders left and the defuser timer at zero.
@@ -194,6 +195,175 @@ What is and is not recorded:
 
 Of 1,661 player-rounds in a real folder of 167 rounds, the 1,631 in finished files all have a loadout. Every gun has its attachments (1,577 primaries and 1,626 secondaries; 49 primaries are shields) except for 5 players who never spawned. 1,621 abilities and 1,626 gadgets have counts; the rest are Skopos's (5) and those 5 players'. `decodeStatus.loadouts` counts the players whose loadout was found and warns about each body or gun that could not be linked.
 
+## Weapons and shooting
+
+From Y11S3, full reads of files the game finished writing carry what players did with their weapons. Every event has `time`, `phase`, `elapsed` and `recordingTime` like the kill feed.
+
+| Key | What it holds | How |
+|---|---|---|
+| `weaponActivity[]` | Per player: `held` (each change of the item in hand), `swaps`, `fired` (each drop of a gun's ammunition, with what was left), `reloads` and `atDeath`. | Decoded; swaps and reload outcomes derived |
+| `shots[]` | Every shot: who, the gun, the muzzle position, the direction and the distance to what it struck. | Decoded |
+| `bulletHits[]` | Every bullet that struck a player: victim, position, damage, limb or not, and the result. The shooter is the shot whose ray fits. | Decoded; shooter inferred |
+| `throws[]` | Every grenade, thrown gadget, drone throw and launcher projectile: who, what, from where, the flight path and where it ended. | Decoded; direction derived |
+| `meleeHits[]` | Every melee hit on a barricade or a destructible part of the map: who, what, which hit on it, and whether it broke. A hit with a shield in hand is a bash. | Decoded |
+| `shieldActions[]` | Held shields raised, stowed and dropped, and each extension of Montagne's shield. | Decoded |
+
+What the file does not hold, after searching every stream:
+
+- **Fire mode.** No property of the HUD or of a gun changes with it, and none of about 186,000 guessed names for one exists in the file. Burst against full-auto can only be guessed from the spacing of `shots`.
+- **The body part of a hit.** A hit says limb or not. A headshot is known only for a kill, from the kill feed, so a headshot rate over all hits cannot be had.
+- **Who fired the bullet that hit.** Neither the hit nor the damage names the shooter; `shooter` is matched by ray and says so (`shooterSource`).
+- **Melee swings and melee hits on players.** See [Melee and shields](#melee-and-shields).
+- **A detonation.** A thrown object is removed; nothing says it went off.
+
+### Weapon handling
+
+`weaponActivity[]` has one entry per player:
+
+| Key | What it holds |
+|---|---|
+| `held[]` | Each change of what is in the player's hands: `item` is `primary`, `secondary`, `ability`, `gadget`, `drone` or `none`, with the `id` and `name` `loadouts` gives that slot. `none` is the hands empty: between two items, on a drone or camera, down or dead. |
+| `swaps[]` | One item put away for another: `from`, `to`, and `duration`, the seconds the hands were empty in between (0 when the game went straight from one to the other). The time is the moment the old item left the hands. Hands empty for more than 3 seconds are not a swap. |
+| `fired[]` | Each drop of a gun's ammunition: `slot`, `rounds` (several when more than one shot fell between two updates), `magazine` (rounds left in the gun, the chambered one included), `reserve`, and `aiming` (the HUD's `IsAiming`). A launcher in the ability slot counts its rounds here too. |
+| `reloads[]` | `slot`, `outcome`, `duration`, `magazineBefore`, `magazineAfter` and `reserveAfter`, timed at the start. `completed`: the gun holds more than before. `cancelled`: the reload ended and the gun gained nothing; when the magazine was already out, `magazineAfter` is the round left in the chamber. `unfinished`: the reload never ended, because the player died or the recording stopped. |
+| `atDeath` | For a player who was killed: `held` with its `id` and `name`, `magazine`, `reloading`, and `swappingFrom` and `swappingTo` when a swap was in progress. A player downed first has empty hands from then on, so this is read at the down. |
+
+Where it lives: the `PlayerLoadoutViewModel` each controller links in the `state` stream (see [Loadouts](#loadouts)).
+
+- `ActiveReticleType` on the view is the item in hand: 0 nothing, 1 the drone, otherwise the number the slot itself carries in `EquippedWeaponType` (2 primary, 3 secondary, 4 ability, 5 gadget).
+- A gun slot's `WeaponAmmoViewModel` holds `AmmoInWeapon` (the magazine and the chambered round, so a 30-round gun reads 31 after a reload with a round in the chamber), `AmmoLeft` (the reserve, written when a reload moves ammunition) and `TotalAmmo`, their sum. A gun with a launcher under it (Nomad's, Kali's) links a second one for the launcher through another field.
+- `IsReloading` on the slot is 1 for the length of a reload. Reloading a gun that is not empty is two pulses a few frames apart: the magazine comes out (the gun keeps 1, the reserve takes the rest), then the new one goes in. They are given as one reload. A shotgun loads shell by shell inside one pulse. Pulses under 0.35 s that move no ammunition are left out: the game raises the flag for a few frames on an empty gun.
+- There is no flag for a swap or for a cancelled reload; both are read off the values above.
+
+Checked on the 10 test rounds and on every fourth round of a real folder (52 rounds):
+
+| | Test rounds | Real rounds |
+|---|---:|---:|
+| Players with activity | 100 of 100 | 527 of 527 |
+| Guns whose `fired` adds up to the loadout's `ammo.fired` | 193 of 193 | 1,030 of 1,030 |
+| Ammunition drops with that gun in hand | 4,862 of 4,868 | 16,400 of 16,420 |
+| Kills with a carried gun, with that gun in the killer's hands | 60 of 62 | 361 of 362 |
+| Gadget uses with the gadget in hand | 105 of 105 | 376 of 376 |
+| Reloads completed | 512 of 566 | 1,598 of 1,789 |
+
+Over those rounds and every eighth real round, each of 12,180 consecutive drops without a reload in between leaves the magazine exactly the rounds fired lower.
+
+- The knife is not a HUD slot, so `held` never says melee: the gun stays in hand through a swing.
+- The controller's `a4dc8dd4`, output as `weaponReady`, is `CanFire`. It does not drop on reloads or on swaps between guns (it stayed 1 through 552 of 565 reloads); it is 0 while a drone is in hand and mostly while a gadget is.
+- An ability used without being held (159 of 196 ability uses in the test rounds had it in hand) is not a fault: some abilities are triggered, not held.
+
+### Shots and bullet hits
+
+`shots` lists every shot of the round and `bulletHits` every bullet that struck a player's body.
+
+| Key | What it holds |
+|---|---|
+| `shots[].username` | Who fired. Absent when the gun could not be linked to a player (`decodeStatus.shots` warns). |
+| `shots[].slot`, `weapon` | The loadout slot that fired: `primary` or `secondary` for a gun, `ability` or `gadget` for a device that shoots (Twitch's drone, a bulletproof camera). `weapon` is the item in it as `{id, name}`, the id `loadouts` and the kill feed use. |
+| `shots[].origin`, `direction` | The muzzle in map coordinates (metres, z up) and a unit vector. |
+| `shots[].distance`, `eyeDistance` | Metres to what the bullet struck first, from the muzzle and from the shooter's eye. |
+| `bulletHits[].victim`, `position` | The player struck and where, in map coordinates. |
+| `bulletHits[].damage`, `limb`, `result` | Health taken, whether an arm or leg was struck, and `alive`, `down` or `dead` after it. Absent for a bullet in a body that was already down or dead. |
+| `bulletHits[].shooter`, `shooterSource`, `shot` | Who fired, how that is known (`ray`), and the index of the shot in `shots`. Absent when no shot fits. |
+
+How they are found:
+
+- **Shots.** In the `movement` stream a gun's `607385fe` update ends in a list of events. Event `06` (63 bytes) is the gun firing: muzzle position, direction, and the distance to the impact from the eye and from the muzzle. The game repeats the event in every update while an automatic gun fires, and a player's own recording repeats each about 16 times, so a shot is a run of events of one gun with the same direction and distance. A shotgun writes one event per shell. The gun is linked to the body that carries it and the body to its player, as loadouts are.
+- **Hits.** A bullet striking a body spawns an effect in the `FXChannel` stream (`f5ee6a3d`): asset `d5 6d 41 58`, the body as its target, and where it struck in parameter `56 95 b5 31`.
+- **Damage.** The update of the body that took the damage ends in a 24-byte block: the health left as a share of the maximum, a damage multiplier (1.0, about 0.75 for a limb), the state after (1 alive, 3 down, 4 dead) and the damage type (0 for a bullet). `damage` is the drop of that share since the body's block before, times the player's maximum health.
+- **Shooter.** Nothing names it. `shooter` is the player whose shot passes within 0.6 m of the hit at about that time.
+
+| | Test rounds (10) | Real rounds (167) |
+|---|---:|---:|
+| Shots | 5,375 | 59,326 |
+| Rounds the HUD counted down on the same guns | 5,348 for 5,335 shots | |
+| Hits that did damage, with a shooter | 184 of 187 | 3,673 of 3,722 |
+| Kills whose lethal hit is the feed's killer's | 59 of 66 | 1,109 of 1,183 |
+| Kills whose lethal hit is another player's | 2 | 11 |
+| Kills with no bullet hit (explosive, melee, bleed-out) | 5 | 63 |
+
+In the test rounds 133 of 155 guns that fired agree exactly with the HUD's count, and 152 of 184 damages equal a change in `health` at that moment.
+
+- Two players firing along the same line at the same moment cannot be told apart.
+- Health regained between two hits is not seen: a hit after healing reads low, or has no `damage`.
+- A shell is one shot, and of its pellets in one body only the first carries the damage.
+- Launcher abilities drop ammunition without a fire event; their rounds are in `throws`.
+- Fire events and damage blocks are found by their shape at the end of a message; what precedes them in the message is not decoded.
+- Bullets that hit walls are in the `DecalChannel` stream and are not output, so a hit through a wall is not marked.
+
+### Throws and launches
+
+`throws` lists every grenade, thrown gadget, drone throw and launcher projectile, in the order they were released.
+
+| Key | What it holds |
+|---|---|
+| `username` | Who threw or fired it. |
+| `slot` | `ability`, `gadget` or `drone`: the loadout slot it came from. Absent for the ammunition of launchers and for sub-munitions. |
+| `asset` | The object's asset id. |
+| `id`, `name` | The item, as `loadouts` names that slot. Launcher ammunition has only a `name`, from a table, marked `inferred: true`. |
+| `subMunition` | `true` for what another object let go: Candela charges, cluster charge pucks, Kawan swarms. |
+| `origin` | Where it left the hand or muzzle, in map coordinates (metres, z up). |
+| `direction`, `speed` | Unit vector and metres a second of the first full step of the flight. |
+| `path` | `[seconds since release, x, y, z]`, thinned to at most 60 points. |
+| `end`, `flightTime` | Where the flight stopped and how long it took. |
+| `ended`, `endedAfter` | `deleted` (the game removed the object) or `returned` (taken back into its pool), and seconds since the release. Absent when it was still there at the end of the recording. |
+
+How it is found: the `movement` stream creates each object with a `617385fe` message that lists its component classes. Everything a player can let go of has a component of class `8490f616` in its `607385fe` updates: a `u8` mask, then a `u16` (bit 01), the owner's `playerid` (02), the owner's alliance (04) and a flag (08) that is 1 once the object is released and 0 when it is taken back. A throw is the update that sets the flag to 1. That message carries the release position, and each update after it one position, about 30 a second. The game writes no velocity, so direction and speed come from the second and third position. The item is the slot of the thrower's body (`PrimaryGadget`, `SecondaryGadget`, `Drone`) whose asset equals the object's. Launcher ammunition is in no slot and is named by a table of 20 assets, each assigned to the launcher of the only operator who fires it. A drone is driven straight after it lands, so its path is cut at the landing. Objects are pooled and created under the map, so the position an object is created at is not where it was thrown from.
+
+| | Test rounds (10) | Real rounds (167) |
+|---|---:|---:|
+| Throws | 348 | 3,802 |
+| Count drops of hand-thrown items with a release at most 1.1 s before | 168 of 168 | 2,362 of 2,366 |
+| Count drops of launchers with a release | 48 of 48 | 367 of 371 |
+
+The count drops 0.38 s after the release (median). Grenades in free flight fit a parabola of 9.3 m/s².
+
+- `ended` is the object being removed. For a grenade that is within a frame or two of it going off; for a gadget it may be minutes later.
+- No release was found for Thatcher's EMP grenade.
+- Gadgets that are placed, not thrown (barbed wire, deployable shields, breach charges, cameras on walls), are another class (`4c60869a`) and are not covered.
+- A few pooled sub-munitions are released without ever being given an owner (8 in the real rounds); they are left out and counted in `decodeStatus.throws`.
+- Both of Capitao's bolts share one name, as do both of Zofia's grenades: which asset is which type is not known. Four assets seen in real rounds have no name.
+- Drones report the 15.9 m/s they leave the hand with.
+- Attackers start prep already on their drones, so prep has no drone throws.
+
+### Melee and shields
+
+`meleeHits` lists every melee hit on a barricade or a destructible part of the map; `shieldActions` lists what players did with a held shield. Both come from the `movement` stream.
+
+Anything that can be damaged carries a damage list in its update messages: a `u32` count, then one entry per hit. An entry is a kind byte (0 melee, 1 bullet), the hit point in the object's own space, the body that did it, a damage id and a list of impacts; an entry of the single byte `fe` says the object is destroyed. A melee hit is an entry with damage id 34118943362.
+
+| Key | What it holds |
+|---|---|
+| `meleeHits[].username` | The player whose body the entry names. |
+| `target`, `object` | `barricade`, `mapObject` (a wall, hatch or prop: an id that is the same in every round on the map) or `entity` (another entity that takes damage), and the id of what was hit. The file does not say whether a map object is a wall, a hatch or a prop. |
+| `hit` | Which melee hit on that object it is, from 1, starting over once it broke. The game's own counter also counts bullets. |
+| `broke` | The hit destroyed the barricade. A barricade takes three hits; a reinforced one took ten. |
+| `position` | Where the hit landed, in map coordinates (`point`, relative to the object, when the object's place is not known). |
+| `withShield` | The player had a shield in hand, so the hit is a shield bash. |
+| `knifeSeen` | The knife was seen in the player's hand for the swing. The game writes that for about 28% of hits, so its absence means nothing. |
+| `shieldActions[].action` | `raise` when a held shield goes in hand, `stow` when it is put away, `drop` when it leaves the hand without being put away (taken to be the holder dying). `extend` is one extension of Montagne's shield, timed at its start, with `extendTime` (seconds until fully extended), `extendedFor`, `retractTime` and `duration`; `duration` is absent when the shield never came back. |
+
+A held shield is an entity of its own, attached to a socket of its holder's body: in hand, or on the back. Montagne's also carries a state (normal, extending, extended, retracting) in component `36638d75`. Covered: Montagne, Blitz, Fuze, Blackbeard and Clash.
+
+| | Test rounds (10) | Real rounds (167) |
+|---|---:|---:|
+| Melee hits | 79 | 1,136 |
+| On a barricade / map object / entity | 51 / 27 / 1 | 755 / 380 / 1 |
+| Barricades broken | 10 | 117 |
+| Shield bashes | 15 | 68 |
+| Raise / stow / drop | 28 / 24 / 4 | 135 / 98 / 28 |
+| Montagne extensions | 8 | 49 |
+
+Not recorded, or not decoded:
+
+- **Melee kills** need nothing new: the kill feed gives them weapon id 3099101909 (6 of 1,249 kills in the real rounds). The id is carried by no loadout; that it means melee is inferred from the killers' knives being out at 4 of those kills.
+- **Melee hits on players that do not kill** are not in the replay: bodies carry no such entry.
+- **Swings that hit nothing.** The knife is seen in hand for about a third of swings, so no list of swings is given.
+- **A ballistic shield held up in guard or aimed over** is not in what was decoded.
+- **Blitz's flash** is the ability's `uses[]` in `loadouts`; who it blinded is not recorded.
+- **Clash's, Blackbeard's and Osa's shield states** are not decoded; Osa gets no shield actions.
+- Blitz's and Fuze's shields and the ten-hit barricades occur only in real rounds, so the test replays do not cover them.
+
 ## Players and identity
 
 Every player in `players[]` carries:
@@ -213,7 +383,7 @@ Every player in `players[]` carries:
 
 Kill feed entries name their players' `profileID` and `targetProfileID`. From Y11S3 a kill can also carry `creditedTo`: the scoreboard credits a kill to the teammate who downed the victim when another player finished them, while the feed names the finisher. With those credits counted, the scoreboard's kill and death totals match the kill feed in every test round.
 
-`weaponReady` lists each change of the controller's weapon-ready flag (`ready`, `phase`, `elapsed`). Attackers hold it at `false` through prep, on their drones, until their body spawns; in action it drops for about a second at a time, as on reloads and weapon swaps. The meaning is inferred from that behaviour (`decodeStatus.weaponReady`).
+`weaponReady` lists each change of the controller's `CanFire` flag (`ready`, `phase`, `elapsed`). Attackers hold it at `false` through prep, on their drones, until their body spawns; in action it drops while a drone or gadget is in hand, not on reloads or swaps between guns. `weaponActivity` says what a player held (see [Weapon handling](#weapon-handling)).
 
 `decodeStatus` adds `profileIds`, `recorder`, `entities`, `movement`, `party`, `weaponReady`, `platform`, `names` and `cosmetics`. `summary.teams[].players[]` gains `key`, `relation`, `party`, `platform`, `usesNickname` and `renamedTo`, and `summary.recording.party` lists who queued with the recorder.
 
@@ -298,7 +468,7 @@ block                        "CMPRV002" (stored as a u64), u32 raw size, u32 pac
 
 Decompressed, each snapshot is a u64 length and the snapshot. The main stream holds every stream's records, each a u32 frame, u32 size, u32 0 and the payload, so every packet belongs to a frame and the index gives its time. Reading only the header needs no decompression for Y8S4+ (`ReadMode::Header`); before Y8S4 everything is one zstd stream.
 
-- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks, every packet this parser decodes; `movement` holds every movement message. The rest are known only by hash. `movement` and `state` have a record at nearly every update, 35 ms apart.
+- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. Only the first four are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
 - **Recording ids.** Stream ids come from one counter per run of the game. A round takes its main id (`recordingId`) and one per stream, and the next recording starts right after, so a skipped id is a recording that was started and never saved. The folder name ends in the same run's process id.
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.

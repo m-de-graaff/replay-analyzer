@@ -362,25 +362,29 @@ fn ban_slots(t: &Tree) -> Vec<BanSlot> {
     elements.sort_unstable();
     let mut out: Vec<BanSlot> = Vec::new();
     for (_, index, slot) in elements {
-        let (Some(side), Some(color)) = (t.u32(slot, HERO_TEAM), t.u32(slot, TEAM_COLOR)) else {
-            continue;
-        };
-        if out.iter().any(|s| s.color == color && s.index == index) {
-            continue;
-        }
-        let icon = t
-            .child(slot, OPERATOR)
-            .and_then(|op| t.child(op, OPERATOR_INFO))
-            .and_then(|info| t.u64(info, BADGE_ICON))
-            .filter(|&icon| icon != 0);
-        out.push(BanSlot {
+        // A side or team missing is 0, which the caller reports for a used
+        // slot rather than dropping it here.
+        let slot = BanSlot {
             index,
-            side,
-            color,
+            side: t.u32(slot, HERO_TEAM).unwrap_or(0),
+            color: t.u32(slot, TEAM_COLOR).unwrap_or(0),
             state: t.u32(slot, BAN_STATE).unwrap_or(0),
             result: t.u32(slot, RESULT_TYPE).unwrap_or(0),
-            icon,
-        });
+            icon: t
+                .child(slot, OPERATOR)
+                .and_then(|op| t.child(op, OPERATOR_INFO))
+                .and_then(|info| t.u64(info, BADGE_ICON))
+                .filter(|&icon| icon != 0),
+        };
+        match out
+            .iter_mut()
+            .find(|s| s.color == slot.color && s.index == slot.index)
+        {
+            // A copy sent again: keep the one that has been used.
+            Some(seen) if !seen.resolved() && slot.resolved() => *seen = slot,
+            Some(_) => {}
+            None => out.push(slot),
+        }
     }
     out
 }
@@ -717,6 +721,37 @@ mod tests {
                 slot(2, 0, 0, None),
             ]
         );
+    }
+
+    #[test]
+    fn a_resent_ban_slot_that_is_resolved_wins_over_an_unused_copy() {
+        let (unused, resolved) = (0xF000_0101, 0xF000_0201);
+        let (operator, info) = (0xF000_0210, 0xF000_0211);
+        let mut d = vec![];
+        set(&mut d, 0xF000_0100, BAN_SLOT_ARRAYS[0], &[1]);
+        element(&mut d, BAN_SLOT_ARRAYS[0], 0, unused);
+        link(&mut d, unused, OPERATOR, 0);
+        slot_props(&mut d, unused, 2, 0, 0);
+        // The same slot sent again with new object ids, now used.
+        set(&mut d, 0xF000_0200, BAN_SLOT_ARRAYS[0], &[1]);
+        element(&mut d, BAN_SLOT_ARRAYS[0], 0, resolved);
+        link(&mut d, resolved, OPERATOR, operator);
+        set(&mut d, operator, [0x0E, 0x9E, 0xBE, 0x88], &[0; 8]);
+        child(&mut d, OPERATOR_INFO, info);
+        set(&mut d, info, BADGE_ICON, &39149215445u64.to_le_bytes());
+        slot_props(&mut d, resolved, 2, 3, 1);
+
+        let slots = snapshot(&d).ban_slots;
+
+        let expected = BanSlot {
+            index: 0,
+            side: 2,
+            color: 1,
+            state: 3,
+            result: 1,
+            icon: Some(39149215445),
+        };
+        assert_eq!(slots, [expected]);
     }
 
     #[test]

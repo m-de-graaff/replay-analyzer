@@ -984,9 +984,11 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        // A slot that could not be read, or slots and icons that disagree,
+        // may mean a ban is missing or misplaced.
         if let Some(f) = r.get_mut("bans") {
             for w in &self.ban_warnings {
-                f.warn(w.clone());
+                f.at_most(Status::Partial).warn(w.clone());
             }
         }
         // Who the players are and which objects carry them.
@@ -1901,15 +1903,25 @@ impl<'a> Parser<'a> {
             });
         }
         from_slots.sort_by_key(|b| (b.team.unwrap_or(usize::MAX), b.slot));
-        let icons = |list: &[Ban]| {
-            list.iter()
-                .filter_map(|b| b.icon)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        if icons(bans) != icons(&from_slots) {
-            self.ban_warnings.push(
-                "the ban slots and the banned-operator icons disagree; the slots were used".into(),
-            );
+        let in_slots: std::collections::BTreeSet<u64> =
+            from_slots.iter().filter_map(|b| b.icon).collect();
+        let in_icons: std::collections::BTreeSet<u64> =
+            bans.iter().filter_map(|b| b.icon).collect();
+        if in_slots != in_icons {
+            self.ban_warnings.push(format!(
+                "the ban slots hold {} banned operators and the icons {}; bans only the icons show are kept without a slot",
+                in_slots.len(),
+                in_icons.len()
+            ));
+        }
+        // Keep what only the icons show, after the slots, rather than lose it.
+        for b in bans
+            .iter()
+            .filter(|b| b.icon.is_some_and(|i| !in_slots.contains(&i)))
+        {
+            let mut b = b.clone();
+            b.team = b.color.and_then(|c| header.team_of_color(c));
+            from_slots.push(b);
         }
         *bans = from_slots;
     }
@@ -2818,6 +2830,37 @@ mod tests {
         let mut p = Parser::new(&[], header);
         p.finish_report(ReadMode::Full);
         p.round.decode
+    }
+
+    #[test]
+    fn a_ban_only_the_icons_show_is_kept_and_lowers_trust() {
+        let mut p = Parser::new(&[], own_recording(10));
+        // The icon scan found Mira; the slots hold only Ace.
+        p.round.bans.push(Ban {
+            operator: None,
+            role: TeamRole::Defense,
+            team: None,
+            icon: Some(39149215445),
+            slot: None,
+            no_ban: false,
+            color: Some(1),
+        });
+        p.ban_slots.push(crate::entities::BanSlot {
+            index: 0,
+            side: 1,
+            color: 2,
+            state: 3,
+            result: 1,
+            icon: Some(104189664325),
+        });
+
+        p.finish_bans();
+        p.finish_report(ReadMode::Full);
+
+        let icons: Vec<_> = p.round.bans.iter().map(|b| b.icon).collect();
+        assert_eq!(icons, [Some(104189664325), Some(39149215445)]);
+        let bans = p.round.decode.get("bans").unwrap();
+        assert_eq!(bans.status, Status::Partial);
     }
 
     #[test]

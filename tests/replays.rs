@@ -490,6 +490,10 @@ fn decode_status_reports_what_can_be_trusted() {
             Status::Inferred
         };
         assert_eq!(status("result"), result, "{}", path.display());
+        // The level's property is named ClearanceLevelText.
+        if round.header.code_version >= replay_analyzer::types::version::Y11S3 {
+            assert_eq!(status("levels"), Status::Decoded, "{}", path.display());
+        }
         let partial = Round::open(&path, ReadMode::Partial).unwrap();
         assert_eq!(
             partial.decode.get("result").unwrap().status,

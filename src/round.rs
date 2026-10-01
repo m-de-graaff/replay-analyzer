@@ -463,8 +463,9 @@ const BAN_WINDOW: usize = 160;
 /// Y11S3+: the `TeamColor` of the team that owns a ban slot, written right
 /// after its side. In a player's recording the player's own team is 1.
 const BAN_TEAM: [u8; 5] = [0x22, 0x2E, 0x61, 0xA2, 0xA9];
-/// Y11S3+: a player's level as decimal text, on the object carrying their
-/// name. Written once in the round's opening snapshot.
+/// Y11S3+: a player's clearance level as decimal text (`ClearanceLevelText`),
+/// on their profile object, which also carries their name. Written once in
+/// the round's opening snapshot.
 const PLAYER_LEVEL: [u8; 5] = [0x22, 0x3F, 0x0F, 0xDC, 0x1F];
 /// Name property on the same object, just before the level.
 const PLAYER_NAME: [u8; 8] = [0x75, 0x6D, 0x39, 0xD4, 0x00, 0x00, 0x00, 0x00];
@@ -1107,9 +1108,7 @@ impl<'a> Parser<'a> {
             .filter(|p| p.level.is_some())
             .count();
         if levels > 0 {
-            r.field("levels", Status::Inferred, levels).warn(
-                "probably the clearance level: stable across rounds and distinct per player, but not checked against Ubisoft's stats",
-            );
+            r.field("levels", Status::Decoded, levels);
         }
         if code >= version::Y9S1 && !skipped {
             r.field("feedbackMessages", Status::NotInVersion, 0)

@@ -274,7 +274,8 @@ pub struct PlayerSummary {
     /// services, which replays do not record.
     #[serde(rename = "profileID", skip_serializing_if = "String::is_empty")]
     pub profile_id: String,
-    /// Y11S3+, most likely the clearance level (full and partial reads).
+    /// Y11S3+: the clearance level (full and partial reads). Replays hold no
+    /// rank or reputation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
     /// `you`, `teammate` or `opponent`; absent for spectator recordings.

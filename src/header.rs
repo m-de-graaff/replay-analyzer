@@ -169,8 +169,8 @@ pub struct Player {
     pub role_portrait: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub spawn: String,
-    /// Y11S3+, from the round's opening snapshot. Most likely the clearance
-    /// level; see `decodeStatus.levels`.
+    /// Y11S3+: the clearance level, from the round's opening snapshot (the
+    /// game's property is `ClearanceLevelText`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
     /// The 4-byte id packets use to refer to this player.

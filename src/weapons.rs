@@ -336,11 +336,16 @@ pub(crate) fn activity(hud: &Hud, view: u32, username: &str, clock: &Clock) -> A
             .extend(slot.and_then(|(o, _)| hud.item(o)).map(|id| (item, id)));
     }
 
-    let hands = distinct(hud.series(view, ACTIVE_RETICLE_TYPE));
-    for s in &hands {
+    let mut hands: Vec<(Sample, Item)> = Vec::new();
+    for s in hud.series(view, ACTIVE_RETICLE_TYPE) {
         let item = item_of(s.value);
+        if hands.last().is_none_or(|l| l.1 != item) {
+            hands.push((s, item));
+        }
+    }
+    for &(s, item) in &hands {
         let id = out.id(item);
-        out.hands.push((seconds(*s), item));
+        out.hands.push((seconds(s), item));
         out.held.push(Held {
             item,
             id,
@@ -349,7 +354,7 @@ pub(crate) fn activity(hud: &Hud, view: u32, username: &str, clock: &Clock) -> A
         });
     }
     for (i, w) in hands.windows(2).enumerate() {
-        let (from, to) = (item_of(w[0].value), item_of(w[1].value));
+        let ((_, from), (emptied, to)) = (w[0], w[1]);
         if from == Item::None {
             continue;
         }
@@ -358,23 +363,22 @@ pub(crate) fn activity(hud: &Hud, view: u32, username: &str, clock: &Clock) -> A
                 from,
                 to,
                 duration: 0.0,
-                when: clock.when(w[1].at, w[1].frame),
+                when: clock.when(emptied.at, emptied.frame),
             });
             continue;
         }
         // Hands empty: a swap when another item follows soon enough.
-        let Some(next) = hands.get(i + 2) else {
+        let Some(&(next, to)) = hands.get(i + 2) else {
             continue;
         };
-        let (start, end) = (seconds(w[1]), seconds(*next));
-        let to = item_of(next.value);
-        if to != from && to != Item::None && end - start <= SWAP_LIMIT {
+        let (start, end) = (seconds(emptied), seconds(next));
+        if to != from && end - start <= SWAP_LIMIT {
             out.swapping.push((Span { start, end }, from, to));
             out.swaps.push(Swap {
                 from,
                 to,
                 duration: round(end - start),
-                when: clock.when(w[1].at, w[1].frame),
+                when: clock.when(emptied.at, emptied.frame),
             });
         }
     }

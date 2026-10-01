@@ -14,7 +14,7 @@ use crate::cursor::Cursor;
 use crate::decoder::ParserInfo;
 use crate::decompress::{self, Decompressed};
 use crate::details::{
-    Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
+    Ban, DownOutcome, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
 };
 use crate::entities::{PLAYER_TABLE_STREAM, PlayerTables};
 use crate::error::{Error, Result};
@@ -46,6 +46,9 @@ pub struct Round {
     pub observation: Vec<ObservationSession>,
     /// What each player carried, once per operator they played.
     pub loadouts: Vec<Loadout>,
+    /// Y11S3 full reads: health with its maximum and overheal, heals,
+    /// plates, status effects and reverse friendly fire.
+    pub vitals: Option<crate::vitals::Vitals>,
     /// The file the round was read from, when read from disk.
     pub file: Option<FileInfo>,
     /// Container layout and prelude.
@@ -82,7 +85,15 @@ pub struct Round {
     pub melee_hits: Vec<crate::melee::MeleeHit>,
     /// Y11S3: shields raised, extended and put away.
     pub shield_actions: Vec<crate::melee::ShieldAction>,
+    /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
+    /// every hit a player took (see [`crate::combat`]).
+    pub combat: Option<crate::combat::Combat>,
 }
+
+/// How far apart, in seconds, the timeline's entry for a kill, down or
+/// revive and the HUD's record of it can be written (0.5 s matched every
+/// kill of 162 real rounds).
+const JOIN_WINDOW: f64 = 0.5;
 
 /// A player's weapon going up (`ready`) or down.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -250,6 +261,16 @@ impl Serialize for Round {
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             loadouts: &'a [Loadout],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            heals: &'a [crate::vitals::Heal],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            plates: &'a [crate::vitals::Plate],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            effects: &'a [crate::vitals::Effect],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            friendly_fire: &'a [crate::vitals::ReverseFriendlyFire],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            flashes: &'a [crate::vitals::Flash],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
             weapon_ready: &'a [WeaponReady],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             weapon_activity: &'a [crate::weapons::Activity],
@@ -263,6 +284,9 @@ impl Serialize for Round {
             melee_hits: &'a [crate::melee::MeleeHit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             shield_actions: &'a [crate::melee::ShieldAction],
+            hits: &'a [crate::combat::Hit],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            timeline_events: &'a [crate::combat::TimelineEvent],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -270,6 +294,7 @@ impl Serialize for Round {
             #[serde(skip_serializing_if = "Option::is_none")]
             census: Option<&'a Census>,
         }
+        let vitals = self.vitals.as_ref();
         Output {
             header: &self.header,
             round: self.info(),
@@ -280,6 +305,11 @@ impl Serialize for Round {
             life_events: &self.life_events,
             observation: &self.observation,
             loadouts: &self.loadouts,
+            heals: vitals.map_or(&[], |v| &v.heals),
+            plates: vitals.map_or(&[], |v| &v.plates),
+            effects: vitals.map_or(&[], |v| &v.effects),
+            friendly_fire: vitals.map_or(&[], |v| &v.friendly_fire),
+            flashes: vitals.map_or(&[], |v| &v.flashes),
             weapon_ready: &self.weapon_ready,
             weapon_activity: &self.weapon_activity,
             shots: &self.shots,
@@ -287,6 +317,8 @@ impl Serialize for Round {
             throws: &self.throws,
             melee_hits: &self.melee_hits,
             shield_actions: &self.shield_actions,
+            hits: self.combat.as_ref().map_or(&[][..], |c| &c.hits),
+            timeline_events: self.combat.as_ref().map_or(&[][..], |c| &c.events),
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
@@ -826,6 +858,8 @@ impl<'a> Parser<'a> {
         self.link_feed_profiles();
         if mode == ReadMode::Full {
             self.resolve_loadouts();
+            self.resolve_vitals();
+            self.join_combat();
             self.round_end();
         }
         self.measure_records();
@@ -1142,6 +1176,34 @@ impl<'a> Parser<'a> {
             let f = r.field(field, Status::Decoded, *count);
             for w in warnings {
                 f.warn(w.clone());
+            }
+        }
+        // Y11S3: vitals count the players whose life object states a maximum
+        // health. One who never spawned has none, which is no fault of the
+        // read.
+        if let Some(v) = &round.vitals {
+            let with = v.players.iter().filter(|p| p.max_health.is_some()).count();
+            let f = r.field("vitals", Status::Decoded, with);
+            if with == 0 && !v.players.is_empty() {
+                f.at_most(Status::Missing);
+            }
+            if with < v.players.len() {
+                f.warn(format!(
+                    "{} of {} players have a maximum health; the others never spawned",
+                    with,
+                    v.players.len()
+                ));
+            }
+            for w in &v.warnings {
+                f.at_most(Status::Partial).warn(w.clone());
+            }
+        }
+        // Y11S3: the timeline and the hits. Who dealt a hit is inferred, and
+        // each hit says how (`attackerSource`).
+        if let Some(c) = &round.combat {
+            let f = r.field("combat", Status::Decoded, c.hits.len());
+            for w in &c.warnings {
+                f.at_most(Status::Partial).warn(w.clone());
             }
         }
         // A slot that could not be read, or slots and icons that disagree,
@@ -2583,6 +2645,152 @@ impl<'a> Parser<'a> {
         self.round.melee_hits = melee.hits;
         self.round.shield_actions = melee.shields;
         self.loadout_status = Some(decoded);
+        self.round.combat = Some(crate::combat::decode(
+            self.data,
+            map,
+            &container.streams,
+            players,
+            &clock,
+        ));
+    }
+
+    /// Y11S3: health with its maximum, heals, plates, status effects and
+    /// reverse friendly fire, from the HUD objects of the state stream (see
+    /// [`crate::vitals`]). Heals are told apart by when the healing
+    /// abilities were used, so this follows the loadouts.
+    fn resolve_vitals(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let (players, loadouts) = (&self.round.header.players, &self.round.loadouts);
+        let streams = &container.streams;
+        let vitals = crate::vitals::decode(self.data, map, streams, players, loadouts, &clock);
+        for (p, v) in self.round.header.players.iter_mut().zip(&vitals.players) {
+            p.max_health = v.max_health;
+        }
+        for h in &mut self.round.health {
+            let Some(s) = vitals.sample(&h.username, h.recording_time) else {
+                continue;
+            };
+            h.max_health = Some(s.max_health);
+            // The sample is the frame's last word; a value written before
+            // it in the same frame has no overheal or cause of its own.
+            if s.health == h.health {
+                h.overheal = Some(s.health.saturating_sub(s.max_health)).filter(|&o| o > 0);
+                h.cause = s.cause;
+            }
+        }
+        self.round.vitals = Some(vitals);
+    }
+
+    /// Y11S3: names who downed, finished and revived whom, from the round's
+    /// timeline, and what the victim of each kill was under. The timeline
+    /// and the life states are written apart, so an entry belongs to the
+    /// life event or kill of the same player within [`JOIN_WINDOW`].
+    fn join_combat(&mut self) {
+        use crate::combat::TimelineKind;
+        let Round {
+            combat,
+            vitals,
+            life_events,
+            match_feedback,
+            ..
+        } = &mut self.round;
+        let Some(combat) = combat else { return };
+        let near = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() <= JOIN_WINDOW,
+            _ => false,
+        };
+        let entry = |kinds: &[TimelineKind], username: &str, at: Option<f64>| {
+            combat.events.iter().find(|e| {
+                kinds.contains(&e.kind) && e.username == username && near(e.recording_time, at)
+            })
+        };
+        for l in life_events.iter_mut() {
+            let kind = match l.kind {
+                LifeEventType::Down => TimelineKind::Down,
+                LifeEventType::Revive => TimelineKind::Revive,
+            };
+            l.by = entry(&[kind], &l.username, l.recording_time).and_then(|e| e.by.clone());
+            l.self_revive =
+                l.kind == LifeEventType::Revive && l.by.as_deref() == Some(l.username.as_str());
+        }
+        // The HUD passes through "down" as a kill ends the round: the last
+        // player of a team cannot go down. The timeline has no down for it
+        // (20 of the 28 downs it does not list in 162 real rounds are these).
+        if !combat.events.is_empty() {
+            let killed_at_once = |l: &LifeEvent| {
+                l.kind == LifeEventType::Down
+                    && l.by.is_none()
+                    && entry(&[TimelineKind::Down], &l.username, l.recording_time).is_none()
+                    && match_feedback.iter().any(|u| {
+                        u.kind == MatchUpdateType::Kill
+                            && u.target == l.username
+                            && near(u.recording_time, l.recording_time)
+                    })
+            };
+            life_events.retain(|l| !killed_at_once(l));
+        }
+        // Each kill, with the down it ended when the victim was down.
+        for u in match_feedback.iter_mut() {
+            let Some(victim) = u.victim().map(str::to_owned) else {
+                continue;
+            };
+            let kinds = [TimelineKind::Kill, TimelineKind::TeamKill];
+            if u.kind == MatchUpdateType::Kill {
+                u.team_kill = entry(&kinds, &victim, u.recording_time)
+                    .is_some_and(|e| e.kind == TimelineKind::TeamKill);
+            }
+            let before =
+                |l: &&mut LifeEvent| l.username == victim && l.recording_time <= u.recording_time;
+            if let Some(down) = life_events.iter_mut().filter(before).last()
+                && down.kind == LifeEventType::Down
+            {
+                if u.kind == MatchUpdateType::Kill {
+                    u.finish = true;
+                    u.downed_by = down.by.clone().unwrap_or_default();
+                    down.outcome = Some(DownOutcome::Finished);
+                    down.finished_by = Some(u.username.clone());
+                } else {
+                    down.outcome = Some(DownOutcome::Died);
+                }
+            }
+            if let Some(v) = vitals {
+                let at = u.recording_time.unwrap_or(f64::MAX);
+                let listed = |e: &&crate::vitals::Effect| {
+                    let start = e.start.recording_time.unwrap_or(f64::MAX);
+                    e.username == victim && start <= at && at <= start + e.seconds + JOIN_WINDOW
+                };
+                u.victim_effects = v
+                    .effects
+                    .iter()
+                    .filter(listed)
+                    .filter_map(|e| e.name)
+                    .collect();
+                u.victim_effects.dedup();
+            }
+        }
+        // A down no kill ended: the player got up, or the recording ended.
+        for i in 0..life_events.len() {
+            if life_events[i].kind != LifeEventType::Down || life_events[i].outcome.is_some() {
+                continue;
+            }
+            let next = life_events[i + 1..]
+                .iter()
+                .find(|l| l.username == life_events[i].username);
+            life_events[i].outcome = Some(match next {
+                Some(l) if l.kind == LifeEventType::Revive => DownOutcome::Revived,
+                _ => DownOutcome::DownAtEnd,
+            });
+        }
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes
@@ -2688,6 +2896,11 @@ impl<'a> Parser<'a> {
         };
         let mut health: HashMap<u32, u32> = HashMap::new();
         let mut life: HashMap<u32, u32> = HashMap::new();
+        // Y11S3: a revive is a down that ends with health. Objects whose
+        // state left down for alive with none yet: health in the same frame
+        // or the next makes it a revive, state 4 a death.
+        let revive_needs_health = self.code() >= version::Y11S3;
+        let mut getting_up: std::collections::HashSet<u32> = Default::default();
         // Observer object -> (index of its open session, elapsed at start).
         let mut open: HashMap<u32, (usize, f64)> = HashMap::new();
         let before_action = &mut self.health_before_action;
@@ -2704,6 +2917,22 @@ impl<'a> Parser<'a> {
                         continue;
                     };
                     let prev = health.insert(s.object, *value);
+                    if *value > 0 && getting_up.remove(&s.object) {
+                        round.life_events.push(LifeEvent {
+                            kind: LifeEventType::Revive,
+                            username: username.clone(),
+                            health: Some(*value),
+                            by: None,
+                            self_revive: false,
+                            outcome: None,
+                            finished_by: None,
+                            time: time.clone(),
+                            time_in_seconds: at.seconds,
+                            phase: at.phase,
+                            elapsed: at.elapsed,
+                            recording_time: recorded(s.offset),
+                        });
+                    }
                     if at.phase == Phase::Prep {
                         before_action.insert(username.clone(), *value);
                     }
@@ -2715,6 +2944,9 @@ impl<'a> Parser<'a> {
                             username,
                             health: *value,
                             change: *value as i32 - prev as i32,
+                            max_health: None,
+                            overheal: None,
+                            cause: None,
                             time,
                             time_in_seconds: at.seconds,
                             phase: at.phase,
@@ -2727,16 +2959,33 @@ impl<'a> Parser<'a> {
                     let Some(username) = owner(&self.health_objects, s.object, 1) else {
                         continue;
                     };
-                    // 0 alive, 2 wounded, 3 downed, 4 dead.
+                    // 0 alive, 1 overhealed (Y11S3), 2 wounded, 3 downed,
+                    // 4 dead.
                     let prev = life.insert(s.object, *state).unwrap_or(0);
-                    let kind = match (prev, *state) {
-                        (p, 3) if p != 3 => LifeEventType::Down,
-                        (3, 0 | 2) => LifeEventType::Revive,
+                    getting_up.remove(&s.object);
+                    let now = health.get(&s.object).copied().filter(|&h| h > 0);
+                    let (kind, revived_to) = match (prev, *state) {
+                        (p, 3) if p != 3 => (LifeEventType::Down, None),
+                        (3, 0 | 2) if !revive_needs_health => (LifeEventType::Revive, None),
+                        // A downed player who dies is written 3, 2, 4, with
+                        // no health: not a revive.
+                        (3, 0..=2) if revive_needs_health => match now {
+                            Some(_) => (LifeEventType::Revive, now),
+                            None => {
+                                getting_up.insert(s.object);
+                                continue;
+                            }
+                        },
                         _ => continue,
                     };
                     round.life_events.push(LifeEvent {
                         kind,
                         username,
+                        health: revived_to,
+                        by: None,
+                        self_revive: false,
+                        outcome: None,
+                        finished_by: None,
                         time,
                         time_in_seconds: at.seconds,
                         phase: at.phase,

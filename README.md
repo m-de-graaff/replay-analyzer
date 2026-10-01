@@ -46,10 +46,18 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `teams[].color` | The game's number for the team (`TeamColor`, 1 or 2), from its team object. Ban slots and `matchresult` name teams by it: in a player's own recording the player's team is always 1, whatever its index in the header. | Y11S3+ |
 | `matchFeedback[].weapon` | Id of the gun or gadget behind each kill. | Y8S1+ |
 | `loadouts` | Guns and gadgets per player, once per operator played, so attacker swaps get their own entry: `weapons` and `gadgets` are item ids, and kill `weapon` ids match them. From Y11S3 the entry of the operator a player spawned with adds `primary` and `secondary` (name, attachments, ammunition) and `ability` and `gadget` (how many the player had, and when each was used). See [Loadouts](#loadouts). | Y8S1+ (detail Y11S3+) |
-| `health` | Every health change in the action phase, with the clock. | Y8S1+ |
-| `lifeEvents` | Downs (DBNO) and revives. | Y8S1+ |
+| `health` | Every health change in the action phase, with the clock. From Y11S3 each adds `maxHealth`, `overheal` (health above the maximum) and, when the change was not damage, its `cause`. See [Health and damage](#health-and-damage). | Y8S1+ (detail Y11S3+) |
+| `lifeEvents` | Downs (DBNO) and revives. From Y11S3 a down names who dealt it (`by`) and how it ended (`outcome`, `finishedBy`); a revive names who gave it (`by`, `self`) and the `health` the player got up with. | Y8S1+ (detail Y11S3+) |
+| `hits` | Every hit a player took: damage, damage type, direction, and the attacker where one can be named. | Y11S3+ |
+| `timelineEvents` | The round's own timeline: kills, team kills, deaths with no killer, downs and revives, each with both players. | Y11S3+ |
+| `heals`, `plates` | Each heal (receiver, amount, kind, giver) and each Rook plate picked up. | Y11S3+ |
+| `effects` | Status effects per player with start and duration: poison, burning, tracking, scans and more. | Y11S3+ |
+| `friendlyFire` | Players whose reverse friendly fire was on, with when it turned on and off. | Y11S3+ |
+| `flashes` | When the recording player was flashed (player recordings only). | Y11S3+ |
+| `players[].maxHealth` | The operator's maximum health: 100, 110 or 125. Replays hold no armor rating; this is what the game has in its place. | Y11S3+ |
+| `matchFeedback[].teamKill`, `finish`, `downedBy`, `victimEffects` | On kills: the victim was a teammate; the victim was down, and who downed them; the status effects the victim was under. | Y11S3+ |
 | `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
-| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. | Y8S1+ |
+| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`. | Y8S1+ (detail Y11S3+) |
 | `weaponActivity`, `shots`, `bulletHits`, `throws`, `meleeHits`, `shieldActions` | What players held, fired, reloaded, threw and struck. See [Weapons and shooting](#weapons-and-shooting). | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
 
@@ -133,8 +141,8 @@ The library equivalent is `library::scan(path, ReadMode::Header)`.
 - **`endedEarly`** comes from `matchresult`. A forfeit, where a team surrenders, should carry 1 or 2 like a normal ending and so get a winner, but no forfeit has been seen. Value 7 has been seen once: the server ended a ranked match 0.03 s into round 4, with no clock, both teams marked as losing and a system notice no other round has. The cause, which the file does not say, may be a ban of a cheating player, which ends a match for everyone.
 - **Dual Front** (6v6, respawns) has not been seen in a replay, and no source says whether it records one. Pick packets are split into teams by `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
 
-- Replays record a player's health, never who caused a change. From Y11S3 `bulletHits` matches each bullet hit to the shot that made it; other damage has no source but the kill feed.
-- Older replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
+- Before Y11S3, replays give a player's health and never who caused a change, so there is damage taken but no damage dealt. From Y11S3 every hit is read, and its attacker is named or inferred; see [Health and damage](#health-and-damage). `bulletHits` separately matches each bullet hit to the shot that made it; see [Weapons and shooting](#weapons-and-shooting).
+- Before Y11S3, replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
 - Observation tool ids 1 (drone), 2 (camera), 6 (Black Eye), 8 (Flores drone) and 9 (shock drone) are confirmed; 3 is a second camera kind seen on defenders with a camera gadget. Others print as `ObservationTool(n)`.
 - No round in the test match or the real folder ends with the defuser going off, so `DefusedBomb` is untested from Y11S3: it is given when attackers win after a plant with defenders left and the defuser timer at zero.
 - `elapsed` counts whole clock seconds, and the first second of a recording is cut short, so it can sit up to two seconds from `recordingTime` minus the prep start.
@@ -364,6 +372,106 @@ Not recorded, or not decoded:
 - **Clash's, Blackbeard's and Osa's shield states** are not decoded; Osa gets no shield actions.
 - Blitz's and Fuze's shields and the ten-hit barricades occur only in real rounds, so the test replays do not cover them.
 
+## Health and damage
+
+From Y11S3, three streams hold what happened to a player's health. All of it needs a full read. Numbers below are from 164 rounds of a real `MatchReplay` folder and the 10 test rounds.
+
+### Downs, kills and revives
+
+The game writes the finished round's timeline into the file (`TimelineChannel`): every kill, team kill, down and revive, each naming both players. `timelineEvents[]` carries it as `type` (`Kill`, `TeamKill`, `Death`, `Down`, `Revive`), `username` (the victim, or the player revived), `by`, and for kills `weapon` and `headshot`. It parsed to its last byte in every finished round.
+
+It is joined onto the events the parser already had:
+
+| Key | What it holds |
+|---|---|
+| `lifeEvents[].by` | Who downed the player, or who revived them. All 32 revives and 314 of 319 downs name someone. |
+| `lifeEvents[].self` | The player revived themselves (6 of 32: Doc's and Finka's own abilities). |
+| `lifeEvents[].outcome` | For a down: `Finished` (with `finishedBy`), `Revived`, `DownAtEnd`, or `Died` when the player died with no killer named. |
+| `matchFeedback[].finish`, `downedBy` | The kill ended a down, and who dealt that down. Where the scoreboard credits the kill to another player (`creditedTo`), it is always the downer. |
+| `matchFeedback[].teamKill` | The timeline lists the kill as a team kill (12 in the real folder, the same 12 whose killer and victim share a team). |
+
+- **No bleed-out has been seen.** No player bled out in 174 rounds, so what one looks like is untested. It should read as `Died`. The bleed-out timer itself (`DBNOProgress`) is in the file and not output.
+- **A kill that ends the round is not a down.** The HUD passes through the down state as the last player of a team dies; those are dropped (23 in the real folder).
+- **Two fixes to older output.** A death written through the down state used to be reported as a revive: 143 "revives" in the real folder, 32 of them real. `damageTaken` used to miss the killing blow of most deaths and count an overheal wearing off as damage.
+
+### Hits
+
+Every hit on a player is in the movement stream, on the victim's body. `hits[]` carries:
+
+| Key | What it holds | How |
+|---|---|---|
+| `username` | The victim. | Decoded |
+| `damage` | Health the hit took. Absent on a hit that downs or kills: the game stores an overkill value there, not the health removed. | Decoded |
+| `health`, `result` | Health after the hit, and `Alive`, `Down` or `Dead`. | Decoded |
+| `type` | `{id, name}`: 0 `bullet`, 1 `melee`, 2 `explosion`, 9 `gas`, 36 `fire`. Other ids have no name yet. | Id decoded, names inferred from which operators were in the round |
+| `multiplier` | Final damage over base damage: 1.0 or about 0.75 for bullets, lower for explosions with distance. | Inferred |
+| `direction` | Where the hit came from, in eighths of a turn clockwise from where the victim was looking. | Inferred |
+| `by`, `attackerSource` | The attacker, and how they were found (below). | See below |
+| `distance` | Metres between attacker and victim. | Derived, only with `by` |
+
+**The file never names the attacker of a hit.** `attackerSource` says where `by` comes from:
+
+- `Timeline`: the hit downed or killed, and the timeline names who did it. Read, not inferred. 36.5% of hits.
+- `Shot`: for bullets, the opponent whose ammunition dropped within about a tenth of a second and who was aiming closest to the victim. Checked against hits the timeline names: right for 1313 of 1350. 51.3% of hits.
+- `Aim`: no opponent's ammunition dropped; the opponent aiming within 10 degrees of the victim. Right for 35 of 41. 3.6% of hits.
+- Absent (8.7% of hits): nobody could be named. Explosions, gas, fire and gadget damage never get an inferred attacker.
+
+`stats[].damageDealt` adds up the hits a player is named for, so it is an estimate and leaves unnamed hits out; hits on teammates go to `teamDamage`. A hit that downs or kills counts the health the victim had left. `damageTaken` adds up every hit on the player the same way.
+
+- About 1.3% of the health losses the HUD shows have no hit found for them.
+- **Body part is not recorded.** A kill's `headshot` is; for other hits a `multiplier` near 0.75 fits a limb hit, which is unconfirmed.
+- **Whether a hit went through a wall is not recorded.**
+
+### Health, overheal, armor and heals
+
+The HUD's life object gives each player `Health`, `MaxHealth` and a life state. `health[]` adds `maxHealth`, and `overheal` when health is above it (the most seen is 20). An overheal wears off at 1 health a second; those steps have `cause: "decay"`.
+
+- **Armor.** Replays hold no armor rating. Each operator has one `MaxHealth`, 100, 110 or 125 (`players[].maxHealth`), which is what the game uses in its place.
+- **Plates.** A Rook plate raises `MaxHealth` and health by 25. `plates[]` lists each pickup with `username` and `by` (the team's Rook). When the pack was put down is the drop of Rook's ability count in `loadouts`.
+
+`heals[]` lists every other rise in health: `username`, `amount`, `health` after it, `overheal`, `kind`, `by`, and `revive` when it got the player up from a down.
+
+| `kind` | Told by | Seen |
+|---|---|---|
+| `finkaSurge` | The Finka boost appears in the player's effects in the same frame. +20. | 115 |
+| `docStim` | Health jumps to the overheal limit as Doc's stim count drops. | 12 |
+| `konaBurst`, `konaTick` | The Thunderbird station's effect is listed: +20 at once, then +1 about three times a second. | 12, 131 |
+
+The kinds are inferred from those signs, and **the giver is inferred too**: the file links no heal to a player, so `by` is the team's Finka, Doc or Thunderbird. Two rises in the real folder fit none of the kinds and are left out. The test rounds have none of these operators, so heals and plates are checked on the real folder only.
+
+### Status effects
+
+Each player's HUD keeps a list of the effects on them. `effects[]` has one entry per stretch: `username`, `type` (the game's number), `name`, `buff` (true for the player's own or a teammate's ability), when it started and `seconds`. An effect names neither the gadget nor the player behind it.
+
+The numbers are the game's; **the names are inferred** from which operator was in every round a type showed up in:
+
+| Name | Type | Name | Type |
+|---|---|---|---|
+| `JackalTracked`, `JackalTracking` | 0, 33 | `GrimSwarm`, `GrimTracked` | 22, 23 |
+| `LesionPoison` | 1 | `FenrirMine`, `FenrirFear` | 26, 27 |
+| `FinkaSurge` | 2 | `TubaraoZoto` | 28 |
+| `DokkaebiCall` | 3 | `DeimosMarked`, `DeimosTracking` | 30, 31 |
+| `RookArmor` | 4 | `ThunderbirdHeal` | 35 |
+| `AlibiTracked` | 5 | `ThornRazorbloom` | 39 |
+| `ClashShock` | 6 | `SnakeRadar` | 43 |
+| `EnemyJammer`, `FriendlyJammer` | 8, 34 | `NoorLance` | 46 |
+| `LionScan` | 11 | `Burning` | 52 |
+| `ProximityAlarm` | 13 | `MelusiBanshee` | 14 |
+
+Types 15, 21, 25, 29, 37 and 51 occur and have no name. A kill's `victimEffects` lists the named effects the victim was under.
+
+What the list does not hold:
+
+- **Flashes of other players.** The flash flag is written for the player whose screen the recording shows, so `flashes[]` covers the recording player only and a spectator recording has none.
+- **Concussion, Smoke's gas, electricity and traps** have no effect entry. Gas and fire still show as `hits` with their damage type.
+- **A hacked phone** (Dokkaebi) was not identified; type 51 is the only candidate.
+
+### Friendly fire
+
+`friendlyFire[]` lists each player whose reverse friendly fire was on in the round: `activeAtStart` when it carried over from an earlier round, and `on` and `off` with their times. It is the game's own flag (`IsReverseFriendlyFireActive`). It turned on for the killer after all 12 team kills in the real folder, and 5 times with no kill, after damage to a teammate. Team damage itself is only in `hits`, where `teamDamage` counts the hits a teammate is named for.
+
+`decodeStatus` adds `combat` (hits read) and `vitals` (players with a maximum health).
+
 ## Players and identity
 
 Every player in `players[]` carries:
@@ -468,7 +576,7 @@ block                        "CMPRV002" (stored as a u64), u32 raw size, u32 pac
 
 Decompressed, each snapshot is a u64 length and the snapshot. The main stream holds every stream's records, each a u32 frame, u32 size, u32 0 and the payload, so every packet belongs to a frame and the index gives its time. Reading only the header needs no decompression for Y8S4+ (`ReadMode::Header`); before Y8S4 everything is one zstd stream.
 
-- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. Only the first four are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
+- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. Only the first four and `TimelineChannel` are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
 - **Recording ids.** Stream ids come from one counter per run of the game. A round takes its main id (`recordingId`) and one per stream, and the next recording starts right after, so a skipped id is a recording that was started and never saved. The folder name ends in the same run's process id.
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.

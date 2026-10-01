@@ -25,12 +25,45 @@ pub struct PlayerRoundStats {
     /// Kills made as the last player standing on the winning team.
     #[serde(rename = "1vX", skip_serializing_if = "is_zero")]
     pub one_vx: u32,
-    /// Health lost during the action phase.
+    /// Health lost during the action phase. From Y11S3 the damage of every
+    /// hit taken, the killing blow included, so an overheal wearing off
+    /// does not count.
     pub damage_taken: u32,
+    /// Y11S3: damage of the hits on opponents this player is named for.
+    /// The attacker of a hit is inferred unless it downed or killed (see
+    /// [`crate::combat`]), and hits nobody is named for count for nobody,
+    /// so this is an estimate. A hit that downs or kills counts the health
+    /// the victim had left.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub damage_dealt: Option<u32>,
+    /// Y11S3: the same for hits on teammates.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub team_damage: u32,
+    /// Times the player went down.
     #[serde(skip_serializing_if = "is_zero")]
     pub downs: u32,
+    /// Times the player was revived.
     #[serde(skip_serializing_if = "is_zero")]
     pub revives: u32,
+    /// Y11S3: opponents this player downed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub downs_dealt: u32,
+    /// Y11S3: kills of players who were down.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub finishes: u32,
+    /// Y11S3: other players this player revived.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub revives_given: u32,
+    /// Y11S3: kills of teammates.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub team_kills: u32,
+    /// Y11S3: health this player's heals gave, to themselves included. The
+    /// giver of a heal is inferred (see [`crate::vitals`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub healing_given: u32,
+    /// Y11S3: health heals gave this player.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub healing_received: u32,
     /// Seconds spent on drones (any phase, own or a teammate's).
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
@@ -52,7 +85,19 @@ pub struct PlayerMatchStats {
     pub headshots: u32,
     pub headshot_percentage: f64,
     pub damage_taken: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub damage_dealt: Option<u32>,
     pub downs: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub downs_dealt: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub finishes: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub revives_given: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub team_kills: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub healing_given: u32,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
@@ -110,6 +155,17 @@ impl Round {
             .count()
     }
 
+    /// Y11S3: the health `username`'s HUD last showed above zero before
+    /// `time`, with a margin for the HUD writing a hit a frame early.
+    fn health_before(&self, username: &str, time: Option<f64>) -> Option<u32> {
+        let (vitals, time) = (self.vitals.as_ref()?, time?);
+        let player = vitals.players.iter().find(|p| p.username == username)?;
+        let earlier = |s: &&crate::vitals::VitalSample| {
+            s.health > 0 && s.recording_time.is_some_and(|t| t < time - 0.05)
+        };
+        player.samples.iter().rev().find(earlier).map(|s| s.health)
+    }
+
     pub fn winning_team(&self) -> usize {
         usize::from(self.header.teams[1].won)
     }
@@ -137,7 +193,10 @@ impl Round {
             .collect();
         let find = |name: &str| index.get(name).copied();
 
-        for h in &self.health {
+        // From Y11S3 the hits themselves say what a player took; before,
+        // only the health the HUD showed does, which misses the last blow
+        // of most deaths.
+        for h in self.health.iter().filter(|_| self.combat.is_none()) {
             if let Some(i) = find(&h.username) {
                 stats[i].damage_taken += h.change.min(0).unsigned_abs();
             }
@@ -147,6 +206,48 @@ impl Round {
                 match e.kind {
                     LifeEventType::Down => stats[i].downs += 1,
                     LifeEventType::Revive => stats[i].revives += 1,
+                }
+            }
+            let by = e.by.as_deref().filter(|by| *by != e.username);
+            if let Some(i) = by.and_then(find) {
+                match e.kind {
+                    LifeEventType::Down => stats[i].downs_dealt += 1,
+                    LifeEventType::Revive => stats[i].revives_given += 1,
+                }
+            }
+        }
+        if let Some(combat) = &self.combat {
+            for s in &mut stats {
+                s.damage_dealt = Some(0);
+            }
+            for h in &combat.hits {
+                let Some(victim) = find(&h.username) else {
+                    continue;
+                };
+                // A hit that downs or kills holds no amount: it took what
+                // health the victim's HUD last showed before it.
+                let damage = h
+                    .damage
+                    .or_else(|| self.health_before(&h.username, h.recording_time));
+                let damage = damage.unwrap_or(0);
+                stats[victim].damage_taken += damage;
+                let Some(by) = h.by.as_deref().and_then(find).filter(|&by| by != victim) else {
+                    continue;
+                };
+                if stats[by].team_index == stats[victim].team_index {
+                    stats[by].team_damage += damage;
+                } else {
+                    *stats[by].damage_dealt.get_or_insert(0) += damage;
+                }
+            }
+        }
+        if let Some(vitals) = &self.vitals {
+            for h in &vitals.heals {
+                if let Some(i) = find(&h.username) {
+                    stats[i].healing_received += h.amount;
+                }
+                if let Some(i) = h.by.as_deref().and_then(find) {
+                    stats[i].healing_given += h.amount;
                 }
             }
         }
@@ -168,6 +269,8 @@ impl Round {
                         let s = &mut stats[i];
                         s.kills += 1;
                         s.headshots += u32::from(u.headshot == Some(true));
+                        s.finishes += u32::from(u.finish);
+                        s.team_kills += u32::from(u.team_kill);
                         s.headshot_percentage = headshot_percentage(s.headshots, s.kills);
                     }
                     if let Some(t) = find(&u.target) {
@@ -249,7 +352,15 @@ pub fn match_stats<'a>(rounds: impl IntoIterator<Item = &'a Round>) -> Vec<Playe
             s.headshots += p.headshots;
             s.headshot_percentage = headshot_percentage(s.headshots, s.kills);
             s.damage_taken += p.damage_taken;
+            if let Some(dealt) = p.damage_dealt {
+                *s.damage_dealt.get_or_insert(0) += dealt;
+            }
             s.downs += p.downs;
+            s.downs_dealt += p.downs_dealt;
+            s.finishes += p.finishes;
+            s.revives_given += p.revives_given;
+            s.team_kills += p.team_kills;
+            s.healing_given += p.healing_given;
             s.drone_seconds += p.drone_seconds;
             s.camera_seconds += p.camera_seconds;
         }

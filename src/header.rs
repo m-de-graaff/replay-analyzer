@@ -174,6 +174,10 @@ pub struct Player {
     /// game's property is `ClearanceLevelText`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
+    /// Y11S3+ full reads: the operator's maximum health without a Rook
+    /// plate (the HUD's `MaxHealth`): 100, 110 or 125.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_health: Option<u32>,
     /// The 4-byte id packets use to refer to this player.
     #[serde(skip)]
     pub dissect_id: Option<[u8; 4]>,

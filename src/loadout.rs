@@ -781,7 +781,7 @@ impl Clock<'_> {
         }
     }
 
-    fn place(&self, count: u32, s: Sample) -> Use {
+    pub(crate) fn place(&self, count: u32, s: Sample) -> Use {
         let when = self.when(s.at, s.frame);
         Use {
             count,

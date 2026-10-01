@@ -72,6 +72,18 @@ pub struct HealthUpdate {
     pub health: u32,
     /// Negative for damage, positive for healing.
     pub change: i32,
+    /// Y11S3: the most health the player could have without overheal when
+    /// this was written, a Rook plate included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_health: Option<u32>,
+    /// Y11S3: how much of `health` is above `max_health`. Left out when none
+    /// is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overheal: Option<u32>,
+    /// Y11S3: why the health changed, when it was not damage: overheal
+    /// wearing off, a heal, a plate. Inferred, see [`crate::vitals`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::vitals::Cause>,
     pub time: String,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub time_in_seconds: f64,
@@ -92,12 +104,43 @@ pub enum LifeEventType {
     Revive,
 }
 
+/// How a down ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+pub enum DownOutcome {
+    /// Another player killed them while down.
+    Finished,
+    /// They got back up.
+    Revived,
+    /// They died with no killer named. A bleed-out would read like this;
+    /// none has been seen in a replay.
+    Died,
+    /// Still down when the recording ended.
+    DownAtEnd,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LifeEvent {
     #[serde(rename = "type")]
     pub kind: LifeEventType,
     pub username: String,
+    /// Y11S3, `Revive`: the health the player got up with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<u32>,
+    /// Y11S3: who downed the player, or who revived them, as the round's
+    /// timeline names them (see [`crate::combat`]). Absent when it names
+    /// nobody: a down that ended the round, or one nobody dealt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// Y11S3, `Revive`: the player got themselves up.
+    #[serde(rename = "self", skip_serializing_if = "std::ops::Not::not")]
+    pub self_revive: bool,
+    /// Y11S3, `Down`: how the down ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<DownOutcome>,
+    /// Y11S3, `Down` that ended `Finished`: the killer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_by: Option<String>,
     pub time: String,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub time_in_seconds: f64,

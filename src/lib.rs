@@ -10,6 +10,7 @@
 
 pub mod analytics;
 pub mod census;
+pub mod combat;
 pub mod container;
 pub mod cosmetics;
 mod cursor;
@@ -38,6 +39,7 @@ pub mod throws;
 pub mod timeline;
 pub mod types;
 pub mod weapons;
+pub mod vitals;
 
 pub use analytics::MatchAnalytics;
 pub use census::Census;
@@ -45,7 +47,7 @@ pub use container::{Container, DirectoryState, StreamInfo};
 pub use cosmetics::Cosmetics;
 pub use decoder::ParserInfo;
 pub use details::{
-    Ban, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
+    Ban, DownOutcome, HealthUpdate, LifeEvent, LifeEventType, Loadout, ObservationSession, Phase,
 };
 pub use error::{Error, Result};
 pub use feedback::{MatchUpdate, MatchUpdateType};
@@ -63,3 +65,4 @@ pub use stats::{PlayerMatchStats, PlayerRoundStats};
 pub use summary::MatchSummary;
 pub use timeline::{PhaseSpan, Timeline};
 pub use types::{GameMode, Map, MatchType, ObservationTool, Operator, TeamRole, WinCondition};
+pub use vitals::Vitals;

@@ -70,6 +70,19 @@ pub struct MatchUpdate {
     pub credited_to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headshot: Option<bool>,
+    /// Y11S3: the round's timeline lists this kill as one of a teammate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub team_kill: bool,
+    /// Y11S3: the victim was down, and this player downed them.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub downed_by: String,
+    /// Y11S3: the victim was down when killed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub finish: bool,
+    /// Y11S3: the status effects the victim's HUD listed at the kill, by
+    /// name (see [`crate::vitals`]); effects without a name are left out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub victim_effects: Vec<&'static str>,
     /// Round clock as displayed in game, e.g. `2:41`.
     pub time: String,
     #[serde(serialize_with = "whole_number_as_int")]
@@ -121,6 +134,10 @@ impl MatchUpdate {
             target_profile_id: String::new(),
             credited_to: String::new(),
             headshot: None,
+            team_kill: false,
+            downed_by: String::new(),
+            finish: false,
+            victim_effects: Vec::new(),
             time: clock.display.clone(),
             time_in_seconds: clock.seconds,
             message: String::new(),

@@ -29,6 +29,12 @@
 //!   and cosmetics.
 //! - Y11S3 (profile Y9S4): loadouts from the HUD slots and entity
 //!   descriptors, with attachments, ammunition and ability and gadget counts.
+//! - Y11S3 (profile Y9S4): the round's timeline (who downed, finished and
+//!   revived whom, team kills), every hit a player took, maximum health and
+//!   overheal, heals, plates, status effects and reverse friendly fire. A
+//!   death written through the down state is no longer a revive, and a
+//!   kill that ends the round is no longer a down; `damageTaken` counts
+//!   hits, so the killing blow is in and an overheal wearing off is out.
 
 use serde::Serialize;
 
@@ -114,7 +120,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 10,
+        revision: 11,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

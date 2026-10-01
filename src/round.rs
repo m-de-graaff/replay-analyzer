@@ -674,7 +674,7 @@ impl<'a> Parser<'a> {
                     .get_or_insert_with(|| format!("at {}: {e}", start + offset));
             }
         }
-        if self.players_read < 10 {
+        if self.players_read < 2 * self.team_size() {
             self.derive_team_roles();
         }
         self.read_levels(start, end);
@@ -1279,7 +1279,7 @@ impl<'a> Parser<'a> {
             Packet::Player => {
                 self.players_read += 1;
                 let result = self.read_player(c);
-                if self.players_read == 10 {
+                if self.players_read == 2 * self.team_size() {
                     self.derive_team_roles();
                 }
                 result
@@ -1316,6 +1316,12 @@ impl<'a> Parser<'a> {
         u.username = username.to_owned();
         u.offset = Some(self.packet_at);
         u
+    }
+
+    /// Players per team: 5 unless the header says otherwise (Y11S3+
+    /// `maxnbplayersperteam`; Dual Front is 6v6).
+    fn team_size(&self) -> u32 {
+        self.round.header.max_players_per_team.unwrap_or(5)
     }
 
     fn read_player(&mut self, c: &mut Cursor) -> Result<()> {
@@ -1356,7 +1362,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.take_loadout(c.pos(), &username, operator);
-        let team_index = usize::from(self.players_read > 5);
+        let team_index = pick_team(self.players_read, self.team_size());
         self.pick_slots.insert(self.players_read, username.clone());
 
         // Caster UI id; links attacker swaps to players from Y9S3.
@@ -2765,6 +2771,12 @@ fn owning_object(before: &[u8], marker_len: usize) -> Option<u32> {
     })
 }
 
+/// The team of the `pick`-th pick packet (from 1) of a round where each
+/// team has `per_team` players: the first team's players are picked first.
+fn pick_team(pick: u32, per_team: u32) -> usize {
+    usize::from(pick > per_team)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2807,6 +2819,14 @@ mod tests {
         let mut p = Parser::new(&[], header);
         p.finish_report(ReadMode::Full);
         p.round.decode
+    }
+
+    #[test]
+    fn picks_fill_the_first_team_up_to_the_team_size() {
+        assert_eq!(pick_team(5, 5), 0);
+        assert_eq!(pick_team(6, 5), 1);
+        assert_eq!(pick_team(6, 6), 0);
+        assert_eq!(pick_team(7, 6), 1);
     }
 
     #[test]

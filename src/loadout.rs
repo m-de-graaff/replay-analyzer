@@ -75,6 +75,8 @@ pub(crate) const SLOT_FIELDS: [Hash; 4] =
 const GADGET_VIEW: Hash = [0x9F, 0x44, 0x69, 0x0A];
 const WEAPON_VIEW: Hash = [0x0E, 0xAA, 0x2B, 0xE0];
 const WEAPON_AMMO: Hash = [0xAF, 0x99, 0xE1, 0x0B];
+/// Weapon slot -> the gun's own `WeaponAmmoViewModel`.
+const AMMO_FIELD: Hash = [0x1E, 0xD1, 0x7F, 0xD6];
 /// Gadget slot: how many are left (`Ammo`) and how many it can hold
 /// (`MaxAmmo`).
 const AMMO: Hash = [0x14, 0xD1, 0xBD, 0x4F];
@@ -344,7 +346,11 @@ impl Hud {
     }
 
     /// The last child linked to `obj` that `wanted` accepts, with its class.
-    pub(crate) fn last_link(&self, obj: u32, wanted: impl Fn(Hash, Hash) -> bool) -> Option<(u32, Hash)> {
+    pub(crate) fn last_link(
+        &self,
+        obj: u32,
+        wanted: impl Fn(Hash, Hash) -> bool,
+    ) -> Option<(u32, Hash)> {
         let links = &self.nodes.get(&obj)?.links;
         let (_, child, class) = links.iter().rev().find(|l| wanted(l.0, l.2))?;
         Some((*child, *class))
@@ -382,7 +388,11 @@ impl Hud {
 
     /// The `WeaponAmmoViewModel` of a weapon slot object.
     pub(crate) fn ammo_object(&self, slot: u32) -> Option<u32> {
-        Some(self.last_link(slot, |_, c| c == WEAPON_AMMO)?.0)
+        // A gun with a launcher under it links a second one, for the
+        // launcher, through another field.
+        let ammo =
+            |own: bool| self.last_link(slot, |f, c| c == WEAPON_AMMO && (!own || f == AMMO_FIELD));
+        Some(ammo(true).or_else(|| ammo(false))?.0)
     }
 
     /// The loadout view of the player with this controller that was
@@ -408,7 +418,7 @@ impl Hud {
             ..Slot::default()
         };
         if slot.weapon {
-            if let Some((ammo, _)) = self.last_link(obj, |_, c| c == WEAPON_AMMO) {
+            if let Some(ammo) = self.ammo_object(obj) {
                 slot.magazine_size = self.series(ammo, MAGAZINE_SIZE).next().map(|s| s.value);
                 slot.counts = distinct(self.series(ammo, TOTAL_AMMO));
             }

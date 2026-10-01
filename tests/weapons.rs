@@ -121,7 +121,11 @@ fn agreement(rounds: &[Round]) -> Agreement {
                 a.fired_in_hand += usize::from(act.at(t).held == f.slot);
             }
             if let Some(l) = loadout {
-                let uses = l.gadget.iter().flat_map(|g| &g.counts).flat_map(|c| &c.uses);
+                let uses = l
+                    .gadget
+                    .iter()
+                    .flat_map(|g| &g.counts)
+                    .flat_map(|c| &c.uses);
                 for t in uses.filter_map(|u| u.recording_time) {
                     a.gadget_uses += 1;
                     let held = |back: f64| act.at(t - back).held == Item::Gadget;
@@ -136,9 +140,8 @@ fn agreement(rounds: &[Round]) -> Agreement {
         let kills = (round.match_feedback.iter()).filter(|u| u.kind == MatchUpdateType::Kill);
         for kill in kills {
             a.kills += 1;
-            a.victims_placed += usize::from(
-                activity(round, &kill.target).is_some_and(|v| v.at_death.is_some()),
-            );
+            a.victims_placed +=
+                usize::from(activity(round, &kill.target).is_some_and(|v| v.at_death.is_some()));
             let (Some(killer), Some(t)) = (activity(round, &kill.username), kill.recording_time)
             else {
                 continue;

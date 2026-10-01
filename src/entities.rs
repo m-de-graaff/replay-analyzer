@@ -57,6 +57,23 @@ const PARTY_ROLE: Hash = [0xAF, 0x6B, 0xB2, 0x87];
 /// `matchresult` name teams by it.
 const TEAM_COLOR: Hash = [0x2E, 0x61, 0xA2, 0xA9];
 
+/// Y11S3 ban manager: one array of three ban slots per team.
+const BAN_SLOT_ARRAYS: [Hash; 2] = [[0x56, 0x1E, 0x4C, 0x23], [0xE6, 0x37, 0x2C, 0x1E]];
+/// Ban slot: the side of the operator it bans, 1 attack, 2 defense
+/// (`HeroTeam`).
+const HERO_TEAM: Hash = [0x18, 0xFF, 0xCA, 0x5E];
+/// Ban slot: 0 not used yet, 3 resolved (`BanState`).
+const BAN_STATE: Hash = [0x60, 0x39, 0xD5, 0xB5];
+/// Ban slot: 1 an operator was banned, 2 the vote ended without a ban
+/// (`ResultType`).
+const RESULT_TYPE: Hash = [0x32, 0x3D, 0xDC, 0xAA];
+/// Ban slot -> the banned operator's descriptor (`Operator`), 0 when none.
+const OPERATOR: Hash = [0xD7, 0xC5, 0xD0, 0x2E];
+/// Operator descriptor -> its info object (`OperatorInfo`).
+const OPERATOR_INFO: Hash = [0x32, 0x83, 0xB2, 0x1A];
+/// Operator info: the operator's icon, the id `roleimage` uses (`BadgeIcon`).
+const BADGE_ICON: Hash = [0xDA, 0x69, 0x14, 0xD5];
+
 /// How far into the stream the opening snapshot of the tree can reach.
 const SNAPSHOT_BYTES: usize = 4 << 20;
 
@@ -66,6 +83,8 @@ struct Object {
     props: Vec<(Hash, usize, usize)>,
     /// `(field, child)` links, in stream order.
     children: Vec<(Hash, u32)>,
+    /// `(field, index, child, offset)` of each array slot (`1e` records).
+    elements: Vec<(Hash, u32, u32, usize)>,
 }
 
 /// The objects of the opening snapshot.
@@ -122,8 +141,10 @@ enum Record {
     Prop(Hash, usize, usize),
     /// `1b`: parent, field, child.
     ParentChild(u32, Hash, u32),
-    /// `1a` or `1e`: field, child.
+    /// `1a`: field, child.
     Child(Hash, u32),
+    /// `1e`: field, array index, child.
+    Element(Hash, u32, u32),
 }
 
 /// Array indices are small (64 at most in real rounds). Binary data between
@@ -162,9 +183,10 @@ fn record(d: &[u8], i: usize) -> Option<(Record, usize)> {
             Record::ParentChild(u32_at(d, i + 1)?, hash_at(d, i + 9)?, u32_at(d, i + 13)?),
             i + 25,
         )),
-        0x1e if zero4(d, i + 13) && i + 21 <= d.len() && index_ok(i + 5) => {
-            Some((Record::Child(hash_at(d, i + 1)?, u32_at(d, i + 9)?), i + 21))
-        }
+        0x1e if zero4(d, i + 13) && i + 21 <= d.len() && index_ok(i + 5) => Some((
+            Record::Element(hash_at(d, i + 1)?, u32_at(d, i + 5)?, u32_at(d, i + 9)?),
+            i + 21,
+        )),
         _ => None,
     }
 }
@@ -183,16 +205,16 @@ fn tree(data: &[u8]) -> Tree<'_> {
             i += 1;
             continue;
         };
-        let mut run = vec![first];
+        let mut run = vec![(i, first)];
         while let Some((r, n)) = record(data, next) {
-            run.push(r);
+            run.push((next, r));
             next = n;
         }
-        if run.len() < 2 && !matches!(run[0], Record::Set(..) | Record::ParentChild(..)) {
+        if run.len() < 2 && !matches!(run[0].1, Record::Set(..) | Record::ParentChild(..)) {
             i += 1;
             continue;
         }
-        for r in run {
+        for (at, r) in run {
             match r {
                 Record::Set(obj, hash, from, to) => {
                     current = Some(obj);
@@ -220,6 +242,13 @@ fn tree(data: &[u8]) -> Tree<'_> {
                             .or_default()
                             .children
                             .push((field, child));
+                    }
+                }
+                Record::Element(field, index, child) => {
+                    if let (Some(parent), true) = (current, child != 0) {
+                        let o = t.objects.entry(parent).or_default();
+                        o.children.push((field, child));
+                        o.elements.push((field, index, child, at));
                     }
                 }
             }
@@ -261,14 +290,102 @@ pub struct PlayerObjects {
     pub weapon_ready: Option<bool>,
 }
 
-/// Every player's objects in the opening snapshot, in stream order.
-pub fn players(body: &[u8]) -> Vec<PlayerObjects> {
+/// A Y11S3 ban slot. Each team has three, filled in the order it bans:
+/// ranked teams fill one per round of a half, and overtime reuses a half's
+/// bans. Written once, in the opening snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BanSlot {
+    /// Position in the team's list, from 0.
+    pub index: u32,
+    /// Side of the banned operator: 1 attack, 2 defense.
+    pub side: u32,
+    /// `TeamColor` of the team that bans in this slot.
+    pub color: u32,
+    /// 0 not used yet, 3 resolved.
+    pub state: u32,
+    /// 1 an operator was banned, 2 the vote ended without a ban.
+    pub result: u32,
+    /// The banned operator's icon, the id `roleimage` uses.
+    pub icon: Option<u64>,
+}
+
+impl BanSlot {
+    /// The team has used the slot: banned an operator or voted for none.
+    pub fn resolved(&self) -> bool {
+        self.state == 3
+    }
+
+    /// The team's vote ended without a ban.
+    pub fn no_ban(&self) -> bool {
+        self.result == 2
+    }
+}
+
+/// What the opening snapshot of the object tree says.
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    /// Every player's objects, in stream order.
+    pub players: Vec<PlayerObjects>,
+    /// Y11S3 ban slots in stream order: per team, by index.
+    pub ban_slots: Vec<BanSlot>,
+}
+
+/// Reads the opening snapshot of the object tree.
+pub fn snapshot(body: &[u8]) -> Snapshot {
     // Y11S3 writes the snapshot before the movement stream; older replays
     // interleave the two, and their snapshot fits in the opening bytes.
     let end = first_movement(body)
         .unwrap_or(body.len())
         .min(SNAPSHOT_BYTES);
     let t = tree(&body[..end]);
+    Snapshot {
+        players: player_objects(&t),
+        ban_slots: ban_slots(&t),
+    }
+}
+
+/// Every player's objects in the opening snapshot, in stream order.
+pub fn players(body: &[u8]) -> Vec<PlayerObjects> {
+    snapshot(body).players
+}
+
+/// The slots of the ban manager's arrays. The game sometimes sends the
+/// slots a second time with new object ids; the first copy is kept.
+fn ban_slots(t: &Tree) -> Vec<BanSlot> {
+    let mut elements: Vec<(usize, u32, u32)> = t
+        .objects
+        .values()
+        .flat_map(|o| &o.elements)
+        .filter(|e| BAN_SLOT_ARRAYS.contains(&e.0))
+        .map(|&(_, index, slot, at)| (at, index, slot))
+        .collect();
+    elements.sort_unstable();
+    let mut out: Vec<BanSlot> = Vec::new();
+    for (_, index, slot) in elements {
+        let (Some(side), Some(color)) = (t.u32(slot, HERO_TEAM), t.u32(slot, TEAM_COLOR)) else {
+            continue;
+        };
+        if out.iter().any(|s| s.color == color && s.index == index) {
+            continue;
+        }
+        let icon = t
+            .child(slot, OPERATOR)
+            .and_then(|op| t.child(op, OPERATOR_INFO))
+            .and_then(|info| t.u64(info, BADGE_ICON))
+            .filter(|&icon| icon != 0);
+        out.push(BanSlot {
+            index,
+            side,
+            color,
+            state: t.u32(slot, BAN_STATE).unwrap_or(0),
+            result: t.u32(slot, RESULT_TYPE).unwrap_or(0),
+            icon,
+        });
+    }
+    out
+}
+
+fn player_objects(t: &Tree) -> Vec<PlayerObjects> {
     let mut out: Vec<(usize, PlayerObjects)> = t
         .objects
         .iter()
@@ -499,6 +616,107 @@ mod tests {
         assert_eq!(p[0].username, "abc");
         assert_eq!(p[0].player_id, 7);
         assert_eq!(p[0].scoreboard, Some(0xF000_0002));
+    }
+
+    /// `23 <obj> 00000000 <hash> <size> <value>`: a property that makes
+    /// `obj` the current object.
+    fn set(d: &mut Vec<u8>, obj: u32, hash: Hash, value: &[u8]) {
+        d.push(0x23);
+        d.extend(obj.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(hash);
+        d.push(value.len() as u8);
+        d.extend(value);
+    }
+
+    /// `22 <hash> <size> <value>`: a property of the current object.
+    fn prop(d: &mut Vec<u8>, hash: Hash, value: &[u8]) {
+        d.push(0x22);
+        d.extend(hash);
+        d.push(value.len() as u8);
+        d.extend(value);
+    }
+
+    /// `1b <parent> 00000000 <field> <child> 00000000 <class>`.
+    fn link(d: &mut Vec<u8>, parent: u32, field: Hash, child: u32) {
+        d.push(0x1B);
+        d.extend(parent.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(field);
+        d.extend(child.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend([7; 4]);
+    }
+
+    /// `1a <field> <child> 00000000 <class>`: a child of the current object.
+    fn child(d: &mut Vec<u8>, field: Hash, child: u32) {
+        d.push(0x1A);
+        d.extend(field);
+        d.extend(child.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend([7; 4]);
+    }
+
+    /// `1e <field> <index> <child> 00000000 <class>`: an array slot of the
+    /// current object.
+    fn element(d: &mut Vec<u8>, field: Hash, index: u32, child: u32) {
+        d.push(0x1E);
+        d.extend(field);
+        d.extend(index.to_le_bytes());
+        d.extend(child.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend([7; 4]);
+    }
+
+    /// A ban slot's side, team color, state and result, as the game writes
+    /// them after the slot's operator.
+    fn slot_props(d: &mut Vec<u8>, slot: u32, side: u32, state: u32, result: u32) {
+        set(d, slot, HERO_TEAM, &side.to_le_bytes());
+        prop(d, TEAM_COLOR, &1u32.to_le_bytes());
+        prop(d, BAN_STATE, &state.to_le_bytes());
+        prop(d, RESULT_TYPE, &result.to_le_bytes());
+    }
+
+    #[test]
+    fn reads_ban_slots_in_order_with_their_operator_icons() {
+        let (manager, banned, skipped, unused) =
+            (0xF000_0100, 0xF000_0101, 0xF000_0102, 0xF000_0103);
+        let (operator, info) = (0xF000_0110, 0xF000_0111);
+        let mut d = vec![];
+        set(&mut d, manager, BAN_SLOT_ARRAYS[0], &[1]);
+        element(&mut d, BAN_SLOT_ARRAYS[0], 0, banned);
+        element(&mut d, BAN_SLOT_ARRAYS[0], 1, skipped);
+        element(&mut d, BAN_SLOT_ARRAYS[0], 2, unused);
+        // Slot 0 banned Mira; slot 1's vote ended without a ban; slot 2 is
+        // not used yet.
+        link(&mut d, banned, OPERATOR, operator);
+        set(&mut d, operator, [0x0E, 0x9E, 0xBE, 0x88], &[0; 8]);
+        child(&mut d, OPERATOR_INFO, info);
+        set(&mut d, info, BADGE_ICON, &39149215445u64.to_le_bytes());
+        slot_props(&mut d, banned, 2, 3, 1);
+        link(&mut d, skipped, OPERATOR, 0);
+        slot_props(&mut d, skipped, 2, 3, 2);
+        link(&mut d, unused, OPERATOR, 0);
+        slot_props(&mut d, unused, 2, 0, 0);
+
+        let slots = snapshot(&d).ban_slots;
+
+        let slot = |index, state, result, icon| BanSlot {
+            index,
+            side: 2,
+            color: 1,
+            state,
+            result,
+            icon,
+        };
+        assert_eq!(
+            slots,
+            [
+                slot(0, 3, 1, Some(39149215445)),
+                slot(1, 3, 2, None),
+                slot(2, 0, 0, None),
+            ]
+        );
     }
 
     #[test]

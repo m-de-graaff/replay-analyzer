@@ -527,6 +527,10 @@ struct Parser<'a> {
     weapon_samples: Vec<(String, bool, Option<usize>)>,
     /// Players' objects from the opening snapshot of the object tree.
     entity_players: Vec<crate::entities::PlayerObjects>,
+    /// Y11S3 ban slots from the same snapshot.
+    ban_slots: Vec<crate::entities::BanSlot>,
+    /// Problems found while reading bans, for `decodeStatus.bans`.
+    ban_warnings: Vec<String>,
     /// Y11S3 scoreboard values by username, and the first assists value
     /// seen (the total going into the round). Players are only known once
     /// their pick packet is read, often after their scoreboard's first
@@ -615,6 +619,8 @@ impl<'a> Parser<'a> {
             scoreboards: HashMap::new(),
             weapon_samples: Vec::new(),
             entity_players: Vec::new(),
+            ban_slots: Vec::new(),
+            ban_warnings: Vec::new(),
             scoreboard_by_name: HashMap::new(),
             pending_credits: Vec::new(),
             packet_at: 0,
@@ -673,7 +679,7 @@ impl<'a> Parser<'a> {
         }
         self.read_levels(start, end);
         self.apply_entities(start, end);
-        self.assign_ban_teams();
+        self.finish_bans();
         self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
@@ -977,6 +983,11 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        if let Some(f) = r.get_mut("bans") {
+            for w in &self.ban_warnings {
+                f.warn(w.clone());
+            }
+        }
         // Who the players are and which objects carry them.
         let players = &round.header.players;
         let with_profile = players.iter().filter(|p| !p.profile_id.is_empty()).count();
@@ -1825,27 +1836,77 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if !self.round.bans.iter().any(|b| b.icon == icon) {
+        if !self.round.bans.iter().any(|b| b.icon == Some(icon)) {
             let operator = Operator::from_role_image(icon);
             tracing::debug!(icon, ?operator, ?role, ?color, "ban");
             self.round.bans.push(Ban {
                 operator,
                 role,
                 team: None,
-                icon,
+                icon: Some(icon),
+                slot: None,
+                no_ban: false,
                 color,
             });
         }
         Ok(())
     }
 
-    /// Y11S3 ban slots name the banning team by its `TeamColor`, not by its
-    /// index in the header.
-    fn assign_ban_teams(&mut self) {
+    /// Y11S3: bans come from the snapshot's ban slots, which also give each
+    /// ban's order and the votes that ended without a ban; the icons found
+    /// above are only a cross-check. Slots name the banning team by its
+    /// `TeamColor`, not by its index in the header.
+    fn finish_bans(&mut self) {
+        let slots = std::mem::take(&mut self.ban_slots);
         let Round { header, bans, .. } = &mut self.round;
-        for b in bans {
-            b.team = b.color.and_then(|c| header.team_of_color(c));
+        if slots.is_empty() {
+            for b in bans.iter_mut() {
+                b.team = b.color.and_then(|c| header.team_of_color(c));
+            }
+            return;
         }
+        let mut from_slots = Vec::new();
+        for s in slots.iter().filter(|s| s.resolved()) {
+            let role = match s.side {
+                1 => TeamRole::Attack,
+                2 => TeamRole::Defense,
+                side => {
+                    self.ban_warnings
+                        .push(format!("ban slot {} bans side {side}", s.index));
+                    continue;
+                }
+            };
+            let no_ban = s.no_ban();
+            if !no_ban && s.icon.is_none() {
+                self.ban_warnings.push(format!(
+                    "ban slot {} is resolved but names no operator",
+                    s.index
+                ));
+                continue;
+            }
+            let icon = s.icon.filter(|_| !no_ban);
+            from_slots.push(Ban {
+                operator: icon.and_then(Operator::from_role_image),
+                role,
+                team: header.team_of_color(s.color),
+                icon,
+                slot: Some(s.index),
+                no_ban,
+                color: Some(s.color),
+            });
+        }
+        from_slots.sort_by_key(|b| (b.team.unwrap_or(usize::MAX), b.slot));
+        let icons = |list: &[Ban]| {
+            list.iter()
+                .filter_map(|b| b.icon)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        if icons(bans) != icons(&from_slots) {
+            self.ban_warnings.push(
+                "the ban slots and the banned-operator icons disagree; the slots were used".into(),
+            );
+        }
+        *bans = from_slots;
     }
 
     /// Y11S3+ player levels from the opening snapshot: each follows the
@@ -2194,7 +2255,9 @@ impl<'a> Parser<'a> {
         if self.code() < version::Y8S1 {
             return;
         }
-        self.entity_players = crate::entities::players(&self.data[start..end]);
+        let snapshot = crate::entities::snapshot(&self.data[start..end]);
+        self.entity_players = snapshot.players;
+        self.ban_slots = snapshot.ban_slots;
         for o in &self.entity_players {
             self.controllers.insert(o.controller, o.username.clone());
             if let Some(sb) = o.scoreboard {

@@ -4,23 +4,34 @@ use serde::Serialize;
 
 use crate::types::{ObservationTool, Operator, TeamRole};
 
-/// An operator banned for this round.
+/// An operator banned for this round, or (Y11S3+) a ban slot whose vote
+/// ended without a ban.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ban {
     /// `None` when the icon is not in the role image table (usually a replay
-    /// from an older season, whose icons have other ids).
+    /// from an older season, whose icons have other ids), or for `noBan`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<Operator>,
     /// The side the banned operator plays on.
     pub role: TeamRole,
     /// Index of the team that owns the ban slot, i.e. the team that banned
-    /// the operator (Y11S3+). Slots are listed in the game's order, so bans
-    /// of one team keep their slot order.
+    /// the operator (Y11S3+). Bans are listed by team, then by slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team: Option<usize>,
     /// The operator's role image id, which is all the replay records.
-    pub icon: u64,
+    /// `None` for `noBan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<u64>,
+    /// Y11S3+: the slot's place in its team's ban list, from 0: the order the
+    /// team banned in. In ranked a team bans once before each round of a
+    /// half, into the next slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// Y11S3+: the team's vote ended without a ban, so the slot holds no
+    /// operator.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_ban: bool,
     /// The slot's `TeamColor`, which `team` is derived from: the game numbers
     /// a player's own team 1 in their recording, whatever its header index.
     #[serde(skip)]

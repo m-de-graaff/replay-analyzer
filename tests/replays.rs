@@ -956,6 +956,75 @@ fn real_bans_are_made_by_the_team_on_the_other_side() {
     );
 }
 
+/// Fails when a ban icon is missing from `ROLE_IMAGES`, or names an operator
+/// of the other side.
+#[test]
+fn real_bans_name_an_operator_of_the_banned_side() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let wrong: Vec<_> = rounds
+        .iter()
+        .flat_map(|r| &r.bans)
+        .filter(|b| !b.no_ban && b.operator.and_then(|o| o.role()) != Some(b.role))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} bans, e.g. {:?}",
+        wrong.len(),
+        wrong.first()
+    );
+}
+
+/// Each team fills its ban slots in order, so a round's bans of one team
+/// are slots 0, 1, 2 with none missing.
+#[test]
+fn real_ban_slots_fill_in_order() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in &rounds {
+        for team in [Some(0), Some(1)] {
+            let slots: Vec<_> = r
+                .bans
+                .iter()
+                .filter(|b| b.team == team)
+                .map(|b| b.slot)
+                .collect();
+            let expected: Vec<_> = (0..slots.len() as u32).map(Some).collect();
+            assert_eq!(
+                slots,
+                expected,
+                "{} R{} team {team:?}",
+                r.header.match_id,
+                r.header.round_number + 1
+            );
+        }
+    }
+}
+
+/// The slots and the banned-operator icons near them are two reads of the
+/// same bans.
+#[test]
+fn real_ban_slots_agree_with_their_icons() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in &rounds {
+        let bans = r.decode.get("bans").unwrap();
+        assert!(
+            bans.warnings.is_empty(),
+            "{} R{}: {:?}",
+            r.header.match_id,
+            r.header.round_number + 1,
+            bans.warnings
+        );
+    }
+}
+
 /// In a player's own recording, the game numbers the player's team 1.
 #[test]
 fn real_recorders_team_has_team_color_one() {

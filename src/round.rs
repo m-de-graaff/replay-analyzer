@@ -1322,7 +1322,11 @@ impl<'a> Parser<'a> {
     /// Players per team: 5 unless the header says otherwise (Y11S3+
     /// `maxnbplayersperteam`; Dual Front is 6v6).
     fn team_size(&self) -> u32 {
-        self.round.header.max_players_per_team.unwrap_or(5)
+        self.round
+            .header
+            .max_players_per_team
+            .filter(|&n| n > 0)
+            .unwrap_or(5)
     }
 
     fn read_player(&mut self, c: &mut Cursor) -> Result<()> {
@@ -1435,7 +1439,7 @@ impl<'a> Parser<'a> {
             !p.operator.is_empty()
         });
         // 5v5 unless the header says otherwise (Y11S3+ `maxnbplayersperteam`).
-        let max = 2 * header.max_players_per_team.unwrap_or(5) as usize;
+        let max = 2 * header.max_players_per_team.filter(|&n| n > 0).unwrap_or(5) as usize;
         if header.players.len() > max {
             tracing::warn!(players = header.players.len(), max, "too many players");
             warnings.push(format!("{} players, more than {max}", header.players.len()));
@@ -2861,6 +2865,18 @@ mod tests {
         assert_eq!(icons, [Some(104189664325), Some(39149215445)]);
         let bans = p.round.decode.get("bans").unwrap();
         assert_eq!(bans.status, Status::Partial);
+    }
+
+    #[test]
+    fn a_header_team_size_of_zero_means_five() {
+        let header = Header {
+            max_players_per_team: Some(0),
+            ..Header::default()
+        };
+
+        let p = Parser::new(&[], header);
+
+        assert_eq!(p.team_size(), 5);
     }
 
     #[test]

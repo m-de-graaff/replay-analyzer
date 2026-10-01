@@ -51,8 +51,45 @@ pub struct MatchSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_team: Option<usize>,
     pub result: MatchResult,
+    /// Each ban once, with the first round it applied to: what each team
+    /// banned and when (full and partial reads).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bans: Vec<BanDecision>,
     /// One entry per round read, in play order.
     pub rounds: Vec<RoundSummary>,
+}
+
+/// One ban and the first round it applied to. In ranked each team bans once
+/// before each round of a half, so `round` is the round the vote came before;
+/// overtime rounds reuse earlier bans and add none.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BanDecision {
+    /// The first round read, from 1, with this ban in force.
+    pub round: u32,
+    #[serde(flatten)]
+    pub ban: Ban,
+}
+
+/// Every distinct ban of `rounds`, in the order they first apply.
+fn ban_decisions(rounds: &[Round]) -> Vec<BanDecision> {
+    let mut out: Vec<BanDecision> = Vec::new();
+    for r in rounds {
+        for b in &r.bans {
+            let seen = out.iter().any(|d| {
+                let d = &d.ban;
+                (d.team, d.role, d.slot, d.icon, d.no_ban)
+                    == (b.team, b.role, b.slot, b.icon, b.no_ban)
+            });
+            if !seen {
+                out.push(BanDecision {
+                    round: r.header.round_number + 1,
+                    ban: b.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// A map, keyed by id: reworked maps get new ids (`Bank` vs `BankY10`), so
@@ -467,6 +504,7 @@ impl MatchSummary {
                 raw_match_result,
             },
             rules,
+            bans: ban_decisions(rounds),
             rounds: round_summaries,
         })
     }
@@ -554,6 +592,47 @@ fn rfc3339<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A defending team's ban in `slot`, of the operator with this icon.
+    fn ban(icon: u64, slot: u32) -> Ban {
+        Ban {
+            operator: Operator::from_role_image(icon),
+            role: TeamRole::Defense,
+            team: Some(0),
+            icon: Some(icon),
+            slot: Some(slot),
+            no_ban: false,
+            color: Some(1),
+        }
+    }
+
+    /// Rounds 1, 2, ... with these bans in force.
+    fn rounds_with_bans(bans: &[Vec<Ban>]) -> Vec<Round> {
+        bans.iter()
+            .enumerate()
+            .map(|(i, bans)| {
+                let mut r = Round::default();
+                r.header.round_number = i as u32;
+                r.bans = bans.clone();
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_ban_is_listed_once_with_the_first_round_it_applied_to() {
+        let (mira, kaid) = (ban(39149215445, 0), ban(161289666176, 1));
+        let rounds = rounds_with_bans(&[
+            vec![mira.clone()],
+            vec![mira.clone(), kaid.clone()],
+            vec![mira, kaid],
+        ]);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let bans: Vec<_> = s.bans.iter().map(|d| (d.round, d.ban.slot)).collect();
+        assert_eq!(bans, [(1, Some(0)), (2, Some(1))]);
+    }
 
     #[test]
     fn splits_reworked_map_names() {

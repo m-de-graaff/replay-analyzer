@@ -12,7 +12,7 @@ use crate::entities::Relation;
 use crate::header::{PartyRole, Player};
 use crate::outcome::{ReasonSource, scores};
 use crate::round::Round;
-use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition};
+use crate::types::{GameMode, Map, MatchType, Operator, TeamRole, WinCondition, playlist_name};
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,9 +38,14 @@ pub struct MatchSummary {
     /// Queue family derived from `match_type`: `ranked`, `unranked`,
     /// `quickMatch`, `custom`, `standard` or `unknown`.
     pub queue: &'static str,
-    /// The header's `playlistcategory`, when written. Raw: not yet named.
+    /// The header's `playlistcategory`, when written (Y11S3+): an asset id
+    /// with one value per playlist.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_category: Option<i64>,
+    /// The playlist's name, for the `playlistCategory` values seen:
+    /// `Ranked`, `QuickMatch`, `Unranked`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist: Option<&'static str>,
     pub game_mode: GameMode,
     pub map: MapInfo,
     pub rules: Rules,
@@ -51,12 +56,64 @@ pub struct MatchSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub your_team: Option<usize>,
     pub result: MatchResult,
+    /// Each ban once, with the first round it applied to: what each team
+    /// banned and when (full and partial reads).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bans: Vec<BanDecision>,
     /// One entry per round read, in play order.
     pub rounds: Vec<RoundSummary>,
 }
 
+/// One ban and the first round it applied to. In ranked each team bans once
+/// before each round of a half, so `round` is the round the vote came before;
+/// overtime rounds reuse earlier bans and add none.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BanDecision {
+    /// The first round read, from 1, with this ban in force.
+    pub round: u32,
+    #[serde(flatten)]
+    pub ban: Ban,
+}
+
+/// Every distinct ban of `rounds`, in the order they first apply.
+fn ban_decisions(rounds: &[Round]) -> Vec<BanDecision> {
+    let mut out: Vec<BanDecision> = Vec::new();
+    for r in rounds {
+        for b in &r.bans {
+            match out.iter_mut().find(|d| ban_key(&d.ban) == ban_key(b)) {
+                // A later round may know the team an earlier one could not.
+                Some(d) => d.ban.team = d.ban.team.or(b.team),
+                None => out.push(BanDecision {
+                    round: r.header.round_number + 1,
+                    ban: b.clone(),
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// What makes a ban the same one in another round. A slot's `TeamColor`
+/// stays the same through a recording, while its team index needs that
+/// round's team objects; bans without a color fall back to the index.
+type BanKey = (
+    Option<u32>,
+    Option<usize>,
+    TeamRole,
+    Option<u32>,
+    Option<u64>,
+    bool,
+);
+
+fn ban_key(b: &Ban) -> BanKey {
+    let team = if b.color.is_some() { None } else { b.team };
+    (b.color, team, b.role, b.slot, b.icon, b.no_ban)
+}
+
 /// A map, keyed by id: reworked maps get new ids (`Bank` vs `BankY10`), so
-/// floor plans and callouts should be looked up by `id`, not by `base`.
+/// floor plans and callouts should be looked up by `id`, not by `base`. A
+/// new id marks a new world build; its floor plan can still be the old one.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MapInfo {
@@ -67,7 +124,8 @@ pub struct MapInfo {
     /// `BankY10`. `None` when the id is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
-    /// The rework suffix (`Y10`), `None` for the original layout.
+    /// The year suffix of the world build (`Y10`), `None` for the original
+    /// build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
@@ -230,7 +288,8 @@ pub struct PlayerSummary {
     /// services, which replays do not record.
     #[serde(rename = "profileID", skip_serializing_if = "String::is_empty")]
     pub profile_id: String,
-    /// Y11S3+, most likely the clearance level (full and partial reads).
+    /// Y11S3+: the clearance level (full and partial reads). Replays hold no
+    /// rank or reputation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
     /// `you`, `teammate` or `opponent`; absent for spectator recordings.
@@ -276,6 +335,9 @@ pub enum Outcome {
     Draw,
     /// The match was decided but the recording player was not on a team.
     Decided,
+    /// The game ended the match without a winner (`matchresult` 7): seen
+    /// once, when the server stopped a ranked match before a round began.
+    Cancelled,
     /// Not decided in the rounds read.
     #[default]
     Unfinished,
@@ -297,11 +359,14 @@ pub struct MatchResult {
     /// rounds are missing from the folder.
     pub complete: bool,
     /// The game says the match is over (Y11S3+ `matchresult`) although
-    /// neither team reached the rounds needed to win: a forfeit or an
-    /// abandoned match. Inferred; `None` when the replay cannot tell.
+    /// neither team reached the rounds needed to win: a forfeit, which has
+    /// a `winner`, or a match the game ended without one (`cancelled`).
+    /// `None` when the replay cannot tell.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_early: Option<bool>,
-    /// The raw Y11S3+ `matchresult` value of the deciding round.
+    /// The raw Y11S3+ `matchresult` value of the deciding round: the result
+    /// of the team the game numbers 1 (the recorder's, in a player's own
+    /// recording): 2 won, 1 lost, 7 ended with no winner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_match_result: Option<u32>,
 }
@@ -398,22 +463,32 @@ impl MatchSummary {
             rounds.iter().map(|r| round_summary(r, &rules)).collect();
         let final_score = round_summaries.last().map_or([0; 2], |r| r.score_after);
 
-        let raw_match_result = rounds.iter().find_map(|r| r.header.match_result);
-        let decided_by_game = raw_match_result.is_some();
+        let deciding = rounds.iter().find(|r| r.header.match_result.is_some());
+        let raw_match_result = deciding.and_then(|r| r.header.match_result);
         let mut winner = rules.winner(final_score);
         let draw = winner.is_none() && rules.is_draw(final_score);
-        let ended_early = if winner.is_none() && !draw && decided_by_game {
-            // Neither side reached the target, yet the game ended the match.
-            // `matchresult` matched the winner's index in the one sample seen.
-            winner = raw_match_result.map(|v| v as usize).filter(|&t| t < 2);
-            Some(true)
-        } else if decided_by_game {
-            Some(false)
-        } else {
-            None
+        let ended_early = match raw_match_result {
+            None => None,
+            Some(_) if winner.is_some() || draw => Some(false),
+            // Neither side reached the target, yet the game ended the match:
+            // `matchresult` is the result of the team it numbers 1.
+            Some(value) => {
+                // In a player's recording, the team numbered 1 is theirs.
+                let first = deciding
+                    .and_then(|r| r.header.team_of_color(1))
+                    .or(your_team);
+                winner = match value {
+                    2 => first,
+                    1 => first.map(|t| t ^ 1),
+                    _ => None,
+                };
+                Some(true)
+            }
         };
-        let complete = winner.is_some() || draw;
+        let cancelled = ended_early == Some(true) && raw_match_result == Some(7);
+        let complete = winner.is_some() || draw || cancelled;
         let outcome = match (winner, your_team) {
+            _ if cancelled => Outcome::Cancelled,
             (Some(w), Some(y)) if w == y => Outcome::Win,
             (Some(_), Some(_)) => Outcome::Loss,
             (Some(_), None) => Outcome::Decided,
@@ -445,6 +520,7 @@ impl MatchSummary {
             match_type: first.match_type,
             queue: queue(first.match_type),
             playlist_category: (first.playlist_category != 0).then_some(first.playlist_category),
+            playlist: playlist_name(first.playlist_category),
             game_mode: first.game_mode,
             map: MapInfo::new(first.map),
             teams,
@@ -465,6 +541,7 @@ impl MatchSummary {
                 raw_match_result,
             },
             rules,
+            bans: ban_decisions(rounds),
             rounds: round_summaries,
         })
     }
@@ -528,12 +605,12 @@ fn picks(round: &Round) -> Vec<Pick> {
 
 /// The queue family a match type belongs to.
 pub fn queue(match_type: MatchType) -> &'static str {
-    match match_type.0 {
-        1 => "quickMatch",
-        2 => "ranked",
-        3 | 4 => "custom",
-        8 => "standard",
-        9 => "unranked",
+    match match_type.name() {
+        Some("QuickMatch") => "quickMatch",
+        Some("Ranked") => "ranked",
+        Some("CustomGameLocal" | "CustomGameOnline") => "custom",
+        Some("Standard") => "standard",
+        Some("Unranked") => "unranked",
         _ => "unknown",
     }
 }
@@ -552,6 +629,132 @@ fn rfc3339<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A defending team's ban in `slot`, of the operator with this icon.
+    fn ban(icon: u64, slot: u32) -> Ban {
+        Ban {
+            operator: Operator::from_role_image(icon),
+            role: TeamRole::Defense,
+            team: Some(0),
+            icon: Some(icon),
+            slot: Some(slot),
+            no_ban: false,
+            color: Some(1),
+        }
+    }
+
+    /// Rounds 1, 2, ... with these bans in force.
+    fn rounds_with_bans(bans: &[Vec<Ban>]) -> Vec<Round> {
+        bans.iter()
+            .enumerate()
+            .map(|(i, bans)| {
+                let mut r = Round::default();
+                r.header.round_number = i as u32;
+                r.bans = bans.clone();
+                r
+            })
+            .collect()
+    }
+
+    /// Round `number` of a ranked match (6 rounds and 3 overtime), recorded
+    /// by a player of `your_team`, going from `before` to `after`.
+    fn ranked_round(
+        number: u32,
+        your_team: usize,
+        before: [u32; 2],
+        after: [u32; 2],
+        match_result: Option<u32>,
+    ) -> Round {
+        let mut r = Round::default();
+        let h = &mut r.header;
+        h.code_version = crate::types::version::Y9S4;
+        h.rounds_per_match = 6;
+        h.rounds_per_match_overtime = 3;
+        h.round_number = number - 1;
+        h.recording_player_id = 7;
+        h.players.push(Player {
+            id: 7,
+            username: "recorder".into(),
+            team_index: your_team,
+            ..Player::default()
+        });
+        for t in 0..2 {
+            h.teams[t].starting_score = before[t];
+            h.teams[t].score = after[t];
+        }
+        h.match_result = match_result;
+        r
+    }
+
+    #[test]
+    fn match_type_seven_queues_as_unranked() {
+        assert_eq!(queue(MatchType::new(7, 9_901_603)), "unranked");
+        assert_eq!(queue(MatchType::new(4, 9_901_603)), "custom");
+    }
+
+    #[test]
+    fn a_match_ended_early_goes_to_the_team_matchresult_names() {
+        // The recorder's team (1) trails 1-2, and the game says it won.
+        let rounds = [ranked_round(3, 1, [1, 1], [1, 2], Some(2))];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!(
+            (r.winner, r.outcome, r.ended_early),
+            (Some(1), Outcome::Win, Some(true))
+        );
+    }
+
+    #[test]
+    fn an_early_end_goes_to_your_team_when_the_last_header_lacks_you() {
+        let mut last = ranked_round(3, 1, [1, 1], [1, 2], Some(2));
+        last.header.players.clear();
+        let rounds = [ranked_round(2, 1, [1, 0], [1, 1], None), last];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!((r.winner, r.outcome), (Some(1), Outcome::Win));
+    }
+
+    #[test]
+    fn matchresult_seven_is_a_match_ended_without_a_winner() {
+        let rounds = [ranked_round(4, 0, [1, 2], [1, 2], Some(7))];
+
+        let r = MatchSummary::new(&rounds).unwrap().result;
+
+        assert_eq!(
+            (r.winner, r.outcome, r.ended_early, r.complete),
+            (None, Outcome::Cancelled, Some(true), true)
+        );
+    }
+
+    #[test]
+    fn each_ban_is_listed_once_with_the_first_round_it_applied_to() {
+        let (mira, kaid) = (ban(39149215445, 0), ban(161289666176, 1));
+        let rounds = rounds_with_bans(&[
+            vec![mira.clone()],
+            vec![mira.clone(), kaid.clone()],
+            vec![mira, kaid],
+        ]);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let bans: Vec<_> = s.bans.iter().map(|d| (d.round, d.ban.slot)).collect();
+        assert_eq!(bans, [(1, Some(0)), (2, Some(1))]);
+    }
+
+    #[test]
+    fn a_ban_whose_team_a_later_round_cannot_tell_is_listed_once() {
+        let mira = ban(39149215445, 0);
+        let mut team_unknown = mira.clone();
+        team_unknown.team = None;
+        let rounds = rounds_with_bans(&[vec![team_unknown], vec![mira]]);
+
+        let s = MatchSummary::new(&rounds).unwrap();
+
+        let bans: Vec<_> = s.bans.iter().map(|d| (d.round, d.ban.team)).collect();
+        assert_eq!(bans, [(1, Some(0))]);
+    }
 
     #[test]
     fn splits_reworked_map_names() {

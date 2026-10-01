@@ -51,15 +51,18 @@ pub struct Header {
         skip_serializing_if = "Option::is_none"
     )]
     pub start_time: Option<DateTime<Utc>>,
-    /// Whether a spectator recorded the match (Y11S3+ `isspectator`).
+    /// Whether a spectator recorded the match (Y11S3+ `isspectator`, which
+    /// the game writes only when true). `None` before Y11S3.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_spectator: Option<bool>,
     /// Y11S3+ `maxnbplayersperteam`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_players_per_team: Option<u32>,
-    /// Y11S3+ `matchresult`, written only on the round that decides the
-    /// match. Its value matched the winning team's index in the one sample
-    /// seen, so it is kept raw.
+    /// Y11S3+ `matchresult`, written only on the round that ends the match:
+    /// the result of the team the game numbers 1 (see `Team::color`), which
+    /// is the recorder's team in a player's recording. 2 won, 1 lost (all 26
+    /// finished matches of a real folder agree); 7 the game ended the match
+    /// with no winner (seen once).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_result: Option<u32>,
     /// When the recording stopped, UTC (Y11S3+ `endtime`).
@@ -137,6 +140,11 @@ pub struct Team {
     pub win_condition: Option<WinCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<TeamRole>,
+    /// The game's number for this team (`TeamColor`, 1 or 2), from the team
+    /// object (full and partial reads, Y11S3+). Ban slots and `matchresult`
+    /// name teams by it; in a player's recording 1 is the recorder's team.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -161,8 +169,8 @@ pub struct Player {
     pub role_portrait: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub spawn: String,
-    /// Y11S3+, from the round's opening snapshot. Most likely the clearance
-    /// level; see `decodeStatus.levels`.
+    /// Y11S3+: the clearance level, from the round's opening snapshot (the
+    /// game's property is `ClearanceLevelText`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
     /// The 4-byte id packets use to refer to this player.
@@ -264,6 +272,31 @@ impl Header {
                     .iter()
                     .find(|p| p.relation == Some(Relation::You))
             })
+    }
+
+    /// Index of the team the game numbers `color` (`TeamColor`, 1 or 2).
+    /// Colors decoded from the team objects decide. Without them, 1 is the
+    /// recorder's team in a player's recording, and team 0 in a spectator's
+    /// (as in the one spectator match seen).
+    pub fn team_of_color(&self, color: u32) -> Option<usize> {
+        if !matches!(color, 1 | 2) {
+            return None;
+        }
+        if let Some(i) = self.teams.iter().position(|t| t.color == Some(color)) {
+            return Some(i);
+        }
+        // One team's decoded color gives the other team the other one.
+        if let Some(i) = self.teams.iter().position(|t| t.color.is_some()) {
+            return Some(i ^ 1);
+        }
+        let first = if self.is_spectator == Some(true) {
+            0
+        } else {
+            self.recording_player()
+                .map(|p| p.team_index)
+                .filter(|&t| t < 2)?
+        };
+        Some(if color == 1 { first } else { first ^ 1 })
     }
 
     /// Fills each player's `key` and `relation`. A relation already set to
@@ -452,7 +485,7 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
         game_version: get("version").unwrap_or_default().to_owned(),
         code_version,
         timestamp,
-        match_type: MatchType(small("matchtype")?),
+        match_type: MatchType::new(small("matchtype")?, code_version),
         map: Map(num("worldid")?),
         site: String::new(),
         recording_player_id: num("recordingplayerid")?,
@@ -472,7 +505,11 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
             .unwrap_or(0),
         match_id: get("id").unwrap_or_default().to_owned(),
         start_time: millis(get("starttime")),
-        is_spectator: get("isspectator").map(|v| v == "1"),
+        // Y11S3 headers, the first with `starttime`, write `isspectator` only
+        // for spectators.
+        is_spectator: get("isspectator")
+            .map(|v| v == "1")
+            .or(get("starttime").map(|_| false)),
         max_players_per_team: get("maxnbplayersperteam").and_then(|v| v.parse().ok()),
         match_result: get("matchresult").and_then(|v| v.parse().ok()),
         end_time: millis(get("endtime")),
@@ -480,4 +517,111 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
     };
     header.assign_relations();
     Ok(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header whose recording player (`recordingplayerid` 7) plays for
+    /// `team`.
+    fn recorded_by_team(team: usize) -> Header {
+        Header {
+            recording_player_id: 7,
+            players: vec![Player {
+                id: 7,
+                username: "recorder".into(),
+                team_index: team,
+                ..Player::default()
+            }],
+            ..Header::default()
+        }
+    }
+
+    /// The header properties of a ranked recording with `extra` added, as
+    /// the file stores them (`u64` length, then the bytes), and their count.
+    fn properties(extra: &[(&str, &str)]) -> (Vec<u8>, u32) {
+        let mut pairs = vec![
+            ("version", "Y11S3_Alpha04"),
+            ("code", "9901603"),
+            ("datetime", "2026-09-29-01-41-49"),
+            ("matchtype", "2"),
+            ("worldid", "413779563590"),
+            ("recordingplayerid", "7"),
+            ("gamemodeid", "327933806"),
+            ("roundspermatch", "6"),
+            ("roundspermatchovertime", "3"),
+            ("roundnumber", "0"),
+            ("overtimeroundnumber", "0"),
+            ("teamname0", "YOUR TEAM"),
+            ("startingteamscore0", "0"),
+            ("teamname1", "ENEMY TEAM"),
+            ("startingteamscore1", "0"),
+            ("teamscore0", "0"),
+            ("teamscore1", "0"),
+        ];
+        pairs.extend_from_slice(extra);
+        let mut d = Vec::new();
+        for s in pairs.iter().flat_map(|(k, v)| [k, v]) {
+            d.extend((s.len() as u64).to_le_bytes());
+            d.extend(s.as_bytes());
+        }
+        (d, pairs.len() as u32)
+    }
+
+    fn read(extra: &[(&str, &str)]) -> Header {
+        let (d, count) = properties(extra);
+        read_properties(&mut Cursor::new(&d, 0), Some(count)).unwrap()
+    }
+
+    #[test]
+    fn a_y11s3_header_without_isspectator_is_a_players_recording() {
+        let h = read(&[("starttime", "1790638909220")]);
+        assert_eq!(h.is_spectator, Some(false));
+    }
+
+    #[test]
+    fn isspectator_marks_a_spectators_recording() {
+        let h = read(&[("starttime", "1790638909220"), ("isspectator", "1")]);
+        assert_eq!(h.is_spectator, Some(true));
+    }
+
+    #[test]
+    fn an_older_header_leaves_spectator_unknown() {
+        assert_eq!(read(&[]).is_spectator, None);
+    }
+
+    #[test]
+    fn team_color_one_is_the_recorders_team() {
+        let h = recorded_by_team(1);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(1), Some(0)));
+    }
+
+    #[test]
+    fn team_color_one_is_team_zero_in_a_spectators_recording() {
+        let mut h = recorded_by_team(1);
+        h.is_spectator = Some(true);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn decoded_team_colors_override_the_recorders_team() {
+        let mut h = recorded_by_team(1);
+        h.teams[0].color = Some(1);
+        h.teams[1].color = Some(2);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn one_decoded_team_color_gives_the_other_team_the_other_color() {
+        let mut h = recorded_by_team(0);
+        h.teams[1].color = Some(1);
+        assert_eq!(h.team_of_color(2), Some(0));
+    }
+
+    #[test]
+    fn team_color_without_a_recorder_or_out_of_range_is_no_team() {
+        assert_eq!(Header::default().team_of_color(1), None);
+        assert_eq!(recorded_by_team(0).team_of_color(3), None);
+    }
 }

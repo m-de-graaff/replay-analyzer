@@ -124,6 +124,34 @@ pub(super) const MAPS: &[(&str, u64)] = &[
     ("LairY10", 417890697769),
     ("NighthavenLabsY10", 418119057546),
     ("ConsulateY10", 418126004176),
+    // Y11S3: ids from real ranked, unranked and quick matches, each map
+    // identified by its bomb sites and attacker spawns. The year marks the
+    // season that gave the map a new world id (patch notes), not necessarily
+    // a new floor plan.
+    // Y10S4 rework: new sites (Bathroom/Commander's, Hammam/Sitting).
+    ("FortressY10", 398899676157),
+    // Y11S3: the Living Room/Library site moved to B Art Storage/B Old Office.
+    ("VillaY11", 409325881472),
+    // New map, Y11S2.
+    ("CalypsoCasino", 419965653950),
+    // Y10S4 visual updates; original sites.
+    ("SkyscraperY10", 423767322185),
+    ("ThemeParkY10", 430788891316),
+    // Y11S1 and Y11S2 visual updates; original sites.
+    ("CoastlineY11", 436375283234),
+    ("KanalY11", 441408792952),
+    // Original sites; no patch note found, the year comes from the id range.
+    ("PresidentialPlaneY11", 439976373310),
+    ("TowerY11", 454245490351),
+];
+
+/// `(playlistcategory, name)`: the playlist a match was queued in, as Y11S3
+/// headers give it. Each match type had one value in a real folder of 30
+/// matches; Unranked's name is inferred like match type 7's.
+pub(super) const PLAYLISTS: &[(i64, &str)] = &[
+    (245225348570, "Ranked"),
+    (414625537378, "QuickMatch"),
+    (416350367764, "Unranked"),
 ];
 
 /// `(role image id, operator name)`: the icon the game shows for an operator,
@@ -150,8 +178,6 @@ pub(super) const ROLE_IMAGES: &[(u64, &str)] = &[
     (104189663738, "Wamai"),
     (104189663842, "Kali"),
     (104189664208, "Melusi"),
-    // Not seen in a header: banned in every Y11S3 test round, and follows the
-    // `id - 65` pattern of the other Y5 operators.
     (104189664325, "Ace"),
     (104189664639, "Aruni"),
     (121604587892, "Alibi"),
@@ -185,4 +211,35 @@ pub(super) const ROLE_IMAGES: &[(u64, &str)] = &[
     (1494825836, "Rook"),
     (1494825842, "Ash"),
     (1494825845, "Thermite"),
+    // From `roleimage`/`rolename` pairs in real Y11S3 headers, each also
+    // banned in a real ban slot. Dokkaebi's icon is new in Y11S2.
+    (1326495659, "Fuze"),
+    (2461366787, "Blitz"),
+    (2461366790, "Pulse"),
+    (2461366796, "Doc"),
+    (2461366799, "Sledge"),
+    (32822532297, "Buck"),
+    (34075810132, "Caveira"),
+    (39149215409, "Jackal"),
+    (39149215517, "Lesion"),
+    (104189661900, "Finka"),
+    (104189662110, "Maestro"),
+    (104189662319, "Maverick"),
+    (104189662959, "Nokk"),
+    (104189663542, "Amaru"),
+    (104189664090, "Oryx"),
+    (183220539159, "Gridlock"),
+    (288200866784, "Brava"),
+    (288200867313, "Thunderbird"),
+    (288200867407, "Osa"),
+    (291191151539, "Zero"),
+    (374667787928, "Denari"),
+    (386098331638, "Skopos"),
+    (386098331848, "Rauora"),
+    (409899350066, "Sentry"),
+    (445433447900, "Dokkaebi"),
+    // Not seen in a header: banned once by a defending team. The id is Iana's
+    // operator id minus 65, as for the other Y3 to Y5 operators (Ace, Amaru,
+    // Goyo, Wamai and nine more), and no other operator lacks an icon.
+    (104189663973, "Iana"),
 ];

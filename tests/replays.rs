@@ -490,6 +490,10 @@ fn decode_status_reports_what_can_be_trusted() {
             Status::Inferred
         };
         assert_eq!(status("result"), result, "{}", path.display());
+        // The level's property is named ClearanceLevelText.
+        if round.header.code_version >= replay_analyzer::types::version::Y11S3 {
+            assert_eq!(status("levels"), Status::Decoded, "{}", path.display());
+        }
         let partial = Round::open(&path, ReadMode::Partial).unwrap();
         assert_eq!(
             partial.decode.get("result").unwrap().status,
@@ -912,6 +916,226 @@ fn a_real_library_accounts_for_every_round() {
     for t in &lib.temporary {
         assert!(t.process_id.is_some() && t.kind.is_some(), "{t:?}");
     }
+}
+
+/// Every real round read in full, match by match: read once, shared by the
+/// tests that need it.
+fn real_rounds() -> Option<&'static [Round]> {
+    static ROUNDS: std::sync::OnceLock<Option<Vec<Round>>> = std::sync::OnceLock::new();
+    ROUNDS
+        .get_or_init(|| {
+            let root = match_replay_dir()?;
+            let mut rounds = Vec::new();
+            for dir in replay_analyzer::matches::find_match_folders(&root).unwrap() {
+                let m = replay_analyzer::Match::open_with(&dir, ReadMode::Full).unwrap();
+                rounds.extend(m.rounds);
+            }
+            Some(rounds)
+        })
+        .as_deref()
+}
+
+/// Each team bans operators of the side it plays against, so a ban credited
+/// to the team playing the banned operator's side is credited to the wrong
+/// team.
+#[test]
+fn real_bans_are_made_by_the_team_on_the_other_side() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut wrong = Vec::new();
+    for r in rounds {
+        for b in &r.bans {
+            let Some(team) = b.team else { continue };
+            if r.header.teams[team].role == Some(b.role) {
+                wrong.push(format!(
+                    "{} R{}: {:?}",
+                    r.header.match_id,
+                    r.header.round_number + 1,
+                    b
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} bans credited to the wrong team, e.g. {:?}",
+        wrong.len(),
+        &wrong[..wrong.len().min(3)]
+    );
+}
+
+/// Fails when a ban icon is missing from `ROLE_IMAGES`, or names an operator
+/// of the other side.
+#[test]
+fn real_bans_name_an_operator_of_the_banned_side() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let wrong: Vec<_> = rounds
+        .iter()
+        .flat_map(|r| &r.bans)
+        .filter(|b| !b.no_ban && b.operator.and_then(|o| o.role()) != Some(b.role))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} bans, e.g. {:?}",
+        wrong.len(),
+        wrong.first()
+    );
+}
+
+/// Each team fills its ban slots in order, so a round's bans of one team
+/// are slots 0, 1, 2 with none missing.
+#[test]
+fn real_ban_slots_fill_in_order() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        for team in [Some(0), Some(1)] {
+            let slots: Vec<_> = r
+                .bans
+                .iter()
+                .filter(|b| b.team == team)
+                .map(|b| b.slot)
+                .collect();
+            let expected: Vec<_> = (0..slots.len() as u32).map(Some).collect();
+            assert_eq!(
+                slots,
+                expected,
+                "{} R{} team {team:?}",
+                r.header.match_id,
+                r.header.round_number + 1
+            );
+        }
+    }
+}
+
+/// The slots and the banned-operator icons near them are two reads of the
+/// same bans.
+#[test]
+fn real_ban_slots_agree_with_their_icons() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for r in rounds {
+        let bans = r.decode.get("bans").unwrap();
+        assert!(
+            bans.warnings.is_empty(),
+            "{} R{}: {:?}",
+            r.header.match_id,
+            r.header.round_number + 1,
+            bans.warnings
+        );
+    }
+}
+
+/// In a player's own recording, the game numbers the player's team 1.
+#[test]
+fn real_recorders_team_has_team_color_one() {
+    let Some(rounds) = real_rounds() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let mut checked = 0;
+    for r in rounds {
+        let Some(you) = r.header.recording_player() else {
+            continue;
+        };
+        let colors = r.header.teams.each_ref().map(|t| t.color);
+        if colors == [None, None] {
+            continue; // a file cut before its team objects
+        }
+        assert_eq!(
+            colors[you.team_index],
+            Some(1),
+            "{} R{}",
+            r.header.match_id,
+            r.header.round_number + 1
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
+/// Every real match folder, headers only, with its rounds.
+fn real_matches() -> Option<Vec<replay_analyzer::Match>> {
+    let root = match_replay_dir()?;
+    let folders = replay_analyzer::matches::find_match_folders(&root).unwrap();
+    Some(
+        folders
+            .iter()
+            .map(|dir| replay_analyzer::Match::open_with(dir, ReadMode::Header).unwrap())
+            .collect(),
+    )
+}
+
+/// `matchresult` is the recorder's result in their own recording: 2 won, 1
+/// lost, 7 ended with no winner.
+#[test]
+fn real_outcomes_agree_with_matchresult() {
+    use replay_analyzer::summary::Outcome;
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        let s = m.summary().unwrap();
+        let Some(value) = s.result.raw_match_result else {
+            continue;
+        };
+        if s.recording.spectator {
+            continue;
+        }
+        let expected = match value {
+            2 => Outcome::Win,
+            1 => Outcome::Loss,
+            7 => Outcome::Cancelled,
+            other => panic!("{}: matchresult {other} not seen before", s.match_id),
+        };
+        assert_eq!(s.result.outcome, expected, "{}", s.match_id);
+    }
+}
+
+/// The game writes `isspectator` only for spectators, so a recording
+/// without it is a player's, even when its header lacks the player (a file
+/// cut during prep has no attackers in its header).
+#[test]
+fn real_player_recordings_are_not_listed_as_spectators() {
+    let Some(matches) = real_matches() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    for m in &matches {
+        if m.rounds.iter().all(|r| r.header.is_spectator != Some(true)) {
+            let s = m.summary().unwrap();
+            assert!(!s.recording.spectator, "{}", s.match_id);
+        }
+    }
+}
+
+/// Fails when the game adds a map or gives one a new world id: name it in
+/// `MAPS`, from its sites and spawns.
+#[test]
+fn real_maps_have_names() {
+    let Some(root) = match_replay_dir() else {
+        eprintln!("skipping: R6_MATCH_REPLAY not set");
+        return;
+    };
+    let lib = replay_analyzer::library::scan(&root, ReadMode::Header).unwrap();
+    let unnamed: Vec<_> = lib
+        .folders
+        .iter()
+        .filter_map(|f| f.summary.as_ref())
+        .filter(|s| s.map.base.is_none())
+        .map(|s| s.map.id)
+        .collect();
+    assert!(unnamed.is_empty(), "unnamed map ids: {unnamed:?}");
 }
 
 #[test]

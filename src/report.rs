@@ -67,6 +67,10 @@ impl DecodeReport {
         self.fields.iter().find(|f| f.field == field)
     }
 
+    pub fn get_mut(&mut self, field: &str) -> Option<&mut FieldReport> {
+        self.fields.iter_mut().find(|f| f.field == field)
+    }
+
     pub fn finish(&mut self) {
         self.trusted = self
             .fields

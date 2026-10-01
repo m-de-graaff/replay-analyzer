@@ -460,11 +460,12 @@ const BAN_ROLE: &[u8] = &[0x18, 0xFF, 0xCA, 0x5E];
 /// How far after an icon to look for a ban slot's side. Older replays put one
 /// more object in between; player icons are thousands of bytes from a ban.
 const BAN_WINDOW: usize = 160;
-/// Y11S3+: the team that owns a ban slot, 1-based, written right after its
-/// side.
+/// Y11S3+: the `TeamColor` of the team that owns a ban slot, written right
+/// after its side. In a player's recording the player's own team is 1.
 const BAN_TEAM: [u8; 5] = [0x22, 0x2E, 0x61, 0xA2, 0xA9];
-/// Y11S3+: a player's level as decimal text, on the object carrying their
-/// name. Written once in the round's opening snapshot.
+/// Y11S3+: a player's clearance level as decimal text (`ClearanceLevelText`),
+/// on their profile object, which also carries their name. Written once in
+/// the round's opening snapshot.
 const PLAYER_LEVEL: [u8; 5] = [0x22, 0x3F, 0x0F, 0xDC, 0x1F];
 /// Name property on the same object, just before the level.
 const PLAYER_NAME: [u8; 8] = [0x75, 0x6D, 0x39, 0xD4, 0x00, 0x00, 0x00, 0x00];
@@ -527,6 +528,10 @@ struct Parser<'a> {
     weapon_samples: Vec<(String, bool, Option<usize>)>,
     /// Players' objects from the opening snapshot of the object tree.
     entity_players: Vec<crate::entities::PlayerObjects>,
+    /// Y11S3 ban slots from the same snapshot.
+    ban_slots: Vec<crate::entities::BanSlot>,
+    /// Problems found while reading bans, for `decodeStatus.bans`.
+    ban_warnings: Vec<String>,
     /// Y11S3 scoreboard values by username, and the first assists value
     /// seen (the total going into the round). Players are only known once
     /// their pick packet is read, often after their scoreboard's first
@@ -615,6 +620,8 @@ impl<'a> Parser<'a> {
             scoreboards: HashMap::new(),
             weapon_samples: Vec::new(),
             entity_players: Vec::new(),
+            ban_slots: Vec::new(),
+            ban_warnings: Vec::new(),
             scoreboard_by_name: HashMap::new(),
             pending_credits: Vec::new(),
             packet_at: 0,
@@ -668,11 +675,12 @@ impl<'a> Parser<'a> {
                     .get_or_insert_with(|| format!("at {}: {e}", start + offset));
             }
         }
-        if self.players_read < 10 {
+        if self.players_read < 2 * self.team_size() {
             self.derive_team_roles();
         }
         self.read_levels(start, end);
         self.apply_entities(start, end);
+        self.finish_bans();
         self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
@@ -976,6 +984,13 @@ impl<'a> Parser<'a> {
                 Packet::ObservationTool,
             ],
         );
+        // A slot that could not be read, or slots and icons that disagree,
+        // may mean a ban is missing or misplaced.
+        if let Some(f) = r.get_mut("bans") {
+            for w in &self.ban_warnings {
+                f.at_most(Status::Partial).warn(w.clone());
+            }
+        }
         // Who the players are and which objects carry them.
         let players = &round.header.players;
         let with_profile = players.iter().filter(|p| !p.profile_id.is_empty()).count();
@@ -1058,7 +1073,7 @@ impl<'a> Parser<'a> {
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
-            if matches!(h.match_type.0, 3 | 4) {
+            if h.match_type.is_custom() {
                 f.at_most(Status::Skipped).warn(
                     "custom game: the whole lobby counts as one party, so no roles are given",
                 );
@@ -1095,9 +1110,7 @@ impl<'a> Parser<'a> {
             .filter(|p| p.level.is_some())
             .count();
         if levels > 0 {
-            r.field("levels", Status::Inferred, levels).warn(
-                "probably the clearance level: stable across rounds and distinct per player, but not checked against Ubisoft's stats",
-            );
+            r.field("levels", Status::Decoded, levels);
         }
         if code >= version::Y9S1 && !skipped {
             r.field("feedbackMessages", Status::NotInVersion, 0)
@@ -1267,7 +1280,7 @@ impl<'a> Parser<'a> {
             Packet::Player => {
                 self.players_read += 1;
                 let result = self.read_player(c);
-                if self.players_read == 10 {
+                if self.players_read == 2 * self.team_size() {
                     self.derive_team_roles();
                 }
                 result
@@ -1304,6 +1317,16 @@ impl<'a> Parser<'a> {
         u.username = username.to_owned();
         u.offset = Some(self.packet_at);
         u
+    }
+
+    /// Players per team: 5 unless the header says otherwise (Y11S3+
+    /// `maxnbplayersperteam`; Dual Front is 6v6).
+    fn team_size(&self) -> u32 {
+        self.round
+            .header
+            .max_players_per_team
+            .filter(|&n| n > 0)
+            .unwrap_or(5)
     }
 
     fn read_player(&mut self, c: &mut Cursor) -> Result<()> {
@@ -1344,7 +1367,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.take_loadout(c.pos(), &username, operator);
-        let team_index = usize::from(self.players_read > 5);
+        let team_index = pick_team(self.players_read, self.team_size());
         self.pick_slots.insert(self.players_read, username.clone());
 
         // Caster UI id; links attacker swaps to players from Y9S3.
@@ -1416,7 +1439,7 @@ impl<'a> Parser<'a> {
             !p.operator.is_empty()
         });
         // 5v5 unless the header says otherwise (Y11S3+ `maxnbplayersperteam`).
-        let max = 2 * header.max_players_per_team.unwrap_or(5) as usize;
+        let max = 2 * header.max_players_per_team.filter(|&n| n > 0).unwrap_or(5) as usize;
         if header.players.len() > max {
             tracing::warn!(players = header.players.len(), max, "too many players");
             warnings.push(format!("{} players, more than {max}", header.players.len()));
@@ -1817,26 +1840,94 @@ impl<'a> Parser<'a> {
             2 => TeamRole::Defense,
             _ => return Ok(()),
         };
-        let team = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
+        // The team is set once the team objects are read (`finish_bans`).
+        let color = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
             c.skip(BAN_TEAM.len())?;
-            match c.u32()? {
-                t @ 1..=2 => Some(t as usize - 1),
-                _ => None,
-            }
+            Some(c.u32()?)
         } else {
             None
         };
-        if !self.round.bans.iter().any(|b| b.icon == icon) {
+        if !self.round.bans.iter().any(|b| b.icon == Some(icon)) {
             let operator = Operator::from_role_image(icon);
-            tracing::debug!(icon, ?operator, ?role, ?team, "ban");
+            tracing::debug!(icon, ?operator, ?role, ?color, "ban");
             self.round.bans.push(Ban {
                 operator,
                 role,
-                team,
-                icon,
+                team: None,
+                icon: Some(icon),
+                slot: None,
+                no_ban: false,
+                color,
             });
         }
         Ok(())
+    }
+
+    /// Y11S3: bans come from the snapshot's ban slots, which also give each
+    /// ban's order and the votes that ended without a ban; the icons found
+    /// above are only a cross-check. Slots name the banning team by its
+    /// `TeamColor`, not by its index in the header.
+    fn finish_bans(&mut self) {
+        let slots = std::mem::take(&mut self.ban_slots);
+        let Round { header, bans, .. } = &mut self.round;
+        if slots.is_empty() {
+            for b in bans.iter_mut() {
+                b.team = b.color.and_then(|c| header.team_of_color(c));
+            }
+            return;
+        }
+        let mut from_slots = Vec::new();
+        for s in slots.iter().filter(|s| s.resolved()) {
+            let role = match s.side {
+                1 => TeamRole::Attack,
+                2 => TeamRole::Defense,
+                side => {
+                    self.ban_warnings
+                        .push(format!("ban slot {} bans side {side}", s.index));
+                    continue;
+                }
+            };
+            let no_ban = s.no_ban();
+            if !no_ban && s.icon.is_none() {
+                self.ban_warnings.push(format!(
+                    "ban slot {} is resolved but names no operator",
+                    s.index
+                ));
+                continue;
+            }
+            let icon = s.icon.filter(|_| !no_ban);
+            from_slots.push(Ban {
+                operator: icon.and_then(Operator::from_role_image),
+                role,
+                team: header.team_of_color(s.color),
+                icon,
+                slot: Some(s.index),
+                no_ban,
+                color: Some(s.color),
+            });
+        }
+        from_slots.sort_by_key(|b| (b.team.unwrap_or(usize::MAX), b.slot));
+        let in_slots: std::collections::BTreeSet<u64> =
+            from_slots.iter().filter_map(|b| b.icon).collect();
+        let in_icons: std::collections::BTreeSet<u64> =
+            bans.iter().filter_map(|b| b.icon).collect();
+        if in_slots != in_icons {
+            self.ban_warnings.push(format!(
+                "the ban slots hold {} banned operators and the icons {}; bans only the icons show are kept without a slot",
+                in_slots.len(),
+                in_icons.len()
+            ));
+        }
+        // Keep what only the icons show, after the slots, rather than lose it.
+        for b in bans
+            .iter()
+            .filter(|b| b.icon.is_some_and(|i| !in_slots.contains(&i)))
+        {
+            let mut b = b.clone();
+            b.team = b.color.and_then(|c| header.team_of_color(c));
+            from_slots.push(b);
+        }
+        *bans = from_slots;
     }
 
     /// Y11S3+ player levels from the opening snapshot: each follows the
@@ -2185,7 +2276,9 @@ impl<'a> Parser<'a> {
         if self.code() < version::Y8S1 {
             return;
         }
-        self.entity_players = crate::entities::players(&self.data[start..end]);
+        let snapshot = crate::entities::snapshot(&self.data[start..end]);
+        self.entity_players = snapshot.players;
+        self.ban_slots = snapshot.ban_slots;
         for o in &self.entity_players {
             self.controllers.insert(o.controller, o.username.clone());
             if let Some(sb) = o.scoreboard {
@@ -2200,7 +2293,7 @@ impl<'a> Parser<'a> {
         use crate::entities::Relation;
         let objects = std::mem::take(&mut self.entity_players);
         let header = &mut self.round.header;
-        let custom = matches!(header.match_type.0, 3 | 4);
+        let custom = header.match_type.is_custom();
         let spectator = header.is_spectator == Some(true);
         let find = |players: &[Player], o: &crate::entities::PlayerObjects| {
             players
@@ -2223,6 +2316,27 @@ impl<'a> Parser<'a> {
                 movement: None,
             });
             p.relation = (!spectator && o.relation == Some(5)).then_some(Relation::You);
+        }
+        // Each team's `TeamColor`, when all its players' team objects agree.
+        let mut colors: [Vec<u32>; 2] = Default::default();
+        for o in &objects {
+            if let (Some(i), Some(color)) = (find(&header.players, o), o.team_color)
+                && let Some(seen) = colors.get_mut(header.players[i].team_index)
+            {
+                seen.push(color);
+            }
+        }
+        let agreed = colors.map(|seen| {
+            let first = *seen.first()?;
+            (matches!(first, 1 | 2) && seen.iter().all(|&c| c == first)).then_some(first)
+        });
+        if agreed[0].is_some() && agreed[0] == agreed[1] {
+            self.warnings
+                .push("both teams' objects carry the same TeamColor".to_owned());
+        } else {
+            for (team, color) in header.teams.iter_mut().zip(agreed) {
+                team.color = color;
+            }
         }
         header.assign_relations();
         // Party roles are those of the recorder's party: only players the
@@ -2672,6 +2786,12 @@ fn owning_object(before: &[u8], marker_len: usize) -> Option<u32> {
     })
 }
 
+/// The team of the `pick`-th pick packet (from 1) of a round where each
+/// team has `per_team` players: the first team's players are picked first.
+fn pick_team(pick: u32, per_team: u32) -> usize {
+    usize::from(pick > per_team)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2714,6 +2834,57 @@ mod tests {
         let mut p = Parser::new(&[], header);
         p.finish_report(ReadMode::Full);
         p.round.decode
+    }
+
+    #[test]
+    fn a_ban_only_the_icons_show_is_kept_and_lowers_trust() {
+        let mut p = Parser::new(&[], own_recording(10));
+        // The icon scan found Mira; the slots hold only Ace.
+        p.round.bans.push(Ban {
+            operator: None,
+            role: TeamRole::Defense,
+            team: None,
+            icon: Some(39149215445),
+            slot: None,
+            no_ban: false,
+            color: Some(1),
+        });
+        p.ban_slots.push(crate::entities::BanSlot {
+            index: 0,
+            side: 1,
+            color: 2,
+            state: 3,
+            result: 1,
+            icon: Some(104189664325),
+        });
+
+        p.finish_bans();
+        p.finish_report(ReadMode::Full);
+
+        let icons: Vec<_> = p.round.bans.iter().map(|b| b.icon).collect();
+        assert_eq!(icons, [Some(104189664325), Some(39149215445)]);
+        let bans = p.round.decode.get("bans").unwrap();
+        assert_eq!(bans.status, Status::Partial);
+    }
+
+    #[test]
+    fn a_header_team_size_of_zero_means_five() {
+        let header = Header {
+            max_players_per_team: Some(0),
+            ..Header::default()
+        };
+
+        let p = Parser::new(&[], header);
+
+        assert_eq!(p.team_size(), 5);
+    }
+
+    #[test]
+    fn picks_fill_the_first_team_up_to_the_team_size() {
+        assert_eq!(pick_team(5, 5), 0);
+        assert_eq!(pick_team(6, 5), 1);
+        assert_eq!(pick_team(6, 6), 0);
+        assert_eq!(pick_team(7, 6), 1);
     }
 
     #[test]

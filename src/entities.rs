@@ -205,12 +205,18 @@ fn tree(data: &[u8]) -> Tree<'_> {
             i += 1;
             continue;
         };
+        let first_end = next;
+        let names_object = names_its_object(&first);
         let mut run = vec![(i, first)];
         while let Some((r, n)) = record(data, next) {
+            // A run can also carry on into binary data that reads as records.
+            if !names_its_object(&r) && swallows_an_object(data, next, n) {
+                break;
+            }
             run.push((next, r));
             next = n;
         }
-        if run.len() < 2 && !matches!(run[0].1, Record::Set(..) | Record::ParentChild(..)) {
+        if !names_object && (run.len() < 2 || swallows_an_object(data, i, first_end)) {
             i += 1;
             continue;
         }
@@ -256,6 +262,39 @@ fn tree(data: &[u8]) -> Tree<'_> {
         i = next;
     }
     t
+}
+
+/// Whether the record from `start` to `end`, which does not name its object,
+/// covers records that do (a `23` or `1b` and what follows it) ending exactly
+/// where it ends: binary data that reads as a record and swallows real ones,
+/// whose properties would then land on the previous object.
+fn swallows_an_object(d: &[u8], start: usize, end: usize) -> bool {
+    // A record's header and the smallest `23` record it could cover.
+    if end - start < 6 + 14 {
+        return false;
+    }
+    memchr::memchr2_iter(0x23, 0x1B, &d[start + 1..end])
+        .map(|k| start + 1 + k)
+        .any(|j| {
+            record(d, j).is_some_and(|(r, _)| names_its_object(&r)) && records_end_at(d, j, end)
+        })
+}
+
+/// `23` and `1b` records say which object they belong to; the others belong
+/// to the current one.
+fn names_its_object(r: &Record) -> bool {
+    matches!(r, Record::Set(..) | Record::ParentChild(..))
+}
+
+/// Whether records read from `at` end exactly at `end`.
+fn records_end_at(d: &[u8], mut at: usize, end: usize) -> bool {
+    while at < end {
+        match record(d, at) {
+            Some((_, next)) => at = next,
+            None => return false,
+        }
+    }
+    at == end
 }
 
 fn add_prop(t: &mut Tree, obj: u32, hash: Hash, from: usize, to: usize) {
@@ -752,6 +791,24 @@ mod tests {
             icon: Some(39149215445),
         };
         assert_eq!(slots, [expected]);
+    }
+
+    #[test]
+    fn a_stray_property_record_does_not_swallow_the_next_object() {
+        let team: u32 = 0xF000_0010;
+        let mut d = vec![];
+        set(&mut d, 1, PLAYER_ID, &7u64.to_le_bytes());
+        prop(&mut d, TEAM, &u64::from(team).to_le_bytes());
+        // Bytes that read as a property whose value is the team object's
+        // first record, ending where the team's color is written.
+        let mut team_record = vec![];
+        set(&mut team_record, team, [0x10, 0x9F, 0x20, 0x30], &[0]);
+        prop(&mut d, [0xCA, 0x8C, 0xD8, 0x71], &team_record);
+        prop(&mut d, TEAM_COLOR, &1u32.to_le_bytes());
+
+        let p = players(&d);
+
+        assert_eq!(p[0].team_color, Some(1));
     }
 
     #[test]

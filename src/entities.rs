@@ -52,6 +52,10 @@ const PROFILE_FIELD: Hash = [0x77, 0xB1, 0x5E, 0x33];
 const RELATION: Hash = [0x05, 0xC7, 0xB9, 0x49];
 /// Profile: role in the recorder's party: 0 none, 1 member, 2 leader.
 const PARTY_ROLE: Hash = [0xAF, 0x6B, 0xB2, 0x87];
+/// Team object: the game's number for the team, 1 or 2 (`TeamColor`; every
+/// hash is the CRC-32 of the game's property name). Ban slots and
+/// `matchresult` name teams by it.
+const TEAM_COLOR: Hash = [0x2E, 0x61, 0xA2, 0xA9];
 
 /// How far into the stream the opening snapshot of the tree can reach.
 const SNAPSHOT_BYTES: usize = 4 << 20;
@@ -238,6 +242,8 @@ pub struct PlayerObjects {
     pub controller: u32,
     /// The player's team object.
     pub team_object: Option<u32>,
+    /// The team object's `TeamColor`: 1 or 2.
+    pub team_color: Option<u32>,
     pub scoreboard: Option<u32>,
     pub health: Option<u32>,
     /// Raw relation to the recorder: 1 opponent, 2 teammate, 3 in the
@@ -263,6 +269,7 @@ pub fn players(body: &[u8]) -> Vec<PlayerObjects> {
         .filter_map(|(&obj, o)| {
             let first = o.props.iter().find(|p| p.0 == PLAYER_ID)?.1;
             let profile = t.child(obj, PROFILE_FIELD);
+            let team_object = t.u64(obj, TEAM).map(|v| v as u32).filter(|&v| v != 0);
             Some((
                 first,
                 PlayerObjects {
@@ -270,7 +277,8 @@ pub fn players(body: &[u8]) -> Vec<PlayerObjects> {
                     username: t.text(obj, NAME).unwrap_or_default(),
                     profile_id: t.text(obj, PROFILE_ID).unwrap_or_default(),
                     controller: obj,
-                    team_object: t.u64(obj, TEAM).map(|v| v as u32).filter(|&v| v != 0),
+                    team_object,
+                    team_color: team_object.and_then(|team| t.u32(team, TEAM_COLOR)),
                     scoreboard: t.child(obj, SCOREBOARD_FIELD),
                     health: t.child(obj, HEALTH_FIELD),
                     relation: profile.and_then(|p| t.u32(p, RELATION)),

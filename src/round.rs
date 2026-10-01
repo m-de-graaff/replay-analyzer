@@ -460,8 +460,8 @@ const BAN_ROLE: &[u8] = &[0x18, 0xFF, 0xCA, 0x5E];
 /// How far after an icon to look for a ban slot's side. Older replays put one
 /// more object in between; player icons are thousands of bytes from a ban.
 const BAN_WINDOW: usize = 160;
-/// Y11S3+: the team that owns a ban slot, 1-based, written right after its
-/// side.
+/// Y11S3+: the `TeamColor` of the team that owns a ban slot, written right
+/// after its side. In a player's recording the player's own team is 1.
 const BAN_TEAM: [u8; 5] = [0x22, 0x2E, 0x61, 0xA2, 0xA9];
 /// Y11S3+: a player's level as decimal text, on the object carrying their
 /// name. Written once in the round's opening snapshot.
@@ -673,6 +673,7 @@ impl<'a> Parser<'a> {
         }
         self.read_levels(start, end);
         self.apply_entities(start, end);
+        self.assign_ban_teams();
         self.finish_scoreboard();
         self.finish_interactions();
         self.round.timeline = Timeline::resolve(&self.readings, self.plant_tick);
@@ -1817,26 +1818,34 @@ impl<'a> Parser<'a> {
             2 => TeamRole::Defense,
             _ => return Ok(()),
         };
-        let team = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
+        // The team is set once the team objects are read (`assign_ban_teams`).
+        let color = if c.peek(BAN_TEAM.len()) == BAN_TEAM {
             c.skip(BAN_TEAM.len())?;
-            match c.u32()? {
-                t @ 1..=2 => Some(t as usize - 1),
-                _ => None,
-            }
+            Some(c.u32()?)
         } else {
             None
         };
         if !self.round.bans.iter().any(|b| b.icon == icon) {
             let operator = Operator::from_role_image(icon);
-            tracing::debug!(icon, ?operator, ?role, ?team, "ban");
+            tracing::debug!(icon, ?operator, ?role, ?color, "ban");
             self.round.bans.push(Ban {
                 operator,
                 role,
-                team,
+                team: None,
                 icon,
+                color,
             });
         }
         Ok(())
+    }
+
+    /// Y11S3 ban slots name the banning team by its `TeamColor`, not by its
+    /// index in the header.
+    fn assign_ban_teams(&mut self) {
+        let Round { header, bans, .. } = &mut self.round;
+        for b in bans {
+            b.team = b.color.and_then(|c| header.team_of_color(c));
+        }
     }
 
     /// Y11S3+ player levels from the opening snapshot: each follows the
@@ -2223,6 +2232,27 @@ impl<'a> Parser<'a> {
                 movement: None,
             });
             p.relation = (!spectator && o.relation == Some(5)).then_some(Relation::You);
+        }
+        // Each team's `TeamColor`, when all its players' team objects agree.
+        let mut colors: [Vec<u32>; 2] = Default::default();
+        for o in &objects {
+            if let (Some(i), Some(color)) = (find(&header.players, o), o.team_color)
+                && let Some(seen) = colors.get_mut(header.players[i].team_index)
+            {
+                seen.push(color);
+            }
+        }
+        let agreed = colors.map(|seen| {
+            let first = *seen.first()?;
+            (matches!(first, 1 | 2) && seen.iter().all(|&c| c == first)).then_some(first)
+        });
+        if agreed[0].is_some() && agreed[0] == agreed[1] {
+            self.warnings
+                .push("both teams' objects carry the same TeamColor".to_owned());
+        } else {
+            for (team, color) in header.teams.iter_mut().zip(agreed) {
+                team.color = color;
+            }
         }
         header.assign_relations();
         // Party roles are those of the recorder's party: only players the

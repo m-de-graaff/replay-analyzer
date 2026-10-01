@@ -21,6 +21,10 @@ pub struct Ban {
     pub team: Option<usize>,
     /// The operator's role image id, which is all the replay records.
     pub icon: u64,
+    /// The slot's `TeamColor`, which `team` is derived from: the game numbers
+    /// a player's own team 1 in their recording, whatever its header index.
+    #[serde(skip)]
+    pub color: Option<u32>,
 }
 
 /// Where in the round something happened. Inferred from the clock: prep

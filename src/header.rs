@@ -137,6 +137,11 @@ pub struct Team {
     pub win_condition: Option<WinCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<TeamRole>,
+    /// The game's number for this team (`TeamColor`, 1 or 2), from the team
+    /// object (full and partial reads, Y11S3+). Ban slots and `matchresult`
+    /// name teams by it; in a player's recording 1 is the recorder's team.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -264,6 +269,27 @@ impl Header {
                     .iter()
                     .find(|p| p.relation == Some(Relation::You))
             })
+    }
+
+    /// Index of the team the game numbers `color` (`TeamColor`, 1 or 2).
+    /// Colors decoded from the team objects decide. Without them, 1 is the
+    /// recorder's team in a player's recording, and team 0 in a spectator's
+    /// (as in the one spectator match seen).
+    pub fn team_of_color(&self, color: u32) -> Option<usize> {
+        if let Some(i) = self.teams.iter().position(|t| t.color == Some(color)) {
+            return Some(i);
+        }
+        if !matches!(color, 1 | 2) || self.teams.iter().any(|t| t.color.is_some()) {
+            return None;
+        }
+        let first = if self.is_spectator == Some(true) {
+            0
+        } else {
+            self.recording_player()
+                .map(|p| p.team_index)
+                .filter(|&t| t < 2)?
+        };
+        Some(if color == 1 { first } else { first ^ 1 })
     }
 
     /// Fills each player's `key` and `relation`. A relation already set to
@@ -480,4 +506,51 @@ fn read_properties(c: &mut Cursor, count: Option<u32>) -> Result<Header> {
     };
     header.assign_relations();
     Ok(header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header whose recording player (`recordingplayerid` 7) plays for
+    /// `team`.
+    fn recorded_by_team(team: usize) -> Header {
+        Header {
+            recording_player_id: 7,
+            players: vec![Player {
+                id: 7,
+                username: "recorder".into(),
+                team_index: team,
+                ..Player::default()
+            }],
+            ..Header::default()
+        }
+    }
+
+    #[test]
+    fn team_color_one_is_the_recorders_team() {
+        let h = recorded_by_team(1);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(1), Some(0)));
+    }
+
+    #[test]
+    fn team_color_one_is_team_zero_in_a_spectators_recording() {
+        let mut h = recorded_by_team(1);
+        h.is_spectator = Some(true);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn decoded_team_colors_override_the_recorders_team() {
+        let mut h = recorded_by_team(1);
+        h.teams[0].color = Some(1);
+        h.teams[1].color = Some(2);
+        assert_eq!((h.team_of_color(1), h.team_of_color(2)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn team_color_without_a_recorder_or_out_of_range_is_no_team() {
+        assert_eq!(Header::default().team_of_color(1), None);
+        assert_eq!(recorded_by_team(0).team_of_color(3), None);
+    }
 }

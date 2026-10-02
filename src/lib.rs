@@ -54,6 +54,7 @@ pub mod report;
 pub mod round;
 pub mod settings;
 pub mod shots;
+pub mod sight;
 pub mod sound;
 pub mod stats;
 pub mod summary;

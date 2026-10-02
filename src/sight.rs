@@ -207,6 +207,69 @@ const HATCH_SIDE: f32 = 2.0;
 const REINFORCEMENT_OFFSET: f32 = 0.1;
 const BARRICADE_OFFSET: f32 = 0.125;
 
+impl From<&crate::mapdata::MapData> for Geometry {
+    /// A map's data as geometry: its walls (a destructible wall that is
+    /// part of a reinforceable one is left out, as is one whose stretch
+    /// is not known), its doors and windows, and each hatch as a patch of
+    /// floor with the hatch in it. Walls keep the object id panels name,
+    /// so a round's reinforcements and barricades find them.
+    fn from(data: &crate::mapdata::MapData) -> Self {
+        use crate::mapdata::WallKind as Kind;
+        let hex = |id: Option<u64>| id.map(|id| format!("{id:x}"));
+        let mut out = Geometry {
+            map: Some(data.map.name.clone()),
+            source: Some("map data".to_owned()),
+            ..Geometry::default()
+        };
+        for w in &data.walls {
+            if w.part_of.is_some() || w.a == w.b {
+                continue;
+            }
+            out.walls.push(Wall {
+                id: None,
+                a: w.a,
+                b: w.b,
+                bottom: w.bottom,
+                top: w.top,
+                kind: match w.kind {
+                    _ if w.see_through => WallKind::SeeThrough,
+                    Kind::Solid => WallKind::Solid,
+                    Kind::Soft | Kind::Reinforceable => WallKind::Soft,
+                },
+                object: hex(w.object_id),
+            });
+        }
+        let openings = (data.doors.iter().map(|o| (o, WallKind::Door)))
+            .chain(data.windows.iter().map(|o| (o, WallKind::Window)));
+        for (o, kind) in openings {
+            out.walls.push(Wall {
+                id: None,
+                a: o.a,
+                b: o.b,
+                bottom: o.bottom,
+                top: o.top,
+                kind: if o.see_through { kind } else { WallKind::Solid },
+                object: hex(o.object_id),
+            });
+        }
+        for h in &data.hatches {
+            let [x, y, z] = h.position;
+            out.slabs.push(Slab {
+                id: Some(format!("hatch {x:.1} {y:.1} {z:.1}")),
+                z,
+                polygon: h.corners.to_vec(),
+                soft: true,
+                openings: vec![Opening {
+                    polygon: h.corners.to_vec(),
+                    hatch: true,
+                    object: hex(h.object_id),
+                }],
+            });
+        }
+        out
+    }
+}
+
 impl Geometry {
     /// The panels rounds put up, as geometry: every wall that was
     /// reinforced as a `soft` wall, every door and window that had a

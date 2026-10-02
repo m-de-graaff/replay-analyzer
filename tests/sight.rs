@@ -562,3 +562,34 @@ fn real_rounds_hold_the_same() {
         all.shots_blocked
     );
 }
+
+#[test]
+fn map_data_serves_as_geometry() {
+    let observed: Vec<_> = (rounds().iter())
+        .map(|(p, _)| replay_analyzer::mapdata::read(p).unwrap())
+        .collect();
+    if observed.is_empty() {
+        return;
+    }
+    let data = replay_analyzer::mapdata::harvest_with(&observed);
+    let g = Geometry::from(&data);
+    let reinforceable = (data.walls.iter())
+        .filter(|w| w.kind == replay_analyzer::mapdata::WallKind::Reinforceable)
+        .count();
+    assert!(g.walls.len() >= reinforceable + data.doors.len() + data.windows.len());
+    assert_eq!(g.slabs.len(), data.hatches.len());
+    let mut v = Validation::default();
+    for (path, round) in rounds() {
+        let scene = Scene::for_round(&g, round);
+        let applied = scene.applied().unwrap();
+        // Every panel of the round finds its wall, door, window or hatch.
+        assert_eq!(applied.reinforcements_unmatched, 0, "{}", path.display());
+        assert_eq!(applied.barricades_unmatched, 0, "{}", path.display());
+        v.add(sight::validate(&scene, round).unwrap());
+        let s = sight::analyze(round, Some(&g), &Options::default()).unwrap();
+        assert!(s.occlusion && s.geometry.starts_with("map data: Bank"), "{}", s.geometry);
+    }
+    report("map data, round state applied", &mut v);
+    // No bullet that struck a player was stopped on its way.
+    assert_eq!(v.miss_rate(), Some(0.0));
+}

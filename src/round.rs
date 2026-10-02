@@ -88,6 +88,14 @@ pub struct Round {
     /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
     /// every hit a player took (see [`crate::combat`]).
     pub combat: Option<crate::combat::Combat>,
+    /// Y11S3: the pings players put on the map (see [`crate::markers`]).
+    pub pings: Vec<crate::markers::Ping>,
+    /// Y11S3: operators spotted through a drone or camera.
+    pub spots: Vec<crate::markers::Spot>,
+    /// Y11S3: the tracking markers abilities put on players.
+    pub ability_markers: Vec<crate::markers::Track>,
+    /// Y11S3: changes to the device markers of Solis.
+    pub device_markers: Vec<crate::markers::DeviceMarker>,
 }
 
 /// How far apart, in seconds, the timeline's entry for a kill, down or
@@ -287,6 +295,14 @@ impl Serialize for Round {
             hits: &'a [crate::combat::Hit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             timeline_events: &'a [crate::combat::TimelineEvent],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            pings: &'a [crate::markers::Ping],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            spots: &'a [crate::markers::Spot],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            ability_markers: &'a [crate::markers::Track],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            device_markers: &'a [crate::markers::DeviceMarker],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +335,10 @@ impl Serialize for Round {
             shield_actions: &self.shield_actions,
             hits: self.combat.as_ref().map_or(&[][..], |c| &c.hits),
             timeline_events: self.combat.as_ref().map_or(&[][..], |c| &c.events),
+            pings: &self.pings,
+            spots: &self.spots,
+            ability_markers: &self.ability_markers,
+            device_markers: &self.device_markers,
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
@@ -2632,11 +2652,17 @@ impl<'a> Parser<'a> {
         let shots = crate::shots::decode(&input);
         let throws = crate::throws::decode(&input);
         let melee = crate::melee::decode(&input);
+        let markers = crate::markers::decode(&input);
+        let marked = markers.pings.len()
+            + markers.spots.len()
+            + markers.tracks.len()
+            + markers.devices.len();
         self.weapon_status = vec![
             ("weaponActivity", activity.len(), Vec::new()),
             ("shots", shots.shots.len(), shots.warnings),
             ("throws", throws.throws.len(), throws.warnings),
             ("melee", melee.hits.len() + melee.shields.len(), melee.warnings),
+            ("markers", marked, markers.warnings),
         ];
         self.round.weapon_activity = activity;
         self.round.shots = shots.shots;
@@ -2644,6 +2670,10 @@ impl<'a> Parser<'a> {
         self.round.throws = throws.throws;
         self.round.melee_hits = melee.hits;
         self.round.shield_actions = melee.shields;
+        self.round.pings = markers.pings;
+        self.round.spots = markers.spots;
+        self.round.ability_markers = markers.tracks;
+        self.round.device_markers = markers.devices;
         self.loadout_status = Some(decoded);
         self.round.combat = Some(crate::combat::decode(
             self.data,

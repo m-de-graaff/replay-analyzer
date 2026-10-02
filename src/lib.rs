@@ -26,6 +26,7 @@ pub mod header;
 pub mod identity;
 pub mod library;
 pub mod loadout;
+pub mod markers;
 pub mod matches;
 pub mod melee;
 pub mod outcome;

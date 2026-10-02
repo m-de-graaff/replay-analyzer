@@ -35,6 +35,7 @@ pub mod identity;
 pub mod intel;
 pub mod joins;
 pub mod join;
+pub mod journal;
 pub mod library;
 pub mod loadout;
 pub mod markers;

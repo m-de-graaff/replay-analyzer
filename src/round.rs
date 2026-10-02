@@ -88,6 +88,15 @@ pub struct Round {
     /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
     /// every hit a player took (see [`crate::combat`]).
     pub combat: Option<crate::combat::Combat>,
+    /// Y11S3 full reads: whether and by whom the objective was found (see
+    /// [`crate::intel`]). Absent when the round shows neither.
+    pub objective: Option<crate::intel::Objective>,
+    /// Y11S3 full reads: each player's operator becoming known to the other
+    /// team.
+    pub operator_reveals: Vec<crate::intel::Reveal>,
+    /// Y11S3 full reads: the alarms of metal detectors (see
+    /// [`crate::sound`]).
+    pub metal_detectors: Vec<crate::sound::MetalDetector>,
 }
 
 /// How far apart, in seconds, the timeline's entry for a kill, down or
@@ -287,6 +296,12 @@ impl Serialize for Round {
             hits: &'a [crate::combat::Hit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             timeline_events: &'a [crate::combat::TimelineEvent],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            objective: Option<&'a crate::intel::Objective>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            operator_reveals: &'a [crate::intel::Reveal],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            metal_detectors: &'a [crate::sound::MetalDetector],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +334,9 @@ impl Serialize for Round {
             shield_actions: &self.shield_actions,
             hits: self.combat.as_ref().map_or(&[][..], |c| &c.hits),
             timeline_events: self.combat.as_ref().map_or(&[][..], |c| &c.events),
+            objective: self.objective.as_ref(),
+            operator_reveals: &self.operator_reveals,
+            metal_detectors: &self.metal_detectors,
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
@@ -685,7 +703,7 @@ struct Parser<'a> {
     /// found, for `decodeStatus.loadouts`.
     loadout_status: Option<crate::loadout::Decoded>,
     /// Y11S3: `(decodeStatus field, events found, warnings)` of each kind
-    /// of weapon event decoded.
+    /// of weapon event decoded, and of what [`Parser::resolve_intel`] reads.
     weapon_status: Vec<(&'static str, usize, Vec<String>)>,
 }
 
@@ -861,6 +879,7 @@ impl<'a> Parser<'a> {
             self.resolve_vitals();
             self.join_combat();
             self.round_end();
+            self.resolve_intel();
         }
         self.measure_records();
         if options.census {
@@ -2689,6 +2708,44 @@ impl<'a> Parser<'a> {
             }
         }
         self.round.vitals = Some(vitals);
+    }
+
+    /// Y11S3: who found the objective and whose operator became known, from
+    /// the HUD objects of the state stream (see [`crate::intel`]), and the
+    /// alarms of metal detectors, from the sound stream (see
+    /// [`crate::sound`]). Reveals are explained by the kills of the feed
+    /// and finds told by the teams' sides, so this follows both.
+    fn resolve_intel(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let header = &self.round.header;
+        let input = crate::loadout::Input {
+            data: self.data,
+            map,
+            streams: &container.streams,
+            players: &header.players,
+            clock: &clock,
+        };
+        let sides = [header.teams[0].role, header.teams[1].role];
+        let intel = crate::intel::decode(&input, sides, &self.round.match_feedback);
+        let sound = crate::sound::decode(&input);
+        let found = usize::from(intel.objective.is_some());
+        self.weapon_status.extend([
+            ("intel", found + intel.reveals.len(), intel.warnings),
+            ("sound", sound.alarms.len(), sound.warnings),
+        ]);
+        self.round.objective = intel.objective;
+        self.round.operator_reveals = intel.reveals;
+        self.round.metal_detectors = sound.alarms;
     }
 
     /// Y11S3: names who downed, finished and revived whom, from the round's

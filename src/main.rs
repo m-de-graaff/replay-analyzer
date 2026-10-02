@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -5,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use replay_analyzer::matches::{FolderReport, find_match_folders};
+use replay_analyzer::{catalog, journal, mapdata, profiles, sight};
 use replay_analyzer::{Match, ReadMode, ReadOptions, Round, decompressed_bytes, file};
 
 /// Parse Rainbow Six Siege replays (.rec files or match folders) into JSON.
@@ -51,6 +53,37 @@ struct Cli {
     /// would decode differently now.
     #[arg(long, conflicts_with_all = ["dump", "info", "partial", "census", "list", "players"])]
     decoders: bool,
+    /// Print the operator catalog of the latest season: side, armor, speed,
+    /// ability and gadgets with their counts, each observed or reference.
+    #[arg(long)]
+    operators: bool,
+    /// Print the weapon catalog: damage, fire rate, magazine, attachments.
+    #[arg(long)]
+    weapons: bool,
+    /// Print the aim and display settings of a `GameSettings.ini`. Only
+    /// the file named is opened, read-only; nothing looks for one.
+    #[arg(long, value_name = "FILE")]
+    settings: Option<PathBuf>,
+    /// Harvest map data from a round, a match folder or a folder of them:
+    /// one entry per map with its floors, sites, spawns, doors, windows,
+    /// hatches, walls and cameras.
+    #[arg(long)]
+    map_data: bool,
+    /// Who could see whom, exposure and crosshair placement of a round
+    /// (Y11S3+). Without `--map` no wall is tested and the output says so.
+    #[arg(long)]
+    sight: bool,
+    /// A map data file (as `--map-data` writes one map) for `--sight`.
+    #[arg(long, value_name = "FILE", requires = "sight")]
+    map: Option<PathBuf>,
+    /// Play sessions, breaks and session insights of the match folders
+    /// under a folder.
+    #[arg(long)]
+    sessions: bool,
+    /// Lobby strength of a match folder from a profile cache file, and the
+    /// players whose profile it lacks or holds for over a day.
+    #[arg(long, value_name = "CACHE")]
+    profiles: Option<PathBuf>,
     /// Log debug information to stderr.
     #[arg(short, long)]
     debug: bool,
@@ -84,7 +117,68 @@ fn main() -> Result<()> {
         movement: cli.movement,
     };
 
-    if cli.decoders {
+    if cli.operators {
+        write_json(&mut out, catalog::operators::latest(), cli.pretty)?;
+    } else if cli.weapons {
+        write_json(&mut out, &catalog::weapons::all(), cli.pretty)?;
+    } else if let Some(path) = &cli.settings {
+        let settings = replay_analyzer::settings::read(path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        write_json(&mut out, &settings, cli.pretty)?;
+    } else if cli.map_data {
+        let input = cli.input.as_ref().context("--map-data needs a file or folder")?;
+        write_json(&mut out, &map_data(input)?, cli.pretty)?;
+    } else if cli.sight {
+        let input = cli.input.as_ref().filter(|_| !is_dir);
+        let input = input.context("--sight needs a single .rec file")?;
+        let geometry = match &cli.map {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                let data: mapdata::MapData = serde_json::from_str(&text)
+                    .with_context(|| format!("{} is not map data", path.display()))?;
+                Some(sight::Geometry::from(&data))
+            }
+            None => None,
+        };
+        let options = ReadOptions {
+            movement: true,
+            ..options
+        };
+        let round = Round::open(input, options)?;
+        let seen = sight::analyze(&round, geometry.as_ref(), &sight::Options::default())
+            .context("the round has no movement to test (Y11S3+)")?;
+        write_json(&mut out, &seen, cli.pretty)?;
+    } else if cli.sessions {
+        let dir = cli.input.as_ref().filter(|_| is_dir);
+        let dir = dir.context("--sessions needs a folder")?;
+        let records = journal::read_folder(dir, options.mode)?;
+        let rules = journal::SessionRules::default();
+        let value = serde_json::json!({
+            "sessions": journal::sessions(&records, &rules),
+            "insights": journal::insights(&records, &rules, &journal::InsightRules::default()),
+            "matches": records,
+        });
+        write_json(&mut out, &value, cli.pretty)?;
+    } else if let Some(cache) = &cli.profiles {
+        let dir = cli.input.as_ref().filter(|_| is_dir);
+        let dir = dir.context("--profiles needs a match folder")?;
+        let m = Match::open_with(dir, options)
+            .with_context(|| format!("reading match {}", dir.display()))?;
+        let summary = m.summary().context("match has no rounds")?;
+        let cache = if cache.exists() {
+            profiles::ProfileCache::load(cache)
+                .with_context(|| format!("reading {}", cache.display()))?
+        } else {
+            profiles::ProfileCache::new()
+        };
+        let day = chrono::Duration::days(1);
+        let value = serde_json::json!({
+            "lobby": profiles::lobby_strength(&summary, &cache.profiles()),
+            "requests": profiles::requests_for(&summary, &cache, profiles::now(), day),
+        });
+        write_json(&mut out, &value, cli.pretty)?;
+    } else if cli.decoders {
         write_json(&mut out, &replay_analyzer::decoder::table(), cli.pretty)?;
     } else if cli.players {
         let dir = cli.input.as_ref().filter(|_| is_dir);
@@ -145,6 +239,35 @@ fn main() -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+/// Map data per map of every `.rec` under `input`, by map id.
+fn map_data(input: &std::path::Path) -> Result<Vec<mapdata::MapData>> {
+    let mut files = Vec::new();
+    let mut stack = vec![input.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            let entries = std::fs::read_dir(&p).with_context(|| format!("reading {}", p.display()))?;
+            stack.extend(entries.flatten().map(|e| e.path()));
+        } else if p == input || p.extension().is_some_and(|e| e == "rec") {
+            files.push(p);
+        }
+    }
+    files.sort();
+    let mut maps: BTreeMap<u64, mapdata::Harvester> = BTreeMap::new();
+    for file in &files {
+        match mapdata::read(file) {
+            Ok(seen) => {
+                let harvester = maps.entry(seen.round.header.map.0).or_default();
+                harvester.add(&seen.round, &seen.objects);
+            }
+            Err(e) => tracing::warn!("{}: {e}", file.display()),
+        }
+    }
+    if maps.is_empty() {
+        bail!("no readable .rec file under {}", input.display());
+    }
+    Ok(maps.values().map(mapdata::Harvester::finish).collect())
 }
 
 fn read_input(path: Option<&PathBuf>) -> Result<Vec<u8>> {

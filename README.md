@@ -13,6 +13,13 @@ replay-analyzer MatchReplay/ --list     # every match folder, game session, unfi
 replay-analyzer MatchReplay/ --players  # every player across matches: name history, you, queue-mates
 replay-analyzer --decoders              # decoder profiles and tested builds, to find rounds worth re-parsing
 replay-analyzer R01.rec --dump -o raw.bin  # decompressed stream, for format research
+replay-analyzer --operators             # operator catalog of the latest season
+replay-analyzer --weapons               # weapon catalog
+replay-analyzer MatchReplay/ --map-data # map data per map, harvested from every round
+replay-analyzer R01.rec --sight --map bank.json   # who could see whom, exposure, crosshair placement
+replay-analyzer --settings GameSettings.ini       # sensitivity and field of view (read-only)
+replay-analyzer MatchReplay/ --sessions # play sessions, breaks and session insights
+replay-analyzer Match-2024-05-04/ --profiles cache.json   # lobby strength from a profile cache
 ```
 
 Only finished `.rec` files are read. While a round records, the game keeps it in temporary `.tmprec` files and deletes them once the round is saved. Players have found leftovers named like `P15440_50_Y2022_M1_D16_H23_M58_FrameDataStream.tmprec`, with `StaticData` and `StreamInfo` parts: the game's process id, a stream id, the local time and the part. They are refused as input, and folders and `--list` report any they find with what their names say.
@@ -1406,6 +1413,867 @@ What is not there, or not known:
 - **Other game modes.** Secure Area and Hostage give `mode` only.
 
 `decodeStatus` gains `objectiveState` (carries; `inferred`, or `notInVersion` for a mode other than Bomb), `defuserDrops` (`decoded`, or `inferred` without the defuser object), `bombSites`, `objectivePositions` (plants and disables with the player's position), and in a planted round `plantSite` (`decoded` when the game names the bomb, `inferred` for the nearer one) and `defuserTimer` (`decoded` when the timer was written).
+
+## Outside the replay
+
+What a replay does not hold, each joined on something it does: an operator or item id, a map id, a profile id, a match id and its times. Everything is in the library; the flags print it as JSON.
+
+| Data | Joined on | Module | Flag |
+|---|---|---|---|
+| Operator catalog per season: side, roles, armor, speed, ability and gadgets with counts | operator and item ids | `catalog::operators` | `--operators` |
+| Weapon catalog: damage, fire rate, magazine, attachments, time to kill | item ids | `catalog::weapons` | `--weapons` |
+| Map data per map id: floors, sites, spawns, doors, windows, hatches, walls, cameras; harvested from replays, completed by hand | map id | `mapdata` | `--map-data` |
+| Line of sight: who could see whom, exposure, crosshair placement | positions and views; map data as geometry | `sight` | `--sight [--map FILE]` |
+| The game's settings file: sensitivity, field of view, and when they changed | the recorder's profile id | `settings` | `--settings FILE` |
+| Sessions and breaks, the user's tags, notes and goals, session and tilt insights | match ids and times | `journal` | `--sessions` |
+| Profile stats: rank, rank points, level; lobby strength and rank progress | profile ids | `profiles` | `--profiles CACHE` |
+
+Nothing here reaches out: no file is looked for and no service is called. `--settings` opens the one file it is given, read-only, and the caller asks the user first. `--profiles` reads a cache the app fills through its own proxy and lists who is missing from it. `--sight --map` takes one map of what `--map-data` writes, as `Geometry::from(&MapData)` makes walls of it; with the ten test rounds of Bank as both, every reinforcement and barricade finds its wall and none of the 264 bullets that struck a player is stopped on its way.
+
+### Operator catalog
+
+A replay holds what each player picked, never what they could have picked. `catalog::operators` is the menu: per season, for each operator, the side, role tags, armor and speed, maximum health, the unique ability with its count, and the gadgets, primaries and secondaries to choose from. It is static data, keyed by the season in the header's version (`Y11S3`), and it is not part of a round's JSON.
+
+```rust
+use replay_analyzer::catalog::operators::{catalog_for, operator_info};
+
+let ace = operator_info("Y11S3", player.operator);
+let resolved = catalog_for(&round); // falls back to the latest season, with `fallback: true`
+```
+
+| Key | What it holds |
+|---|---|
+| `operator` | `{name, id}`, as everywhere else. |
+| `side`, `sideEvidence` | `Attack` or `Defense`. |
+| `roles` | The game's role tags (`Breach`, `Anti-Gadget`, `Intel`, ...). Always reference: no replay holds them. |
+| `maxHealth`, `armor`, `speed`, `healthEvidence` | `players[].maxHealth` (100, 110 or 125), the armor it stands for (1, 2 or 3) and the speed left of 4. Absent for an operator nobody played. |
+| `ability` | `id`, `name`, the `count` the HUD starts with, `max` when the HUD states one, `regenerates`, and `evidence`. Absent for Striker and Sentry, whose ability slot holds a second gadget (`gadgetSlots: 2`). |
+| `gadgets[]` | `id`, `name`, `count` at spawn and `evidence`. |
+| `primaries[]`, `secondaries[]` | `id`, `name` and `evidence`. A shield in the primary slot is listed as a primary. |
+
+Ids are the HUD item ids of `loadouts[]` and the kill feed, so an entry joins to `loadouts[].primary.id`, `.ability.id` and the rest.
+
+Every value says where it comes from. `evidence` is `{source, rounds}`:
+
+- **`observed`:** read from replays, with the number of loadouts (one player in one round) it was seen in. `catalog::operators::observe(rounds)` is the harvest: per operator, the sides, maximum health, and every item seen in each slot with its counts at spawn. The season table is that harvest over the 10 test rounds and a real folder of 178 rounds: 1,837 loadouts on builds 9883691 to 9918362.
+- **`reference`:** not in any replay read so far, and taken from the game's operator pages (October 2026): role tags, items no player picked, and Iana, the one operator nobody played. A reference item has its id when another operator was seen carrying it, and never a count.
+
+What the 188 rounds cover, of 78 operators:
+
+| Field | Observed | Reference | Unknown |
+|---|---|---|---|
+| Side | 77 | 1 | |
+| Role tags | | 78 | |
+| Maximum health, armor, speed | 77 | | 1 (Iana) |
+| Ability | 75 | 1 | (2 have none) |
+| Ability count | 74 | | 2 (Skopos, Iana) |
+| Gadgets | 156 picks, each with its count | 43, without a count | |
+| Primaries | 130 | 38, 9 of them without an id | |
+| Secondaries | 121 | 27 | |
+
+For 47 operators every listed gadget was seen, for 43 every primary and for 56 every secondary.
+
+What to know about the values:
+
+- **Armor is not recorded.** `MaxHealth` is what the game has in its place, and every operator seen has one value. Year 11 differs from older seasons here: Ace, Thatcher, Osa, Blackbeard, Aruni, Melusi and Warden are at 125.
+- **A count is what the HUD counts**, which is not always a number of devices: 36 for Buck's Skeleton Key (shells), 320 for Maverick's torch (fuel), 25 for Sledge's hammer, 18 for Hibana's pellets, and 1 for an ability that is on or off. A refilling ability starts below what it holds (Lesion 1, Azami 1), so `regenerates` is the flag to check before comparing counts. Dokkaebi starts at 1 of a `max` of 5.
+- **Skopos's shells show no count** in the HUD, so the ability has an id and no count.
+- **Blackbeard's rifle is his secondary.** The shield sits in the primary slot, so the MK17 CQB and SR-25 are under `secondaries`, as `loadouts[]` has them.
+- **Zero's 5.7 USG has an id of its own** (`5.7 USG (Zero)`), not the one other operators' 5.7 USG has.
+- **A player's start can be lower than the catalog's.** Apart from Dokkaebi, 15 of the 1,837 loadouts start an ability or gadget below `max` (a Jäger at 0 of 3), so the tests check that nobody starts above it.
+- **The operator pages are not complete.** Three picks seen in replays are not on the pages as read: Fuze's Hard Breach Charge (18 loadouts), and the XK23 on Sens (3) and Rauora (6). The catalog keeps them as observed.
+- **An unknown season gets the latest catalog**, flagged `fallback`. Loadouts change every season, so treat a fallback as a guess.
+
+Checked by `tests/catalog_operators.rs`: each of the 100 loadouts in the test rounds, and with `R6_MATCH_REPLAY` set each of the 1,737 in the real folder, has a primary, secondary and gadget the catalog lists for that operator, the catalog's ability, no count above the catalog's, and the catalog's side. Maximum health agrees except for one round where an Ash reads 110 and a Hibana 125. (Building the catalog found 31 attackers at 125 that `players[].maxHealth` gave as 100: a rise of 25 while the attacker picks was read as a Rook plate and subtracted. Plates are now counted only on a team with a Rook.) In the real folder a pick the catalog does not list is printed, not failed: the folder grows as matches are played.
+
+### Weapon catalog
+
+`replay_analyzer::catalog::weapons` is a table of the guns of Y11S3, keyed by the item id `loadouts` and the kill feed use: class, damage, fire rate, magazine, fire modes and attachments, with time-to-kill helpers. It is a library module: nothing of it is in a round's JSON.
+
+A replay holds no weapon statistics. It holds what each gun did, and the catalog is built on that. Every number says where it comes from:
+
+| `source` | Meaning |
+|---|---|
+| `observed` | Measured in replays; `samples` says on how much. `reference` is filled as well when a reference has the number, equal or not. |
+| `reference` | From the reference table. Where replays measured it too (`observed`), they agree within the measurement's precision. |
+| `unknown` | Neither has it. No number is guessed. |
+
+Observed means 188 rounds: the 10 test rounds and a real folder of 178 (builds 9883691, 9901603 and 9918362), 3,595 guns carried, 68,766 shots. The reference is the weapon table of r6data.com as fetched on 2026-10-02, with three changes of the Y11S3 patch notes over it (SMG-12 16 damage and 22 rounds, AR-15.50 59 damage, SPSMG9 35 damage); it is a third-party table, not Ubisoft's.
+
+| Field | What it is | Observed | Reference only | Unknown |
+|---|---|---:|---:|---:|
+| `magazine` | Rounds in a full magazine. | 108 | 6 | 1 |
+| `chambered` | A round stays in the chamber on a reload. | 106 | | 9 |
+| `rpm` (62 automatic guns) | Rounds a minute. | 51 measured | 11 | |
+| `damage` | Health a bullet takes off a torso. | 54 | 58 | 3 |
+| `class` | Assault rifle, shotgun and so on. | | 111 | 4 |
+| `fireModes` | Follows from the class. | 1 | 110 | 4 |
+| `attachments` | Per slot: ids seen, names listed. | 108 | 6 | 1 |
+
+The table has 115 entries: the 111 primaries and secondaries of the item table (one of them the Ballistic Shield, which has a class and nothing else), and 4 guns only the reference knows (G36C, SASG-12, Super 90, SIX12 SD), which have no `id` because no replay has shown one.
+
+How each is measured, by `harvest(&[Round])`, which returns the observed side for any set of rounds:
+
+- **Magazine.** `loadouts[].primary.ammo.magazineSize`, read. Every gun had one size in all its loadouts. `chambered` is read too: the most rounds a player had in the gun is one above the magazine for 85 guns and equal to it for 21 (revolvers, most shotguns, the Gonne-6, and the DP27, 6P41, M249 and ALDA 5.56). `capacity()` adds the two.
+- **Fire rate.** The median rate of a gun's steady bursts: 8 shots or more of one player, each at most 0.25 s after the last, the longest and shortest gap no more than one update apart. A shot's time is an update of the movement stream, 34 ms apart (the stream runs at about 28 Hz), so one burst's rate is good to 34 ms over its length: 2.4% for 20 rounds at 800 a minute, 8% for the 16 rounds of an SMG-11. The median over a gun's bursts (2,021 in all) is much closer: for the 48 automatic guns where reference and measurement agree, the two differ by 0.4% at the median and 2.5% at worst (FMG-9, 3 bursts). The catalog then gives the reference's figure, which is exact, and keeps the measured one beside it.
+- **Only automatic guns have a fire rate.** A steady burst of a semi-automatic gun is the player's finger: the 417, Mk 14 EBR, PMR90A2, TCSG12, D-50, P9 and P12 gave medians of 407 to 476 a minute, with single bursts up to 502. That is a lower bound on what the gun allows and no more, and the reference has no figure either, so `rpm` is absent for them.
+- **Damage.** The damage most hits did, of `bulletHits` that were not on a limb, left the victim standing and came from a barrel named something other than `Extended Barrel`. It counts when at least 3 hits and half of the gun's hits share it: 54 guns, 1,158 of their 1,486 hits. Hits that down or kill carry no damage in the file and head and torso are not told apart, so a headshot is never a sample and headshot damage is not observed. Pellet shotguns are left to the reference: of a shell's pellets in one body only the first carries the damage, and it carries their sum.
+- **Attachments.** `seen` lists the ids players had in each slot (874 over all guns), with the names of the attachment table: 599 have one, 336 of them inferred (see [Loadouts](#loadouts)). `reference` lists the option names the reference gives the gun. A sight's name there (`Red Dot A`, `Holo B`) cannot be matched to an id. Underbarrels (laser or none) are observed only.
+
+What replays say about the rules, which the helpers apply:
+
+- **Armor takes nothing off a bullet.** A gun did its usual damage in 252 of 331 hits on targets of 100 health, 668 of 835 on 110 and 176 of 238 on 125 (76%, 80%, 74%), and in 87 of 89 pairs of a gun and a target health with 5 hits or more the usual damage is the same. Armor is the health itself. `armor_multiplier` is 1.0.
+- **A limb takes three quarters, rounded down.** For 39 of 41 guns with 3 or more limb hits the most common limb damage is `floor(0.75 x damage)` (673 limb hits).
+- **An extended barrel adds 12%, rounded down**, for 7 of 9 guns seen with one (MP7 32 to 35, MPX 26 to 29, MP5 27 to 30, C8-SFW 40 to 44). Two do not fit: the P90 did 29 (4 hits, base 22) and the 9mm C1 46 (2 hits, base 36). The barrel's name is inferred, so either those two ids are something else or the rule is not flat; `hit_damage` applies 12%.
+- **A headshot kills.** From the reference: the file marks a headshot on kills only, so this cannot be checked on hits.
+
+Where replays and the reference differ, both are kept and the catalog goes by what was observed:
+
+| Gun | Field | Observed | Reference |
+|---|---|---:|---:|
+| Scorpion EVO 3 A1 | `rpm` | 1076 (99 bursts) | 1800 |
+| MP5K | `rpm` | 797 (54 bursts) | 900 |
+| MK17 CQB | `magazine` | 20 (16 loadouts) | 25 |
+| UZK50GI | `damage` | 36 (21 hits) | 40 |
+| AUG A3 | `damage` | 36 (8 hits) | 40 |
+| Commando 9 | `damage` | 36 (7 hits) | 40 |
+| Mk 14 EBR | `damage` | 56 (5 hits) | 60 |
+
+The two fire rates look like slips of the reference (1080 and 800 are the long-standing figures). For the other five the reference is likely a patch behind; a second site gives the UZK50GI 36.
+
+Time to kill:
+
+| Function | What it gives |
+|---|---|
+| `hit_damage(base, extended_barrel, location, health)` | The health one bullet takes on the torso, a limb or the head. |
+| `shots_to_kill(damage, health)` | Hits to bring `health` (100, 110 or 125) to zero. |
+| `time_to_kill(shots, rpm)` | Seconds from the first shot to the last: `(shots - 1) x 60 / rpm`. |
+| `expected_shots_to_kill`, `expected_time_to_kill` | The same on average for a mix of torso, limb and head hits (`HitMix`), a headshot ending it. |
+| `WeaponInfo::time_to_kill`, `times_to_kill` | Shots and seconds for a gun of the catalog, with or without an extended barrel. |
+
+They count hits, not shots fired: misses, travel time, recoil and range are not in them. "Kill" is health reaching zero, which the game may turn into a down.
+
+What is not known, or not in the catalog:
+
+- **Four guns no reference lists**: XK23, PMR90A2, TACIT .45 and Zero's 5.7 USG (`unknown()`). They have no class. The XK23 has what replays show: 35 rounds, 49 damage (18 hits), 676 rounds a minute over 64 bursts, which is taken as automatic fire. The PMR90A2 has 20 rounds and 62 damage (16 hits). The TACIT .45 and Zero's 5.7 USG have a magazine only.
+- **Damage fall-off with range.** No figures were confirmed, so the catalog has none. Hits beyond about 20 m do read lower (an MP7's 32 becomes 22 or 23), which is why damage is the most common value and not the highest.
+- **Hits that do less at any range.** About 5% of torso hits did half the gun's damage and another 5% seven tenths, at 5 to 28 m. Nothing in the hit says why; a bullet that went through a surface or another player first is the likely cause, unconfirmed. A few did double: two bullets between two updates of the body.
+- **Fire modes are not in the file** (see [Weapons and shooting](#weapons-and-shooting)). `fireModes` gives the one the class implies, and not the other settings of a selector (burst, single).
+- **Semi-automatic and pump fire rates**, the reload time, recoil, and what each attachment does apart from the extended barrel's damage.
+- **Two guns of the item table were in no replay** (LMG-E and M249 SAW), so they are reference only, as are the 4 without an id.
+- **The reference is unofficial and undated.** Where it was neither measured nor contradicted (58 damages, 11 fire rates, 6 magazines) it is taken as given.
+
+`tests/catalog_weapons.rs` holds every gun of the test rounds against the catalog (56 guns: 56 magazines equal, 14 fire rates within 3%, 8 damages not above) and does the same for a real folder when `R6_MATCH_REPLAY` is set (107 guns: 107 magazines, 51 fire rates, 53 damages).
+
+### Maps
+
+A replay holds no floor plan, no room outlines and no blueprint of the building. It does hold the objects of the map a round touched, each with the same id and the same place in every round on that map, and where players stood. `replay_analyzer::mapdata` puts those into one file per map id, in a schema that also holds what somebody draws by hand, so a map fills in with every replay parsed and the hand-drawn parts stay. Nothing in it comes from the game's files.
+
+```rust
+use replay_analyzer::mapdata::{self, MapData};
+
+// One file per map id; `stored` is what the app has for this map so far.
+let rounds: Vec<_> = paths.iter().filter_map(|p| mapdata::read(p).ok()).collect();
+let found = mapdata::harvest_with(&rounds);
+let stored: MapData = mapdata::merge(&stored, &found);
+
+let floor = stored.floor_at(z);                // which storey a body at this height is on
+let room = stored.room_at(x, y, z);            // needs outlines, which are drawn by hand
+let (opening, metres) = stored.nearest_opening(x, y, z)?;
+```
+
+`cargo run --release --example mapdata -- <match folder or MatchReplay folder> <out dir>` writes `<map id>-<name>.json` per map and merges into a file that is already there. [413779563590-BankY10.json](413779563590-BankY10.json) is what the ten test rounds give (150 KB). The key is the map id (`summary.map.id`): a rebuilt map gets a new id and a new file.
+
+Numbers below are from the ten test rounds (Bank) and from a real `MatchReplay` folder: 178 rounds on 15 maps, read with `--movement`.
+
+#### What a round holds of the map
+
+| | Where | How |
+|---|---|---|
+| Bombs | Eight map objects per map, two per site, in every round; the round's two have a name in the header. | Read; which name is which bomb by order, assumed (see [Objective](../../README.md#objective)) |
+| Default cameras | `mapCameras[]`: id, place, rotation. | Read |
+| Reinforced walls | A reinforcement names its wall (`host`) and stands at the wall's foot, in the middle of its width. | Read; the width by the asset, inferred |
+| Hatches | A hatch reinforcement names its hatch and lies in its middle; the hatch itself is a destructible object with its origin at a corner. | Read; 2 m square derived |
+| Doors and windows | A barricade is at the top of its opening, in the middle. Only an opening that was barricaded is seen. | Read; door or window by the asset, inferred; the width assumed |
+| Destructible objects | `627385fe` creates one when the round damages it: id, origin, rotation. No size, and no word on what it is. | Read; wall, floor, hatch or prop from the catalog or the round's impacts |
+| Spawns | Each attacker's `spawn` name and `spawnPosition`. | Read; one point per spawn derived |
+| Floor heights | Not written. Walls, hatches, doors and bombs stand on few heights. | Derived |
+| Floor names | The prefix of the site names: `B`, `1F`, `2F`. | Derived |
+| Where one can walk | Every player's position, 28 times a second. | Derived, with `--movement` |
+| Room names | The two sites of the round, and the room of each Fenrir mine that went off. Nothing else: a player's callout is not in the file. | Read, as points |
+| Room outlines, walls that do not break, doorways nobody barricades, stairs | Not in the file. | Authored |
+
+- **A round lists only what it changed.** The stream never lists the map. A round creates the 8 bombs, the cameras, and the destructible objects that were shot, blown up or walked through: 11 to 283 of them, 102 at the median (187 rounds). Bank has 1,064 distinct ones after 31 rounds and still gains about ten a round. A wall nobody touched in any round parsed is not in the file of the map.
+- **A reinforced wall is another object than the wall that breaks.** The `host` of a reinforcement is never created in the stream: its id is known only from the reinforcement, its place from where the reinforcement stands. The destructible wall at the same place has its own id, which is what `destruction[]` names. 555 of the 998 destructible walls of the real folder have their origin on a reinforced wall and say so in `partOf`; the reinforced wall lists them in `parts`.
+- **Where a reinforcement stands.** 0.1 m off the middle plane of the wall, on the player's side: a wall reinforced from both sides has two places 0.2 m apart (72 of the 418 hosts seen), and the wall is between them. Neighbouring walls of one asset are exactly its width apart (three 2.0 m walls on Bank at x -57.7, -55.7, -53.7), and a destructible wall's origin lies half the asset's width from the reinforcement's middle, which is what the widths `panels` infers (1.6 to 2.4 m) predict.
+- **A destructible wall has no length.** Its origin is at its foot, its x axis runs along it, and the origin is at an end of the wall or in its middle, differing from wall to wall. `a` and `b` are the reach of the impacts on it (`destruction[].objects[].impacts`, `surfaces[]`) along that axis: 588 of 998 have one, 1.3 m at the median, and 221 are under a metre. A wall with `a` equal to `b` is known by its origin alone. This is a lower bound, not a width.
+- **A hatch is 2 m square.** In 25 of 27 reinforced hatches the hatch under the reinforcement was seen too, and the reinforcement lies at (1, 1) of it.
+- **A door is 2.2 m high.** 134 of 140 doors are 2.2 m under their barricade on a height a reinforced wall, a hatch or a bomb stands on; the other six are on a roof or a half level nothing else stands on. A window's barricade is 2.5 m (165) or 2.9 m (58) above a height of its floor. How wide an opening is and where a window starts are not in the file.
+- **Doors and windows are those that were barricaded.** The map barricades the openings to the outside (88 doors, 225 windows); players add inside doors (61 doors name a frame). A doorway nobody barricaded in any round parsed is missing, and one that cannot be barricaded always is.
+- **No room names for players.** Searched again for this: the text of 22 decompressed rounds (58 to 92 MB each) holds 2 to 13 room names a round, all of them the header's two sites and the rooms of Fenrir's mines. The parser gives a mine's room only when the mine goes off (`trapTriggers[].location`, 4 in 188 rounds).
+
+#### The file
+
+```json
+{
+  "schema": 1,
+  "map": { "id": 413779563590, "name": "BankY10", "base": "Bank", "version": "Y10" },
+  "rounds": ["<match id>/1", "..."],
+  "bounds": { "min": [-134.0, -35.0, -5.101], "max": [-21.0, 51.0, 9.45], "source": "derived" },
+  "floors": [
+    { "index": 0, "name": "B", "z": -3.8, "ceiling": 0.0, "levels": [-3.8], "source": "derived", "rounds": 10 }
+  ],
+  "rooms": [
+    { "name": "B CCTV Room", "floor": 0, "polygon": [], "anchor": [-68.022, 7.681, -3.8], "source": "read", "rounds": 5 }
+  ],
+  "sites": [
+    { "name": "B CCTV Room", "objectId": "60572f3500", "position": [-68.022, 7.681, -3.8], "floor": 0,
+      "partner": "60572f71b8", "source": "read", "rounds": 10, "played": 5 }
+  ],
+  "spawns": [
+    { "name": "Alley Access", "position": [-22.0, -34.1, 0.0], "radius": 0.0, "source": "derived", "rounds": 9, "players": 15 }
+  ],
+  "doors": [
+    { "a": [-70.4, 0.2], "b": [-71.6, 0.2], "normal": [0.0, 1.0], "bottom": -3.8, "top": -1.6, "floor": 0, "width": 1.2,
+      "objectId": "60572f4834", "seeThrough": true, "source": "read", "rounds": 2, "assumed": ["width"] }
+  ],
+  "windows": [
+    { "a": [-45.69, -6.9], "b": [-45.69, -5.7], "normal": [1.0, 0.0], "bottom": 1.07, "top": 2.47, "floor": 1, "width": 1.2,
+      "defaultRounds": 10, "seeThrough": true, "source": "read", "rounds": 10, "assumed": ["width", "bottom"] }
+  ],
+  "hatches": [
+    { "position": [-75.2, -3.399, 0.0], "corners": [[-76.2, -4.399], [-74.2, -4.399], [-74.2, -2.399], [-76.2, -2.399]],
+      "size": 2.0, "floor": 1, "objectId": "60572f75ab", "panelId": "60572f4fee", "reinforceable": true, "source": "read", "rounds": 5 }
+  ],
+  "walls": [
+    { "a": [-62.6, 4.1], "b": [-62.6, 5.8], "floor": 0, "bottom": -3.8, "top": -0.8, "kind": "reinforceable", "width": 1.7,
+      "objectId": "60572f14ce", "parts": ["60572f1451", "60572f29b9", "60572f3aab"], "source": "read", "rounds": 4, "assumed": ["top"] },
+    { "a": [-73.0, 8.5], "b": [-73.0, 8.974], "floor": 0, "bottom": -3.8, "top": -0.8, "kind": "soft", "width": 0.474,
+      "objectId": "60572f6e3d", "origin": [-73.0, 8.5], "source": "derived", "rounds": 5, "assumed": ["top"] }
+  ],
+  "cameras": [
+    { "objectId": "60572f1958", "position": [-102.9, -3.2, -1.0], "rotation": [0.0, 0.0, -0.724, 0.69], "floor": 0, "source": "read", "rounds": 10 }
+  ],
+  "pieces": [
+    { "objectId": "60572f144c", "kind": "unknown", "position": [-72.809, 8.599, 0.0], "rotation": [0.0, 0.0, -0.342, 0.94], "source": "read", "rounds": 1 }
+  ],
+  "walkable": [
+    { "floor": 0, "cell": 1.0, "origin": [-134, -7], "rows": ["...##..", "..."], "source": "derived", "rounds": 10 }
+  ]
+}
+```
+
+Positions are the game's: metres, z up, the same as every position in the round output. Object ids are hex, as everywhere.
+
+| Key | What it holds |
+|---|---|
+| `source` | On every element: `read` (the file states it), `derived` (worked out from what it states) or `authored` (drawn by hand). |
+| `rounds` | On every harvested element: the rounds it was seen in. On the map data: the rounds harvested, as `<match id>/<round number>`, so an app can skip one it has. |
+| `assumed` | The fields of the element that are neither read nor measured: a door's `width` (1.2 m, 2.2 m for a wide one), a window's `bottom` (1.4 m under its top), a wall's `top` (3 m above its foot, or the floor above where that is lower), the `ceiling` of the top floor. |
+| `floors[]` | Lowest first. `z` is the height most of the floor stands on, `levels` every height that belongs to it (Club House's ground floor is at -0.5 and 0.4), `ceiling` where the next floor starts. `index` is the place in the list and changes when a floor is found below. |
+| `rooms[]` | A name, a floor and an outline. A harvested room has no outline, only the `anchor` the file named it at. |
+| `sites[]` | One entry per bomb: the two of a site name each other in `partner`. `played` counts the rounds it was the objective, `name` is absent for a bomb never played. |
+| `spawns[]` | The median of where the attackers who picked the spawn first stood, and the median distance from it. |
+| `doors[]`, `windows[]` | Two ends over the ground, `bottom` and `top`, `normal`, `wide`, the frame's `objectId` when a player's barricade named it, `defaultRounds` when the map barricades it. `seeThrough` is true: an opening hides nothing until something closes it, which is in the round's `barricades[]`. |
+| `hatches[]` | The middle, the four corners, the floor it is the floor of. `objectId` is what a hatch reinforcement names, `panelId` the destructible hatch. |
+| `walls[]` | Two ends over the ground on the wall's middle plane, `bottom`, `top`, and `kind`: `reinforceable` (a reinforcement was seen on it), `soft` (it breaks, and none was) or `solid` (authored: nothing breaks it). A `soft` wall with `partOf` is the same stretch as the reinforceable wall it names; leave it out of a test of what walls hide. |
+| `cameras[]` | Place and rotation of each default camera. |
+| `pieces[]` | Every other destructible object: `floor` panels, `breakable` props and panes, and `unknown` ones. Origin and rotation, no size. |
+| `walkable[]` | Per floor, a grid of 1 m cells where a player stood on their feet: not in the air, on a rope, vaulting or dead. `rows[r]` is the row at `y = origin[1] + r`, its characters the cells from `x = origin[0]`. |
+
+A wall or an opening is what a line-of-sight test needs: a segment over the ground with a bottom and a top, and whether one sees through it.
+
+#### Floors
+
+A floor is a group of heights that walls, doors, hatches and bombs stand on, not more than 2 m above the lowest of the group: a storey is 3.4 m and more in every map seen, a split level 1.9 m at most. Destructible walls do not count, since some of them do not stand on the floor.
+
+- The ten test rounds give Bank its three: `B` at -3.8, `1F` at 0, `2F` at 4.0. All 15 maps come out with two or three floors, 40 in all.
+- **A floor's name needs a site played on it.** 33 of the 40 have one. Bank's `1F` has none in the real folder, where nobody played a first-floor site in 21 rounds.
+- **A roof with a door is a floor.** Fortress gets a third, unnamed floor at 30.5 from two roof doors.
+- **A level nothing stands on is none.** Nine windows of Tower are above its top known floor: its upper level has no reinforced wall, door or bomb in the four rounds parsed.
+- `floor_at(z)` gives the highest floor that starts at or below `z`, with 0.6 m to spare; stairs belong to the floor they leave, and a roof (at or above the top floor's ceiling) to none. It says which storey a height is in, also outside the building.
+
+#### Merging
+
+`merge(a, b)` holds everything of both, the same thing once: by object id, else by place within 0.35 m (a room and a spawn by name).
+
+- **An authored element is never changed.** It wins over a harvested one at its place, so drawing a wall better than the harvest has it means copying the entry, correcting it and setting `"source": "authored"`. Authored floors stand for the derived ones within a metre of them.
+- **`rounds` add up** when the two sides share no round, and are the larger of the two when they do, so merging a file with itself or with a part of itself changes nothing. Sides that overlap in part give a count that is too low.
+- **Round by round is the same as all at once** for what is read: merging ten harvests of one round each gives the walls, doors, windows, hatches, sites, cameras, pieces and walked cells of one harvest of the ten, counts included (checked on the test rounds; walls, doors, windows, hatches and sites also on two halves of each of the 15 real maps). Spawn points and anchors are medians and come out a little different.
+- An object is a wall as soon as one round says so; in the other rounds it is a piece of unknown kind, and the merge makes it the wall.
+- `harvest` does not depend on the order of the rounds, and counts a round once however often it is given (a spectator's and a player's recording of one round are one round).
+
+`harvest(&[Round])` works from rounds as the parser returns them. It has the reinforced walls, doors, windows, cameras, spawns and the sites in play, and no map objects, so no destructible walls, no pieces and only the bombs that were played. `harvest_with` takes rounds read by `mapdata::read`, which also scans the decompressed bytes for the `627385fe` messages. A round does not keep its map objects.
+
+#### Per map
+
+| Map | Rounds | Floors | Rooms | Bombs (named) | Spawns | Doors | Windows | Hatches | Walls reinforceable | Walls soft (with a stretch) | Cameras | Pieces | Walked cells |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| BankY10 (test) | 10 | B -3.8, 1F 0, 2F 4 | 6 | 8 (6) | 3 | 14 | 16 | 7 | 23 | 146 (74) | 8 | 633 | 3,998 |
+| BankY10 | 21 | B -3.8, ? 0, 2F 4 | 5 | 8 (4) | 3 | 13 | 17 | 7 | 29 | 135 (68) | 8 | 635 | 4,849 |
+| BorderY10 | 13 | 1F -0.2, 2F 4.2 | 6 | 8 (6) | 3 | 9 | 10 | 1 | 30 | 101 (53) | 8 | 413 | 3,751 |
+| CalypsoCasino | 6 | B 26.8, 1F 31.2, 2F 35.6 | 6 | 8 (6) | 4 | 12 | 15 | 3 | 29 | 68 (26) | 10 | 229 | 3,700 |
+| ClubHouseY10 | 25 | B -4.4, ? 0.4, 2F 4.3 | 6 | 8 (6) | 4 | 19 | 8 | 3 | 34 | 95 (76) | 8 | 543 | 5,200 |
+| CoastlineY11 | 14 | 1F 3, 2F 6.4 | 7 | 8 (6) | 3 | 11 | 15 | 0 | 30 | 84 (48) | 8 | 475 | 3,915 |
+| ConsulateY10 | 20 | B 0, 1F 3.4, 2F 7.8 | 6 | 8 (6) | 4 | 16 | 15 | 3 | 37 | 81 (46) | 11 | 565 | 5,264 |
+| FortressY10 | 6 | 1F 22.6, 2F 27, ? 30.5 | 8 | 8 (8) | 3 | 9 | 11 | 1 | 30 | 59 (39) | 11 | 239 | 3,776 |
+| KafeDostoyevskyY10 | 6 | 1F 0, ? 4.4, 3F 8.8 | 4 | 8 (4) | 3 | 6 | 13 | 2 | 19 | 54 (27) | 7 | 321 | 3,096 |
+| KanalY11 | 4 | ? 0.6, 1F 4, 2F 7.4 | 6 | 8 (6) | 3 | 7 | 20 | 2 | 16 | 18 (10) | 8 | 142 | 2,602 |
+| LairY10 | 5 | B 27.2, 1F 31.2, 2F 35.2 | 6 | 8 (6) | 4 | 12 | 15 | 2 | 24 | 26 (13) | 11 | 184 | 3,702 |
+| NighthavenLabsY10 | 20 | B 27.9, 1F 32.3, 2F 36.7 | 6 | 8 (6) | 3 | 8 | 12 | 3 | 29 | 73 (56) | 11 | 303 | 5,167 |
+| SkyscraperY10 | 5 | ? 0.9, 2F 4.3 | 4 | 8 (4) | 3 | 5 | 12 | 0 | 12 | 39 (16) | 8 | 224 | 1,581 |
+| ThemeParkY10 | 17 | 1F 0, 2F 4.4 | 8 | 8 (8) | 3 | 8 | 12 | 1 | 30 | 86 (56) | 8 | 374 | 5,557 |
+| TowerY11 | 4 | 1F -2.2, 2F 2.2 | 6 | 8 (6) | 2 | 0 | 43 | 0 | 18 | 19 (9) | 8 | 163 | 1,777 |
+| VillaY11 | 12 | B 6, ? 10, 2F 14.6 | 6 | 8 (6) | 3 | 5 | 16 | 1 | 24 | 60 (45) | 9 | 424 | 3,895 |
+| 15 real maps | 178 | 40 | 90 | 120 (88) | 48 | 140 | 234 | 29 | 391 | 998 (588) | 134 | 5,234 | 57,832 |
+
+A `?` is a floor no site was played on. The 15 files are 46 to 159 KB, 1.4 MB together.
+
+How it was checked, on the ten test rounds and on every map of the real folder:
+
+- Every completed reinforcement lies on a harvested wall or hatch that names its host, within 0.15 m (91 in the test rounds), and every barricade at the top of a harvested door or window of its kind, within 0.2 m (212).
+- Every reinforced wall, door, reinforced hatch and bomb is on a floor; every site's name starts with the name of its floor.
+- Every map has eight bombs, and the two of a site name each other.
+- Every destructible object the test rounds created is in the file once: a wall, a hatch or a piece.
+- The file reads back from JSON as it was written, with and without hand-drawn entries.
+
+#### Not in the file, or not known
+
+- **Room outlines.** A room is a name and a point. `room_at` answers only for rooms somebody drew; `nearest_room` gives the nearest named point on the floor, which is a guess.
+- **Every wall that does not break**, the outer walls first of all, and every wall nobody damaged. What is harvested is far from a floor plan: it is the soft part of the building.
+- **Open doorways, stairs, ladders, vault spots.** `walkable` shows where players went; nothing says what connects two rooms, and with no outlines there is no room adjacency.
+- **Widths of doors and windows, and where a window starts.** Assumed, and listed in `assumed`.
+- **How long a destructible wall is.** Only the stretch that was hit.
+- **What most destructible objects are.** 3,586 of the 5,234 pieces are `unknown`: no catalog entry and no impacts that tell a wall from a floor.
+- **Which bomb is A**, and the name of a site nobody played (32 of 120 bombs).
+- **A level nothing stands on**, and anything of a map on a build with another map id.
+- **More room names.** The file has the room of every Fenrir mine in the HUD list of its owner, gone off or not, and (see [Movement](../../README.md#movement)) the rooms of Solid Snake's radar marks. The parser gives the first only for a mine that went off and does not decode the second; each would be a named point per mine or mark.
+
+### Line of sight
+
+`src/sight.rs` answers who could see whom, how exposed a player was and where a player's crosshair was when an enemy came into view (Y11S3+, rounds read with `ReadOptions { movement: true, .. }`). It is a library module: nothing of it is in the CLI's JSON yet.
+
+```rust
+use replay_analyzer::sight::{self, Geometry, Options};
+
+let open = sight::analyze(&round, None, &Options::default());           // open field
+let geometry: Geometry = serde_json::from_str(&json)?;
+let walled = sight::analyze(&round, Some(&geometry), &Options::default());
+```
+
+**The file holds no level geometry and no head position.** Both are filled in from outside the file, and the output says which was.
+
+| | Where it is from |
+|---|---|
+| Body origin, view direction, stance, lean, on a rope, on a drone | Read (`movement`) |
+| The eye | Derived: the origin plus a height per stance, measured from the fire events (below) |
+| The points a body shows (head, chest, pelvis, knees, feet) | The head is the eye; the rest is assumed |
+| Walls, floors, doors, windows, hatches | **Authored**: a `Geometry` handed in. Not in the file |
+| Reinforcements, barricades, Armor Panels, with their times | Read (`reinforcements`, `barricades`), put on the wall of the geometry that names their `host`, else on the nearest |
+| Holes in walls | Derived from `surfaces[]` labelled `breach`, `rotationHole` or `murderHole`; the size is assumed |
+| Hatches gone | Read (`surfaces[].hatchDestroyed`, a hatch reinforcement's `opened`) |
+| Smoke | Read (`areas[]` of kind `smoke` and `extinguisher`); the radius is assumed there |
+| A player's field of view | Not in the file: a parameter, 90 x 60 degrees by default |
+
+#### The eye
+
+A fire event states the distance from the shooter's eye to where the bullet ended, and that point follows from the muzzle, the direction and the muzzle distance. Fitting an eye offset to those distances over the 4,618 shots of the ten test rounds fired off a rope:
+
+| | Above the origin | Median residual |
+|---|---:|---:|
+| Standing | 1.44 m | 1.5 cm |
+| Crouched | 0.96 m | 1.3 cm |
+| Prone | 0.39 m | 0.3 cm |
+| On a rope | 0: the origin is at the eye there, upright and head down | 13 cm |
+| Leaning | 0.12 m to the side leaned to | |
+
+There is no offset forwards. A downed player is taken to be as low as a prone one (not measured). The fit also says something of `lean`, which the README calls unchecked: the side it names is the side the eye moves to.
+
+Checked on every shot of a gun by a player on their feet (`sight::validate`):
+
+| | Test rounds (10) | Real rounds (175) |
+|---|---:|---:|
+| Shots | 4,618 | 60,866 |
+| Stated eye distance against the derived eye, median / nine in ten within | 1.4 cm / 10.6 cm | 0.6 cm / 4.8 cm |
+| Bullet hits with a shooter | 264 | 5,486 |
+| View direction off the point struck, median / 95% / most | 1.1 / 3.4 / 5.7 degrees | 0.9 / 4.0 / 36.2 degrees |
+| Hits that downed or killed, within 8 degrees | 77 of 77 (most 4.6) | 1,543 of 1,552 |
+
+The rest of the eye error is a stance changing: its number changes at once, the body takes a third of a second. The view direction is the one of the last sample at or before the hit; recoil, a shotgun's spread and a flick between two samples 35 ms apart are in its error.
+
+Two things the fire events turned out to say, both worth knowing elsewhere:
+
+- **A shot's `distance` is to what stopped the bullet, not to the first thing in its way.** Of the first shots at a soft wall in each test round, 44 of 62 end behind it. The README describes `shots[].distance` and `eyeDistance` as "what the bullet struck first".
+- **The recording player's own shots state an eye distance 0.20 m longer** than anybody else's shot does, in every stance (5,694 shots of 175 rounds, 0.196 to 0.210 m by stance and lean). It is measured from behind the eye for them. `validate` leaves them out of the eye check.
+
+#### Geometry
+
+`Geometry` is serde, camelCase:
+
+```json
+{ "map": "Bank", "source": "authored",
+  "walls": [{ "id": "vault east", "a": [-53.0, -3.08], "b": [-53.0, -4.61], "bottom": 0.0, "top": 2.6,
+              "kind": "soft", "object": "60572f5567" }],
+  "slabs": [{ "id": "1F floor", "z": 0.0, "polygon": [[-95, -10], [-35, -10], [-35, 35], [-95, 35]], "soft": true,
+              "openings": [{ "polygon": [[-56.7, 5.1], [-54.7, 5.1], [-54.7, 7.1], [-56.7, 7.1]], "hatch": true }] }] }
+```
+
+A wall is a vertical quad without thickness: a segment seen from above, from `bottom` to `top`. A slab is a polygon at one height with openings; an opening that is a `hatch` is closed until the round destroys it. `object` is the map object's id in hex, the `host` of a reinforcement or barricade, and is how a panel finds its wall; without it the nearest wall within 0.6 m takes it.
+
+| Element | Sight | Bullet |
+|---|---|---|
+| `solid` wall, slab | stopped | stopped |
+| `soft` wall, `soft` slab, closed hatch | stopped | passes |
+| The same, reinforced | stopped | stopped |
+| `window`, `door` | passes | passes |
+| The same, barricaded | stopped | passes |
+| The same, with an Armor Panel | stopped | stopped |
+| `seeThrough` | passes | stopped |
+| A hole, an open hatch, an opening | passes | passes |
+| Smoke | stopped | passes |
+
+`Scene::new(&geometry)` indexes it in a grid of 2 m cells; `Scene::for_round` applies the round's state, and `scene.applied()` counts what found a wall and what did not. Every query takes the time. `Scene::open_field()` has no geometry: nothing stops a line.
+
+**Without geometry the output says so**: `geometry: "none"`, `occlusion: false`. Every pair alive then "could see" each other, a sightline is the time both were alive, and only `inFov`, the distances and `engagements` carry information. Nothing in it means a wall was tested.
+
+#### Outputs of a round
+
+| Key | What it holds |
+|---|---|
+| `geometry`, `occlusion`, `state` | `none`, or the geometry's source and map; whether lines were tested; what the round put on it. |
+| `sightlines[]` | Each stretch in which nothing stood between the eye of `from` and the body of `to`: `start`, `end`, `mutual` and `mutualSeconds` (the other way too), `inFovSeconds` and the stretches `inFov[]` in which `to` was inside the field of view of `from`, `headSeconds`, the mean `fraction` of the body seen, and the `distance` at the start with the least and the most. Tested every 0.1 s; a line lost for 0.25 s or less is one sightline. Enemies only unless `teammates` is set. A player on a drone or a camera is seen and does not see. |
+| `exposure[]` | Per player: seconds `alive`, `exposed` (at least one enemy could see them), `inView` (and had them in the field of view), the number of `enemies` that ever could, the most at once and the mean while any could, and the same per phase. |
+| `firstSights[]` | Each time an enemy came into a player's view after 0.25 s or more out of it: `entry` (`appeared`: the line cleared while the player looked that way; `turned`: it was clear and the player turned to it; `start`), and how far the view direction was off the enemy's head: `yaw` and `pitch` in degrees, the `angle` between them, the `height` in metres the crosshair passed over (or under) the head, and the `distance`. |
+| `engagements[]` | The first bullet of a player to strike an enemy after 5 s without one: `errorAtHit`, and `before`, the same errors off the enemy's head 0.5 s earlier. A hit proves a clear line, so this needs no geometry. |
+| `crosshair[]` | Per player, medians of the absolute errors: `yawError`, `pitchError`, `angleError`, `headHeightError`, the mean signed `headHeightBias`, over the `appeared` first sights; `engagements` and `errorBeforeHit`. `basis` is `fovEntry` without geometry: an enemy then comes into view only by the edge of the field of view, the yaw error is near half of it by construction (median angle 35 degrees in the test rounds), and only `errorBeforeHit` says anything of crosshair placement. |
+
+In the test rounds an open field gives 1,530 sightlines and 99 engagements; the crosshair was 4.2 degrees off the enemy's head half a second before the first hit (median) and 0.8 degrees off the point struck at it.
+
+#### Validation against the replays
+
+A bullet that struck a player proves that nothing solid stood between the shooter's eye and the point struck, and so does every shot up to where it ended. `sight::validate(&scene, &round)` counts the hits and shots a geometry contradicts (`blocked`, `shotsBlocked`, with each hit in `misses[]`), and those that crossed something that stops only sight (`sightBlocked`, `shotsThrough`): a soft wall, a barricade, smoke.
+
+No authored map exists yet, so the geometry tested is `Geometry::harvest`: the panels rounds put up. Every reinforced wall becomes a `soft` wall, every barricaded door and window an opening, every reinforced hatch a patch of floor with a hatch in it. For Bank the ten test rounds give 23 walls, 14 doors, 16 windows and 6 hatches. That is a small part of a map, and its extents are assumed (below), but it tests the whole path: matching panels to walls, their times, and the ray tests.
+
+| | Test rounds, one geometry of all ten | Real rounds (175, 15 maps), each with its own panels |
+|---|---:|---:|
+| Panels of the round that found their wall | all | all |
+| Bullet hits | 264 | 5,486 |
+| Stopped as bullets: the geometry is wrong | 0 | 4 (0.07%) |
+| Stopped as sight: through a soft wall, a barricade or smoke | 20 | 454 |
+| Shots | 4,618 | 60,866 |
+| Went on behind something that stops a bullet | 2 (0.04%) | 40 (0.07%) |
+| Went through something soft | 1,091 | 7,625 |
+
+The same Bank walls with none of the round's state applied stop no bullet (no wall is reinforced) and hide 48 victims in place of 20: the holes and the barricades that went account for the difference.
+
+The panel extents were set on the 175 real rounds, so the right column is a fit, not a test. With a panel 3.0 m high and as wide as `width` says, 148 shots went on behind a standing reinforcement, 84 of them through its last tenth and 18 over 2.6 m; a harvested panel is therefore 2.6 m high and nine tenths of its `width`. Another 34 crossed an Armor Panel, 32 of them in its lowest 0.3 m: where its position is on the frame is not known, and that was left as it is.
+
+#### Timing
+
+Measured in a release build on a machine doing other work, not benchmarked: one test round (214 s, 10 players, 2,100 tests of 50 pairs) takes 30 to 55 ms as an open field and 120 to 240 ms against the harvested geometry. 500,000 random lines across an 80 x 60 m map of 2,000 walls take 0.15 to 0.6 s.
+
+#### Limits
+
+- **No map is authored.** Everything said of occlusion needs a `Geometry` from outside; the harvested one is a test fixture. Its `appeared` first sights are not crosshair placement: a handful of panels in an otherwise open field.
+- **Walls have no thickness, bodies are five points.** A line that grazes a corner or a shoulder is decided by a centimetre.
+- **A stance is a number.** The eye jumps where the body takes a third of a second, and a prone or downed body is laid out along the view direction, not the body's own heading.
+- **On a rope the eye is the origin**, to 13 cm, and the body hangs straight down from it.
+- **Hole sizes are assumed**: the extent of the impacts and 0.15 m around, at least 1.0 x 1.4 m for a breach or rotation hole and 0.3 x 0.3 m for a murder hole. A reinforcement that is `opened` goes back to a soft wall with whatever holes `surfaces` gives; holes in floors other than hatches are not applied.
+- **A barricade is whole until it is destroyed.** One shot half away still hides what is behind it.
+- **Smoke is a ball of the assumed radius** (3.0 m), opaque from its first frame to its last.
+- **The field of view is one setting for everybody**, and a window in yaw and pitch, not a frustum. No scope narrows it.
+- **Drones and cameras do not see.** A player on one is a target only; what the device could see is not computed, though `spots` could check it.
+- **Glass, shields, deployable shields, Mira windows, light screens and gadgets** are not in the state applied.
+- **Tested 0.1 s apart**: a line open for less can be missed.
+
+#### Tests
+
+`cargo test --lib sight` (12 unit tests: ray against quad and slab with openings, what stops what, state over time, stance eye heights, the field of view, intervals, the grid against a brute-force test, JSON) and `cargo test --release --test sight` (8, on the test recordings; `real_rounds_hold_the_same` reads `R6_MATCH_REPLAY` and is skipped without it). `-- --nocapture` prints the numbers of the tables above.
+
+### Game settings (`GameSettings.ini`)
+
+
+#### Why this reads outside the replay
+
+A replay does not record sensitivity, field of view, resolution or any other
+client setting. The census of a Y11S3 round lists 34 distinct property keys (match,
+round, team and player facts, `gmsetting` asset ids for the match rules) and
+none of them is a client setting; the packet census of the stream has no
+such record either. The only place these live is the game's settings file:
+
+```
+<Documents>\My Games\Rainbow Six - Siege\<profile id>\GameSettings.ini
+```
+
+The folder name is the Ubisoft profile id, which is the recording player's
+`profileID` in a replay (`summary.recording.profileID`), so a replay says
+which folder belongs to the player who recorded it.
+
+#### Consent and read-only guarantees
+
+- The library never looks for or opens the file on its own. No other module
+  calls `settings`, and parsing a replay never touches it.
+- `settings::locate(profile_id)` builds candidate paths from the
+  `USERPROFILE`, `OneDrive`, `OneDriveConsumer` and `OneDriveCommercial`
+  environment variables. It does not touch the filesystem, not even to check
+  that a candidate exists. `settings::locate_in(documents, profile_id)` does
+  the same under Documents folders the caller resolved.
+- `settings::read(path)` and `Snapshot::take(path)` open the one path given,
+  read-only. Nothing in the module writes, creates, renames or deletes.
+- Only whitelisted keys are read (below). Hardware ids, the GPU adapter
+  string, audio devices and the whole `[ONLINE]` section (data centre hint,
+  proxy) have no field in the output type. `Snapshot::sha256` is a hash of
+  the whole file; it reveals nothing about those keys beyond "something
+  changed".
+- Asking the user is the application's job: ask before the first read, and
+  say that the file is read and never changed.
+
+#### Keys read
+
+`[INPUT]`, mouse: `RawInputMouseKeyboard`, `InvertMouseAxisY`,
+`MouseYawSensitivity`, `MousePitchSensitivity`,
+`MouseSensitivityMultiplierUnit`, `XFactorAiming`, `AimDownSightsMouse`,
+`ADSMouseUseSpecific`, `ADSMouseSensitivityGlobal`,
+`ADSMouseSensitivity1x`, `1xHalf`, `2x`, `2xHalf`, `3x`, `4x`, `5x`, `8x`,
+`12x`, `ADSMouseMultiplierUnit`, `ToggleAim`, `ToggleLean`.
+
+`[INPUT]`, controller: `InvertAxisY`, `YawSensitivity`, `PitchSensitivity`,
+`DeadzoneLeftStick`, `DeadzoneRightStick`, `ControllerStickRotationCurve`,
+`AimDownSights`, `ADSGamepadUseSpecific`, `ADSGamepadSensitivityGlobal`,
+`ADSGamepadSensitivity1x` .. `12x` (the same nine), `ADSGamepadMultiplierUnit`.
+
+`[DISPLAY_SETTINGS]`: `DefaultFOV`, `AspectRatio`, `ResolutionWidth`,
+`ResolutionHeight`, `RefreshRate`, `WindowMode`, `VSync`, `UseLetterbox`.
+
+`[DISPLAY]`: `FPSLimit`, `NVReflex`.
+
+Every field is optional: a missing key or a value that does not parse is
+`null`, never an error. The parser accepts comments (`;`, `#`), CRLF, a
+UTF-8 or UTF-16 byte order mark, unknown sections and keys, and matches
+names case-insensitively.
+
+#### Derived values
+
+These are computed, not read, and say so in their docs.
+
+| Value | Formula | Confidence |
+| --- | --- | --- |
+| Horizontal FOV | `2 * atan(tan(DefaultFOV / 2) * aspect)` | Exact geometry. `DefaultFOV` being vertical is the file's own comment. |
+| Aspect ratio | `ResolutionWidth / ResolutionHeight` when `AspectRatio` is 1 (resolution) or 0 (display, assumed to match the resolution) | Not derived for 2 and up: those are entries of the game's menu and the file does not say which ratio each is. Pass the ratio yourself. |
+| Counts per 360 | `2 * pi / (MouseYawSensitivity * MouseSensitivityMultiplierUnit * 0.005)` | Medium. From the yaw constant sensitivity converters use for Siege (0.00572957795 degrees per count per slider step at the default unit 0.02, i.e. 0.0001 rad); a community measurement, not published by Ubisoft. |
+| cm/360 | `counts per 360 / DPI * 2.54` | As above, and only as good as the DPI the caller supplies: the DPI is not in the file. |
+| ADS multiplier | `ADS slider * ADSMouseMultiplierUnit` (the per-zoom slider when `ADSMouseUseSpecific` is on, else the global one) | Medium, and partial: the game also applies a per-sight FOV factor that is not in the file, so this compares one sight across changes; it is not an ADS cm/360. |
+
+Sources: the mouse-sensitivity.com Siege entry and forum threads for the yaw
+constant and the multiplier unit; Ubisoft's Y5S3 "FOV and sensitivity" dev
+blog for the per-zoom ADS scheme.
+
+#### History: "since you changed sensitivity"
+
+The app stores a `SettingsHistory` (plain serde data) and calls
+`history.record(Snapshot::take(path)?)` whenever it is allowed to read the
+file, ideally at every replay import.
+
+- `record` appends only when a whitelisted value changed; otherwise it only
+  moves the latest snapshot's `lastSeen` forward.
+- `changes()` lists `{at, notBefore, field, from, to, aim}`.
+- `periods()` gives the spans over which the aim settings were constant.
+  Aim settings are every sensitivity, multiplier, deadzone, curve, inversion
+  and raw input, plus FOV, aspect ratio, resolution and letterbox. Toggles,
+  refresh rate, window mode, v-sync, frame limit and Reflex are tracked as
+  changes but do not start a period.
+- `split_matches(&history, start_times)` buckets matches into those periods.
+- `since_change(&history, matches)` sums kills and headshots per period from
+  `PlayerMatchStats`; `recording_stats(&match)` gives the recording player's
+  row and the match start time.
+
+A change is not dated exactly. The file holds the current values and one
+modified time, so a change is known to lie after the last snapshot that
+still showed the old value (`notBefore`) and no later than the file's
+modified time, or the new snapshot when the modified time is unusable
+(`at`). Matches that started inside that window are reported as `uncertain`
+and matches older than the first snapshot's file time as `beforeHistory`;
+neither is counted in a period. The latest period is taken to run on until a
+snapshot shows otherwise, so snapshot before attributing new matches.
+
+A headshot rate per period is a correlation. Show the match and kill counts
+beside it.
+
+#### Limits
+
+- Windows paths only. A Documents folder moved off the default location or
+  with a localized folder name on disk (OneDrive does this in some locales)
+  is not found by `locate`; resolve the folder with the shell's known-folder
+  API and call `locate_in`.
+- Mouse DPI, Windows pointer speed and acceleration, and the monitor's
+  physical size are not in the file.
+- Settings from before the first snapshot are unknown.
+- Replays from before Y11S3 carry local start times
+  (`startTimeIsLocal`); convert to UTC before splitting.
+
+### Sessions, journal and insights
+
+`replay_analyzer::journal` is the app's own data layer. It keeps three kinds of data apart.
+
+| Kind | Types | Where it lives |
+|---|---|---|
+| Derived from replays | `MatchRecord`, `PlaySession`, `Break`, `GoalProgress`, `Insights`, `TiltSignal` | Nowhere as truth. The same replays and rules give the same values again. |
+| Owned by the player | `Journal`: `tags`, `notes`, `goals` | One JSON file. The caller chooses the path; the crate never does. |
+| Rules | `SessionRules`, `InsightRules`, `TiltRules` | The caller's settings. Every threshold has a default and can be changed. |
+
+Everything serializes and deserializes as camelCase JSON. Timestamps are UTC, written as `2026-01-31T20:15:00.000Z`. Nothing in the module reads the clock: functions that stamp a time take `now`.
+
+The journal refers to matches by `matchID` and holds the player's words. It copies nothing out of a replay.
+
+#### Match records
+
+A `MatchRecord` is what sessions, goals and insights need of one match: `matchID`, `started`, `ended`, `utcOffsetMinutes`, `queue`, `map`, `outcome`, `score` (yours first), the game `launch` that recorded it, the followed `player`'s match line and one line per round.
+
+| Call | Reads | Gives |
+|---|---|---|
+| `journal::read_folder(root, ReadMode::Header)` | headers only, under a second for 30 folders | times, queue, map, result, rounds won; no player lines |
+| `journal::read_folder(root, ReadMode::Full)` | every round in full, tens of seconds for 30 folders | the same plus the recording player's lines |
+| `journal::records_from_library(&library)` | nothing: reuses a `library::scan` | the header-only records |
+| `MatchRecord::from_match(&m, stats)` | one opened `Match` | one record |
+| `MatchRecord::from_match_as(&m, username)` | one opened `Match` | the record from that player's side: for spectator recordings and a teammate's files |
+
+The game keeps a fixed number of matches and deletes the oldest. A `MatchRecord` is small and reads back from JSON, so an app that wants history stores the records and derives sessions and insights from them. Two records of the same match count once; the fuller one is used.
+
+What a full read gives for the followed player, per match and per round: rounds, kills, deaths, assists, headshots, damage taken, damage dealt (Y11S3+, an estimate, see [Health and damage](#health-and-damage)), whether they made the first kill of a round and whether they were the first to die, the operator and side per round, and whether their team won each round. Replays hold no rank, rank points or ping, so no insight can hold lobby strength equal.
+
+`started` is when the first round read began recording, after the queue, the map load and the ban and pick phases. `ended` is when the last round read stopped. Before Y11S3 a replay has only the recording PC's local time and no end; such a record has `startedIsLocal` set and counts as over when it began.
+
+#### Play sessions
+
+`journal::sessions(&records, &SessionRules)` cuts matches into sittings, oldest first.
+
+```json
+{
+  "id": "session:<matchID of the first match>",
+  "started": "...", "ended": "...", "utcOffsetMinutes": 120,
+  "matches": [{ "matchID": "...", "position": 2, "started": "...", "ended": "...",
+                "gapSeconds": 215, "afterBreak": false, "queue": "ranked", "map": "...",
+                "outcome": "win", "score": [4, 2], "player": { "kills": 7, "deaths": 4, "...": 0 } }],
+  "breaks": [{ "after": "<matchID>", "before": "<matchID>", "from": "...", "to": "...", "seconds": 857 }],
+  "launches": [{ "processId": 1234, "matches": 4 }],
+  "record": { "wins": 3, "losses": 1, "draws": 0, "undecided": 0 },
+  "totals": { "matches": 4, "kills": 25, "...": 0 }
+}
+```
+
+The gap measured is from the end of one match's last round to the start of the next match's first round. It always holds the end screens, the queue, the map load and the ban and pick phases, so it is never zero in real play.
+
+| Rule | Default | Why |
+|---|---|---|
+| `breakSeconds` | 600 | A gap this long inside a session is a break; shorter is queue time. |
+| `sessionGapSeconds` | 3600 | A gap this long starts a new session. |
+| `splitOnLaunch` | false | A game restart alone does not start a new session. |
+
+The evidence is one real folder: 30 matches over 8 evenings, 23 ranked, 4 unranked and 3 quick matches.
+
+- The 22 gaps between matches of one evening ran from 2.3 to 14.3 minutes, with a median of 3.6. Twenty were 6.0 minutes or less; the other two were 7.8 and 14.3.
+- The 7 gaps between evenings were all longer than 21 hours. Nothing fell between 15 minutes and 21 hours.
+- Every change of game process in the folder came with one of those 21-hour gaps. Within an evening the process never changed.
+
+So ten minutes sits well clear of a normal requeue and catches the one long pause in the data. Under the defaults the folder cuts into 8 sessions with 1 break.
+
+The data cannot place the session threshold: any value between 15 minutes and 21 hours cuts this folder the same way. One hour is a convention. A pause for a meal is a break; an hour away is a new sitting.
+
+The data also cannot say what a restart means, since no restart happened mid-evening. The default keeps the session, because a crash or an update restart costs minutes and the player has not left. Restarts are listed in `launches` either way: a launch changes when the process id changes, or when the same process id starts its recording counter over.
+
+What always holds, and what `tests/journal.rs` checks on any folder:
+
+- Every match is in exactly one session.
+- Sessions are in start order, and so are the matches inside one.
+- A break never overlaps a match. It runs from the latest end of the matches before it to the start of the next one.
+- Matches that overlap, such as two recordings with clocks apart, get a gap of 0 and stay in one session.
+- An unfinished or cancelled match is part of its session and counts as `undecided`.
+
+The session id comes from its first match, so it changes once the game has deleted that match and the records were not kept. `journal::find_session(&sessions, id)` finds a session by its id or by any match in it, which resolves a stored id for as long as the match it was made from is still in the session.
+
+#### The journal
+
+```json
+{
+  "version": 1,
+  "tags":  [{ "id": "...", "target": { "kind": "round", "matchID": "...", "round": 3 },
+              "label": "clutch", "created": "...", "edited": "..." }],
+  "notes": [{ "id": "...", "target": { "kind": "session", "sessionID": "session:..." },
+              "text": "...", "created": "...", "edited": "..." }],
+  "goals": [{ "id": "...", "text": "...", "created": "...", "due": "...", "status": "active",
+              "edited": "...",
+              "metric": { "stat": "killDeathRatio", "comparison": "atLeast", "target": 1.0,
+                          "scope": { "kind": "rolling", "matches": 10 } } }]
+}
+```
+
+A `target` is one of:
+
+| `kind` | Fields |
+|---|---|
+| `match` | `matchID` |
+| `round` | `matchID`, `round` (from 1) |
+| `session` | `sessionID` |
+| `kill` | `matchID`, `round`, `index` (place among the round's kills and deaths, from 0), `time` (round clock, seconds) |
+
+A tag's id is made from its target and its label without case, so tagging twice gives one tag, and the same tag set on two devices is one tag after a merge.
+
+A goal's `metric` is optional. `stat` is one of `kills`, `deaths`, `assists`, `headshots`, `killDeathRatio`, `killsPerRound`, `deathsPerRound`, `survivalRate`, `headshotPercentage`, `damagePerRound`, `winRate`, `roundWinRate`, `openingKillRate`, `openingDeathRate`. `scope` is `perMatch`, `perSession` or `rolling` over the last N matches. `status` (`active`, `achieved`, `abandoned`) is the player's to set.
+
+`journal::goal_progress(&goal, &records, &SessionRules)` measures a goal against the matches started from its creation up to its due time. It gives one point per match, session or full window, how many met the target, and the current value. A rolling goal short of its window reports a value and says nothing about whether it is met.
+
+**Saving.** `Journal::save(path)` writes a temporary file next to the target, flushes it to disk and renames it over the target. A crash leaves the old file or the new one. `Journal::load(path)` gives an empty journal when there is no file, and an error when the file is not a journal.
+
+**Newer files.** Fields this version does not know, at the top level and in every item, are kept and written back. An item this version cannot read at all, such as a tag on a new kind of target, is kept in `Journal::unread` and written back. A newer file's `version` is left as it is. An older file goes through `migrate`, which has nothing to do yet: version 1 is the first.
+
+**Merging.** `a.merge(&b)` takes in another copy of the journal. Per item the later change wins. Deleting an item leaves a tombstone: the item keeps its id and gets `deleted`, and its text is emptied. A copy that never saw the deletion therefore cannot bring the item back. Merging gives the same result either way round and can be repeated. `purge_deleted(before)` drops old tombstones; that is only safe once every copy has merged since.
+
+Last writer wins by the time each device stamped. Two devices with clocks apart can let the older edit win.
+
+#### Insights
+
+`journal::insights(&records, &SessionRules, &InsightRules)` compares the followed player's matches by where they sit in a session and what came before them.
+
+These are descriptive statistics of one player's own matches. They are correlations on small samples, not causes. A worse result after a loss can as well come from a stronger lobby, a later hour or chance, and none of those is held equal. The text of this warning is in every result as `caveat`.
+
+| Field | Groups |
+|---|---|
+| `overall` | every match |
+| `byPosition` | first, second, ... match of the session, then `5+` |
+| `afterLossVsAfterWin` | matches right after a loss in the same session, against right after a win |
+| `onLossStreak` | matches after 2 or more straight losses in the session, against the session's other later matches |
+| `afterBreakVsWithout` | matches after a break, against after a normal requeue |
+| `bySessionLength` | matches of sessions of 1-2, 3-4 and 5+ matches |
+| `byTimeOfDay` | `night` (0-6), `morning`, `afternoon`, `evening`, by local start time from the replay's UTC offset |
+| `afterDyingFirst` | rounds right after one in which the player was the first to die, against the other rounds with a round before them |
+| `afterRoundLosses` | rounds after 2 or more straight lost rounds of the match, against the other rounds with a round before them |
+
+Every group carries `sample`, `enough` and the raw counts (`totals`), so the numbers behind a rate are always there. Rates are win rate with its 95% Wilson interval, K/D, kills and deaths per round, headshot percentage and round win rate.
+
+Below the minimum sample a group holds counts and no rate, and a comparison holds no `effect`. The minimum is `minMatches` (default 10) for groups of matches and `minRounds` (default 30) for groups of rounds. Ten is low: at ten matches a win rate still has a standard error of about 16 points, which the interval shows.
+
+An `effect` is the first group minus the second: the difference in win rate with Cohen's h, the difference in K/D, the difference in kills per round with Cohen's d over the matches, and the difference in round win rate. As a rule of thumb 0.2 is small, 0.5 medium and 0.8 large.
+
+On the real folder, with all 30 matches read in full, the defaults give no effect at all. The groups were 5 matches after a loss against 14 after a win, 1 on a loss streak, 1 after a break, 15 rounds after dying first and 18 after two lost rounds. The 30 matches the game keeps are too few for these questions, which is the reason to keep records.
+
+What the replays can and cannot answer:
+
+- From a header-only read: position in session, after a loss or a win, loss streaks, breaks, session length, time of day and round losses, on win rates only.
+- From a full read: the same with K/D, kills per round and headshots, and `afterDyingFirst`.
+- Not from replays: anything about lobby strength, rank or ping; time spent in the queue as opposed to the menu; what the player did during a break. Before Y11S3 there is no UTC offset and no match end, so time of day uses the local time as written and gaps are measured from the start of the match before.
+
+#### Tilt
+
+`journal::tilt(&session, &SessionRules, &TiltRules)` reads a session in progress. It counts the straight losses at the end of the session, back to the last break, and compares the matches of that streak with the ones before it.
+
+| Level | When |
+|---|---|
+| `none` | fewer than `watchLosses` (2) straight losses |
+| `watch` | 2 straight losses |
+| `tilted` | 3 straight losses (`tiltedLosses`), or 2 with the K/D in the streak at least 20% (`kdDrop`) below the K/D before it |
+
+`suggestBreak` is set when the level is `tilted`, or after `maxSecondsWithoutBreak` (7200) of play without a break whatever the results. `suggestedBreakSeconds` is the session rules' `breakSeconds`: the shortest pause after which the next match counts as coming after a break, which also resets the streak count. The signal carries its `reasons`, the totals before and during the streak, and the session's match count as `sample`.
+
+This is a rule of thumb on a handful of matches. It says the last matches went worse than the ones before; it does not say why.
+
+#### Dependencies
+
+None added. `chrono` is built without its `serde` and `clock` features, so the module writes timestamps itself and takes `now` from the caller. Item ids are the first 16 hex digits of a SHA-256 (`sha2`, already present) of what the item is.
+
+### Profiles from outside the replay
+
+Rank, rank points and level come from Ubisoft's services, not from the replay. `replay_analyzer::profiles` joins stats fetched elsewhere onto the players a replay names and derives lobby strength and rank progress from them. The crate makes no network call and holds no key or URL: the app fetches through its own proxy and hands the answers in.
+
+#### What is joined on
+
+| From the replay | Use |
+| --- | --- |
+| `players[].profileID` | The join key: a Ubisoft profile id, the same in every match. Players without one (older replays) cannot be joined. |
+| `players[].platform` (Y11S3+) | Which of the account's ranked profiles applies: Ubisoft keeps one for PC and one for the consoles. PC is assumed when the replay does not say. |
+| `players[].username`, `renamedTo`, `usesNickname` | The name to look up, since the provider looks up by name. `renamedTo` is used when the recording has it. A player behind a nickname in a recording that stops before the match ends has no name to look up (`nameIsNickname`). |
+| `players[].level` (Y11S3+) | The clearance level, used as the fallback measure and preferred over the provider's. |
+| `queue`, `matchID`, `endTime`, `result.winner` | Which matches are ranked, when they ended and who won, for rank progress. |
+
+Replays hold no rank, rank points or reputation. Checked again for this work: a census of a Y11S3 test round lists 34 header keys, none unknown and none about rank, and 26 named stream fields, none about rank; the 230 unnamed fields are hashes the census cannot name, which the earlier search (see "Limits worth knowing" in the README) went through by value.
+
+#### What the provider gives
+
+The R6 Data API (`r6data.com/api-docs` redirects to `r6.arenyze.com/api-docs`, where it is documented as the R6 Arenyze API; `r6data.eu` did not resolve), as its documentation stood on 2026-10-02:
+
+- `GET https://public-api.arenyze.com/r6/api/v2/profile?nameOnPlatform=<name>&platformType=<uplay|psn|xbl>&platform_families=<pc|console>` with the header `api-key: <key>`.
+- The answer holds `player` (`nameOnPlatform`, `platformType`), `account` (`level`, `xp`, `profilePicture`, `profiles`), `stats.platform_families_full_profiles`, `banned`, `seasons`, `history` and `meta`.
+- Each entry of `platform_families_full_profiles` has `profile_id` and `board_ids_full_profiles[]`, each with a `board_id` (`ranked`, ...) and `full_profiles[]` holding `season_id`, `profile` (`rank`, `rank_points`, `max_rank`, `max_rank_points`, ...) and `season_statistics` (`kills`, `deaths`, `match_outcomes.{wins, losses, abandons}`). This is Ubisoft's own ranked shape passed through.
+- The older `GET /api/stats?type=stats|accountInfo|seasonalStats|...` routes answer `410 Gone`.
+- `GET /r6/api/me/usage` reports the plan and its call limit (the example shows `"plan": "pro", "limit": 100000`).
+
+Not in the documentation, and so not relied on:
+
+- **Lookup by profile id.** Every player route takes a name and a platform. The answer carries `profile_id`, so the adapter checks it against the id the replay gave and refuses an answer for another account (`ProfileError::Mismatch`): names change hands. Whether a name can be replaced by an id is an open question for the proxy.
+- **Rate limits.** No per-second or per-minute limit and no `429` behaviour is documented, only a call limit per plan. One call fetches one player, so a lobby costs up to ten calls.
+- **Rank ids.** The documented example pairs rank 18 with 3300 rank points, which its own history example names Platinum II (id 24 by Ubisoft's count from Copper V = 1). The adapter therefore names a ranked player's rank from the rank points and keeps the provider's ids apart in `providerRank` and `providerMaxRank`.
+- **`top_rank_position`, `platform_family` and the placement of `season_id`.** Read where Ubisoft puts them and where the provider's example puts them.
+
+`from_r6data_json` and `from_r6data_value` are the only functions that know these names. Everything is optional, numbers may be strings, and a response with no ranked profile still yields the level.
+
+#### What is stored
+
+`ProfileStats` is the crate's own shape, in camelCase like the rest of the output:
+
+```json
+{
+  "profileID": "…", "idConfirmed": true, "platform": "pc", "family": "pc",
+  "username": "…", "fetchedAt": "2026-10-02T18:00:00Z", "season": 43, "level": 212,
+  "ranked": {
+    "season": 43, "rank": {"id": 19, "name": "Gold II"}, "rankPoints": 2850,
+    "maxRank": {"id": 20, "name": "Gold I"}, "maxRankPoints": 2940,
+    "providerRank": 19, "providerMaxRank": 20,
+    "wins": 30, "losses": 20, "abandons": 1, "kills": 300, "deaths": 200
+  },
+  "boards": {"standard": {"…": "…"}}
+}
+```
+
+`ProfileCache` keeps the latest stats per profile id and family in a JSON file the caller names, with every snapshot whose ranked board differs from the one before (the history rank progress needs) and the players the provider did not know. `save` writes a temporary file beside the target and renames it over.
+
+#### What the app does
+
+```rust
+let mut cache = ProfileCache::load(&path)?;
+let now = profiles::now();
+let due = profiles::requests_for(&summary, &cache, now, Duration::hours(6));
+cache.refresh(&source, &due, now)?;      // source: the app's ProfileSource
+cache.save(&path)?;
+let lobby = profiles::lobby_strength(&summary, &cache.profiles());
+```
+
+`requests_for` lists the players with nothing cached younger than the max age, the recording player first, then teammates, then opponents, so an app short on calls can stop early. The app's `ProfileSource::fetch` makes one proxy request per key, using `key.name`, `key.platform_type()` and `key.platform_families()`, and passes each answer with the time it was fetched to `from_r6data_json`. The proxy adds the `api-key` header; the crate never sees it.
+
+#### What is modelled
+
+**The rank table.** Rank points to rank: Copper V starts at 1000, each division is 100 points, five divisions a tier from Copper to Diamond.
+
+| System | Seasons | Ranks | Champion | Confidence |
+| --- | --- | --- | --- | --- |
+| Ranked 2.0 | Y7S4 to Y11S1 (season ids below 42) | 36 | one rank, from 4500 | Divisions and 100 points each: reported widely. The base of 1000: from the provider's example (3300 is Platinum II) and the figure in common use, not from a Ubisoft page. |
+| Ranked 3.0 | Y11S2 on (season ids 42 and up) | 40 | Champion V to I, assumed at 4500, 4600, 4700, 4800 and 4900 | Champion's five divisions, five placement matches and the end of hidden MMR: Ubisoft's Ranked 3.0 article. The thresholds: assumed to carry on from 2.0; not published where looked. Season id 42 for Y11S2 assumes ids count from Y1S1 = 1. |
+
+Rank id 0 is unranked, including a player still in placement matches (assumed); unranked players are left out of every rank point figure.
+
+**Lobby strength.** Per team and for the lobby: mean, median, minimum, maximum and standard deviation of the ranked rank points of the players who hold a rank, with the ranks the mean and median fall in; how many of the players had a profile, a rank, a level. `difference` is the mean of the recording player's team minus the other's (team 0 minus team 1 for a spectator). `percentile` is the share of the other players below a player, ties counting half.
+
+- `basis` says what the difference and percentiles are measured in: `rankPoints` when each team has at least one ranked player known; else `level`, a fallback on clearance levels, which count time played and not skill; else `none`.
+- `expectedWin` is `1 / (1 + 10^(-difference / 400))`: the Elo curve with its usual scale applied to the mean rank point difference. It is a model, not the game's figure, and has not been fitted to match results. It is absent on the level fallback.
+- Stats are as of `fetchedAt`, not as of the match. `maxFetchGapSeconds` is the longest gap between the match and a profile used. A lobby looked up weeks later is measured by where its players are now.
+- A team lists everyone seen on it, so a team with a leaver and a joiner has six players and all six count.
+
+**Rank progress.** `rank_progress(history, matches)` takes one player's snapshots and the match summaries and gives, per pair of consecutive snapshots, the rank point change, the ranked matches the provider counted between them (the growth of wins, losses and abandons) and the ranked matches of the replays that ended between them.
+
+- `match`: the provider counted one match and the replays hold exactly one. The change is that match's.
+- `matchUnconfirmed`: the replays hold exactly one, and the provider gave no counts, so an unrecorded match may share the change.
+- `span`: anything else. No split between the matches of a span is made up.
+
+Per-match rank point changes therefore need a fetch before and after every ranked match; the app decides whether that is worth the calls. Across a season change no change is given, since the reset is not a result. `seasonPeak` is the provider's `max_rank_points` when present, else the highest snapshot of the season, marked `snapshots`: a lower bound. `trend` sums the change over the latest five spans of the season. `nextDivision` and `nextTier` come from the rank table and share its confidence.
 
 ## Players and identity
 

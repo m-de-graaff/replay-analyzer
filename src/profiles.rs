@@ -14,7 +14,7 @@
 //! that knows the provider's field names.
 //!
 //! What is the provider's and what is modelled here is said on each item;
-//! `docs/outside/profiles.md` has the whole account.
+//! the README has the whole account.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};

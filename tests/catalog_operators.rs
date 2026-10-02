@@ -158,6 +158,7 @@ fn test_round_loadouts_agree_with_the_catalog() {
         f.plate_misreads
     );
     assert_eq!(f.loadouts, rounds.len() * 10);
+    assert_eq!(f.plate_misreads, 0);
     assert!(f.wrong.is_empty(), "{}", f.wrong.join("\n"));
     assert!(f.unlisted.is_empty(), "{}", f.unlisted.join("\n"));
     for (operator, (_, other)) in &f.health {

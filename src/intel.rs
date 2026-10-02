@@ -11,7 +11,7 @@
 //! - The feed, in a player's recording only. A feed entry (class
 //!   `2b9d6947`) gets a `Message` (`e3090079`) whose array element 0 is the
 //!   text shown, `<username> has found the bombs`, and names no killer
-//!   (`ac190f70`) and no victim (`d9133cba`). The text is the game's and
+//!   (`d9133cba`) and no victim (`ac190f70`). The text is the game's and
 //!   may be translated, so an entry is told by its shape and by the
 //!   attacker its text names, not by its words. The entry is written again
 //!   as the feed scrolls; the first is the find.
@@ -70,8 +70,8 @@ const MATCH_ASSISTS: Hash = [0x4D, 0x73, 0x7F, 0x9E];
 const FEED_ENTRY: Hash = [0x2B, 0x9D, 0x69, 0x47];
 /// `Message` of a feed entry; its array element 0 is the text.
 const FEED_MESSAGE: Hash = [0xE3, 0x09, 0x00, 0x79];
-const FEED_KILLER: Hash = [0xAC, 0x19, 0x0F, 0x70];
-const FEED_VICTIM: Hash = [0xD9, 0x13, 0x3C, 0xBA];
+const FEED_KILLER: Hash = [0xD9, 0x13, 0x3C, 0xBA];
+const FEED_VICTIM: Hash = [0xAC, 0x19, 0x0F, 0x70];
 /// Field of Dokkaebi's ability object that links her tablet, and the
 /// tablet's `EquipState`.
 const TABLET: Hash = [0xB4, 0x92, 0x8F, 0x1D];

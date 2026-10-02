@@ -39,6 +39,7 @@ pub mod loadout;
 pub mod markers;
 pub mod matches;
 pub mod melee;
+pub mod messages;
 pub mod movement;
 pub mod objective;
 pub mod outcome;

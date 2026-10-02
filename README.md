@@ -65,6 +65,8 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `abilityMarkers`, `deviceMarkers` | Tracking markers abilities put on players (Jackal, Alibi, Lion, Grim, Deimos), and the device markers of Solis. | Y11S3+ |
 | `drones`, `cameras`, `deviceEvents`, `cameraCounts` | Every drone and camera with its owner, path and end; jams, captures and offline spans; cameras alive per team. Who destroyed a device is inferred. | Y11S3+ |
 | `objective`, `operatorReveals`, `phoneHacks` | Who found the objective, when each player's operator became known to the other team and what showed in that moment, and Dokkaebi's phone hacks. | Y11S3+ |
+| `systemMessages` | The lines of the feed that are no kills: players leaving, joining and reconnecting, reverse friendly fire turning on and off, the objective being found, the announcements of a phase, and any line of an id not known, kept with its raw id. See [System messages and BattlEye](#system-messages-and-battleye). | Y11S3+ |
+| `battlEye` | Whether the feed showed a line that says "BattlEye" (`flagged`), which lines, and how many lines are of a kind not known. It marks the round and repeats what the game showed; it says nothing of any player. A match folder adds `battlEye.flaggedRounds`. | Y11S3+, and before Y9S1 |
 | `metalDetectors` | Alarms of the map's metal detectors, with the nearest player (inferred). | Y11S3+ |
 | `matchFeedback[].victimSpotted`, `victimPinged` | On kills: the killer's team had the victim spotted, or had pinged where the victim was, at most 15 seconds before. Derived. | Y11S3+ |
 | `gadgets`, `mapCameras` | Every gadget object placed or thrown: what, whose, where, when, its states, the statuses put on it, each time it went off as a trap, and how it ended, with who destroyed it where the scoreboard tells. The map's own cameras, with when each was destroyed. See [Gadgets, world and destruction](#gadgets-world-and-destruction). | Y11S3+ |
@@ -113,7 +115,7 @@ Every round also says where it came from and how far it can be trusted:
 | `replay.version` | `Y11S3_Alpha04` split into season, year, season number and branch, plus the build number (`code`). |
 | `replay.parser` | Parser version and the decoder profile and revision chosen for the build. A decoding fix bumps the revision of the profiles it touches, so stored rounds with an older `(decoder, decoderRevision)` than `--decoders` lists for their build are the ones to re-parse. `untestedBuild` flags builds newer than any the decoders were checked against (9883691, 9901603 and 9918362, all `Y11S3_Alpha04`). |
 | `replay.container` | Y8S4+: the streams the round was recorded in (id, name hash, role where known, frames covered, snapshot blocks, record count), the compressed blocks, `recordingId`, and `complete`, false when the game did not finish writing the file. See [File format notes](#file-format-notes). |
-| `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What a replay never records (text feed messages, from Y9S1) is `notInVersion`, and a player who never spawned has no body to link, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. Of the 167 real rounds in one `MatchReplay` folder, the 6 untrusted ones were 3 unfinished files and 3 rounds that were not played out (no result). |
+| `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What this parser does not decode for a version (the feed's lines that are no kills, from Y9S1 to Y11S2: `feedbackMessages`) is `notInVersion`, and a player who never spawned has no body to link, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. From Y11S3 `feedbackMessages` counts `systemMessages` and is `partial` when a line has an id not known, with the ids in its warning. Of the 167 real rounds in one `MatchReplay` folder, the 6 untrusted ones were 3 unfinished files and 3 rounds that were not played out (no result). |
 | `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `skips` lists moments the game moved on by more than the recording's clock did (Y11S3; see [File format notes](#file-format-notes)). `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
 | `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes and the stream it was seen in, known or not. `unknownStreams` lists streams whose role is unknown and `streamsNotSeen` known ones the replay lacks, so a stream or field added by a patch stands out. |
 | `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. The game writes `isspectator` only for spectators, so it reads `false` when absent. `matchResult` appears only on the round that ends the match, as the result of the team numbered 1 (`teams[].color`): 2 won, 1 lost, 7 the game ended the match with no winner. |
@@ -767,6 +769,70 @@ A kill in `matchFeedback` gains two derived fields. Both say what was on the kil
 | `objectiveFound` | 1 when `objective.by` is this player (`objectivesFound` in the match totals). | As `objective` |
 
 `decodeStatus` adds `markers`, `devices`, `intel` and `sound`.
+
+## Chat and system
+
+From Y11S3, full reads of files the game finished writing carry what the game told the players in the feed besides the kills. Numbers below are from 175 rounds of a real `MatchReplay` folder and the 10 test rounds.
+
+### System messages and BattlEye
+
+Every line of the on-screen feed is one entry of the HUD's `Messages` array in the `state` stream, the same entries the kills are. An entry's `Message` is one of two things:
+
+- **A text**, written out by the game: `<username> has found the bombs`. `text` keeps it as it is.
+- **An id**, eight bytes that name a line of the game's language files, with the values that fill its placeholders: `[PLAYER]` or `[STRING]`, each a player's name. `messageId` is the eight bytes as hex and `args[]` the values with the placeholder's hash (`key`) and `name`.
+
+`systemMessages[]` lists each such line once, in order, with `time`, `phase`, `elapsed` and `recordingTime` like the kill feed. Kills stay in `matchFeedback`.
+
+| Key | What it holds | How |
+|---|---|---|
+| `kind` | What the line says: see the table below. | From the text, or inferred from the id |
+| `kindSource` | `decoded` for a text, `inferred` for an id. Absent for `unknown`. | |
+| `messageId`, `args[]` | The id and its values. Absent for a text. | Decoded |
+| `text` | The text, for a line that is one. | Decoded |
+| `username`, `profileID` | The player the line names: the first value of an id, or the player a text names. `profileID` when that is a player of the header. | Decoded |
+| `backgroundColor` | 1 or 2, a team's colour, on finds, leaves, joins and reconnects; 0 on the rest. | Decoded |
+
+The wording of an id is not in the file. What each id means is inferred from when it shows:
+
+| `messageId` | Value | `kind` | Seen |
+|---|---|---|---|
+| (a text) | | `objectiveFound` | 147 lines. The text names an attacker, and it is `objective.by` in all 147. Told by its shape, not its words, which may be translated. |
+| `c3c5050000000065` | | `phase` | As the recording starts: 174 of 175 real rounds, all 10 test rounds. |
+| `c4c5050000000065` | | `phase` | As the action phase starts: 173 real rounds, all 10 test rounds. |
+| `39f4000000000065` | `[PLAYER]` | `playerLeft` | 10 lines in 7 rounds. |
+| `38f4000000000065` | `[PLAYER]` | `playerJoined` | 1 line: a player not in the header, 12 s after a leave. |
+| `fcdb020000000065` | `[PLAYER]` | `playerReconnected` | 3 lines. |
+| `66f4020000000065` | `[STRING]` | `connectionLost` | 4 lines, each 0.39 to 0.42 s before the same player's `playerLeft`; 6 leaves come without. The weakest of these readings. |
+| `bea3040000000065` | `[PLAYER]` | `reverseFriendlyFireOn` | 24 lines. 14 come within 1.5 s of the player's flag turning on in `friendlyFire[]`; the other 10 are said again in later rounds, 1.2 s and 46 s in, of a player whose flag carried over (`activeAtStart`). |
+| `2ca9040000000065` | `[PLAYER]` | `reverseFriendlyFireOnSquad` | 4 lines in 2 rounds, each naming a squad-mate of the player it turned on for, just before that player's own line. |
+| `bfa3040000000065` | `[PLAYER]` | `reverseFriendlyFireOff` | 6 lines, all within 1.5 s of the flag turning off. |
+
+Any other id is kept as `unknown` with its `messageId` and `args`, never dropped. Three are seen and not named: `dc02060000000065` (16 lines in the 8 rounds of two matches, as the action phase starts and 6.8 s later), `9154050000000065` (once, as a recording starts, in a round without the two `phase` lines) and `0451343166523165` (3 lines, with a `[PLAYER]`).
+
+An entry is written again each time the feed scrolls, so one line shown is several writes. A write is a new line when its content was not on a line above it before that frame, and not on the same line in the last 5 seconds (the entries' `Duration`). Counting kill lines that way gives the kills of `matchFeedback` in 185 of 185 rounds.
+
+`battlEye` is the round's flag:
+
+| Key | What it holds |
+|---|---|
+| `flagged` | True when a line's text says "BattlEye", in any case. Before Y9S1, where the feed is text: when the feed has such a line. |
+| `messages` | Indexes into `systemMessages` of those lines. |
+| `texts` | Their texts, as the game wrote them. |
+| `unknownMessages` | How many lines are `unknown`. |
+
+- **The flag marks the round, not a player.** It repeats what the game showed. Nothing in the output calls a player a cheater, and no field is derived to that end.
+- **No BattlEye line exists in any Y11S3 round at hand**, so `flagged` is false in all 185. Its id, if it is one, is not known: such a line would show as `unknown`, which is why those are kept and counted. A round with `unknownMessages` above 0 is worth a look.
+- Rounds from Y9S1 to Y11S2 have no `battlEye`: their feed's lines that are no kills are not decoded.
+- A match folder adds `battlEye.flaggedRounds`, the numbers of the rounds flagged.
+
+Not recorded, or not decoded:
+
+- **The wording of an id.** Only the id and its values are in the file.
+- **Why a player left**, and whether a `playerJoined` is a new player or a returning one: the line names the player and nothing else.
+- **`round.left` and the stats do not use these lines yet.**
+
+`decodeStatus` adds `feedbackMessages`: the count of `systemMessages`, `partial` when a line's id is not known.
+
 ## Movement
 
 `--movement` adds a `movement` block (Y11S3+, full reads): where every player is, where they look and what their body is doing, at every update the game recorded. It is left out by default because it is large, about 3 MB of JSON a round. The library equivalent is `ReadOptions { movement: true, .. }` and `Round::movement`.
@@ -1315,7 +1381,7 @@ Decompressed, each snapshot is a u64 length and the snapshot. The main stream ho
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.
 - **Temporary files.** A current install has an empty `DissectTmp` folder next to `MatchReplay`, and the process id and stream id in the reported `.tmprec` names match what round files hold. No `.tmprec` file was available, so their contents are unchecked.
-- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet).
+- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet), and on a feed entry `BackgroundColor` (`5934e58b`), `Message` (`e3090079`), `KillerName` (`d9133cba`), `VictimName` (`ac190f70`), `Index` (`0548b241`) and `Duration` (`96e2297f`), with `Messages` (`c07c7422`) the array the entries are in. The placeholders of a feed line are hashed the same way: `[PLAYER]` is `3c7fb10e`, `[STRING]` `6f56659c`.
 - **Skipped game time.** A recording can leave out game time without a gap in its frames: two or more players who were walking are, a tenth of a second later, metres further on than anyone can run. `timing.skips` lists each such moment with `at`, `until`, the `seconds` missing (the median of what the players' speed says) and how many `bodies` jumped; it is inferred from the bodies, and `decodeStatus.timing` is `partial` with it. 22 skips of 0.3 to 1.0 s in 12 of the 175 real rounds, none in the test rounds. Whatever is timed across one is that much shorter than it was: in the one round checked against other evidence a second is missing as action starts, a wall reinforcement that takes 4.08 s is up in 3.06 s, and two melee hits of one player are 0.76 s apart where the game allows no less than 1.02 s.
 - **Stray records.** Binary data between record runs can read as records. In one real round such a "record" covered a team object's first record and moved its properties to another object. Two rules reject them: an array record claiming an index of 65536 or more (real ones reach 64), and any record that does not name its object yet covers records that do (a `23` or `1b` and what follows) ending exactly where it ends.
 

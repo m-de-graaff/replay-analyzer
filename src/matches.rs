@@ -196,6 +196,15 @@ impl Match {
         MatchAnalytics::new(&self.rounds)
     }
 
+    /// The rounds whose feed showed a line that says "BattlEye" (see
+    /// [`crate::messages`]). `None` when no round was read for it.
+    pub fn battl_eye(&self) -> Option<crate::messages::MatchBattlEye> {
+        let rounds = self.rounds.iter();
+        crate::messages::match_battleye(
+            rounds.map(|r| (r.header.round_number + 1, r.battl_eye.as_ref())),
+        )
+    }
+
     /// Y11S3: per player, the rounds their loadout differs from their
     /// previous round on the same side.
     pub fn loadout_changes(&self) -> Vec<LoadoutChange> {
@@ -456,6 +465,8 @@ impl Serialize for Match {
             analytics: MatchAnalytics,
             #[serde(rename = "loadoutChanges", skip_serializing_if = "Vec::is_empty")]
             loadout_changes: Vec<LoadoutChange>,
+            #[serde(rename = "battlEye", skip_serializing_if = "Option::is_none")]
+            battl_eye: Option<crate::messages::MatchBattlEye>,
             rounds: &'a [Round],
             stats: Vec<PlayerMatchStats>,
         }
@@ -464,6 +475,7 @@ impl Serialize for Match {
             folder: self.folder.as_ref(),
             analytics: self.analytics(),
             loadout_changes: self.loadout_changes(),
+            battl_eye: self.battl_eye(),
             rounds: &self.rounds,
             stats: self.player_stats(),
         }

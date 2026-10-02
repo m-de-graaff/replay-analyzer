@@ -115,6 +115,13 @@ pub struct Round {
     pub operator_reveals: Vec<crate::intel::Reveal>,
     /// Y11S3 full reads: Dokkaebi hacking the phone of a dead defender.
     pub phone_hacks: Vec<crate::intel::PhoneHack>,
+    /// Y11S3 full reads: the lines of the feed that are no kills (see
+    /// [`crate::messages`]).
+    pub system_messages: Vec<crate::messages::SystemMessage>,
+    /// Whether the feed showed a line that says "BattlEye": Y11S3 full
+    /// reads, and full reads before Y9S1, whose feed is text. It marks the
+    /// round and says nothing of any player.
+    pub battl_eye: Option<crate::messages::BattlEye>,
     /// Y11S3 full reads: the alarms of metal detectors (see
     /// [`crate::sound`]).
     pub metal_detectors: Vec<crate::sound::MetalDetector>,
@@ -478,6 +485,10 @@ impl Serialize for Round {
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             phone_hacks: &'a [crate::intel::PhoneHack],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            system_messages: &'a [crate::messages::SystemMessage],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            battl_eye: Option<&'a crate::messages::BattlEye>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
             metal_detectors: &'a [crate::sound::MetalDetector],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             score_changes: &'a [crate::gadget_events::ScoreChange],
@@ -539,6 +550,8 @@ impl Serialize for Round {
             objective: self.objective.as_ref(),
             operator_reveals: &self.operator_reveals,
             phone_hacks: &self.phone_hacks,
+            system_messages: &self.system_messages,
+            battl_eye: self.battl_eye.as_ref(),
             metal_detectors: &self.metal_detectors,
             reinforcements: &self.reinforcements,
             barricades: &self.barricades,
@@ -767,6 +780,9 @@ const UI_ID_INDICATOR: &[u8] = &[0x38, 0xDF, 0xEE, 0x88];
 const CURRENT_SITE: [u8; 5] = [0xFC, 0xC6, 0xA8, 0x60, 0x01];
 const LEGACY_FEEDBACK: &[u8] = &[0x00, 0x00, 0x00, 0x22, 0xE3, 0x09, 0x00, 0x79];
 const KILL_INDICATOR: [u8; 5] = [0x22, 0xD9, 0x13, 0x3C, 0xBA];
+/// Y11S3: `Message` of a feed entry, as a property and as an array element.
+const FEED_MESSAGE: [u8; 5] = [0x22, 0xE3, 0x09, 0x00, 0x79];
+const FEED_MESSAGE_ELEMENT: [u8; 5] = [0x26, 0xE3, 0x09, 0x00, 0x79];
 /// Property that follows the operator in a pick or swap, on the same object.
 const STATE_PROPERTY: [u8; 4] = [0x63, 0xCC, 0x18, 0x8F];
 const ITEM_ICON: [u8; 5] = [0x22, 0xB2, 0x97, 0xEF, 0x0C];
@@ -936,6 +952,12 @@ struct Parser<'a> {
     /// Y11S3: `(decodeStatus field, events found, warnings)` of each kind
     /// of weapon event decoded, and of what [`Parser::resolve_intel`] reads.
     weapon_status: Vec<(&'static str, usize, Vec<String>)>,
+    /// Y11S3 full reads: the ids of the feed's lines of unknown kind and
+    /// what could not be read of the feed, for
+    /// `decodeStatus.feedbackMessages`.
+    messages_status: Option<(Vec<String>, Vec<String>)>,
+    /// Before Y9S1: the texts of the feed that say "BattlEye".
+    battleye_texts: Vec<String>,
     /// Y11S3: every mark of a spotted operator, and who looked through
     /// which device where, kept for [`Parser::resolve_intel`] to make the
     /// spots of.
@@ -1056,6 +1078,8 @@ impl<'a> Parser<'a> {
             physics_events: 0,
             join_status: None,
             weapon_status: Vec::new(),
+            messages_status: None,
+            battleye_texts: Vec::new(),
             spot_marks: Vec::new(),
             views: Vec::new(),
             poses: Vec::new(),
@@ -1143,6 +1167,7 @@ impl<'a> Parser<'a> {
             self.join_world();
             self.round_end();
             self.resolve_intel();
+            self.resolve_messages();
             self.resolve_activity();
             let stream = self.movement_stream();
             if let (true, Some(stream)) = (options.movement, &stream) {
@@ -1863,9 +1888,26 @@ impl<'a> Parser<'a> {
         if levels > 0 {
             r.field("levels", Status::Decoded, levels);
         }
-        if code >= version::Y9S1 && !skipped {
-            r.field("feedbackMessages", Status::NotInVersion, 0)
-                .warn("text feed messages (leaves, objective found) are not decoded from Y9S1");
+        if let Some((unknown, warnings)) = &self.messages_status {
+            // Y11S3: a line of an id not known is kept, and says so here.
+            let f = r.field(
+                "feedbackMessages",
+                Status::Decoded,
+                round.system_messages.len(),
+            );
+            if !unknown.is_empty() {
+                f.at_most(Status::Partial).warn(format!(
+                    "feed lines of unknown message ids: {}",
+                    unknown.join(", ")
+                ));
+            }
+            for w in warnings {
+                f.at_most(Status::Partial).warn(w.clone());
+            }
+        } else if code >= version::Y9S1 && !skipped {
+            r.field("feedbackMessages", Status::NotInVersion, 0).warn(
+                "feed lines that are no kills (leaves, objective found) are not decoded for this version",
+            );
         }
 
         let won = h.teams.iter().filter(|t| t.won).count();
@@ -2583,7 +2625,24 @@ impl<'a> Parser<'a> {
 
     fn read_feedback(&mut self, c: &mut Cursor) -> Result<()> {
         let code = self.code();
-        if code >= version::Y9S1_UPDATE3 {
+        if code >= version::Y11S3 {
+            // The colour, then the message: its id, and as array elements
+            // an empty text and a count for a kill, a text for a find, or
+            // a count and arguments for a line with an id (see
+            // [`crate::messages`], which reads the lines that are no
+            // kills). The killer follows whichever it is.
+            c.skip(4)?;
+            if c.array::<5>()? != FEED_MESSAGE {
+                return Ok(());
+            }
+            c.u64()?;
+            while c.peek(5) == FEED_MESSAGE_ELEMENT {
+                c.skip(9)?;
+                let size = c.u8()? as usize;
+                c.skip(size)?;
+            }
+            return self.read_kill(c);
+        } else if code >= version::Y9S1_UPDATE3 {
             c.skip(38)?;
         } else if code >= version::Y9S1 {
             c.skip(9)?;
@@ -2607,6 +2666,9 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let msg = String::from_utf8_lossy(c.bytes(size)?).into_owned();
+        if crate::messages::names_battleye(&msg) && !self.battleye_texts.contains(&msg) {
+            self.battleye_texts.push(msg.clone());
+        }
         let kind = if msg.contains("left") {
             MatchUpdateType::PlayerLeave
         } else if msg.contains("BattlEye") {
@@ -3311,6 +3373,44 @@ impl<'a> Parser<'a> {
         self.round.operator_reveals = reveals;
         self.round.phone_hacks = intel.hacks;
         self.round.metal_detectors = sound.alarms;
+    }
+
+    /// The lines of the feed that are no kills, and the round's BattlEye
+    /// flag (see [`crate::messages`]): from the HUD objects of the state
+    /// stream in Y11S3, and from the feed's texts before Y9S1. A find is a
+    /// text that names an attacker, so this follows the teams' sides.
+    fn resolve_messages(&mut self) {
+        if self.code() < version::Y9S1 {
+            let said = |u: &MatchUpdate| u.kind == MatchUpdateType::Battleye;
+            let entry = self.round.match_feedback.iter().any(said);
+            let texts = std::mem::take(&mut self.battleye_texts);
+            self.round.battl_eye = Some(crate::messages::legacy_battleye(texts, entry));
+            return;
+        }
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let header = &self.round.header;
+        let input = crate::loadout::Input {
+            data: self.data,
+            map,
+            streams: &container.streams,
+            players: &header.players,
+            clock: &clock,
+        };
+        let sides = [header.teams[0].role, header.teams[1].role];
+        let found = crate::messages::decode(&input, sides);
+        self.round.battl_eye = Some(crate::messages::battleye(&found.lines));
+        self.round.system_messages = found.lines;
+        self.messages_status = Some((found.unknown_ids, found.warnings));
     }
 
     /// Y11S3: score changes, gadget removals with who and how, statuses

@@ -962,12 +962,12 @@ A match folder adds `breaks[]`, one per pair of consecutive rounds read (none ac
 | `banPhase` | The bans in force differ between the two rounds: operators were banned in the break. Absent on a header-only read. | Decoded |
 | `sideSwitch` | The teams changed sides. | Decoded |
 | `overtime` | The round before or after is an overtime round. | Decoded |
-| `expected`, `excess` | The median of the match's breaks with no ban phase, no side switch and no overtime, and how much longer this one is. Absent when the match has fewer than three such breaks. | Inferred |
-| `pauseSuspected` | `excess` is over 20 s and the break has no ban phase and no side switch. Absent without `expected` or `banPhase`. | Inferred |
+| `expected`, `excess` | The median of the match's breaks with no ban phase, no side switch and no overtime, and how much longer this one is. A match with fewer than three such breaks (Ranked bans before every round; a 1v1 switches sides after every round) gives the median of its commonest kind of break to the breaks of that kind, when it has three. | Inferred |
+| `pauseSuspected` | `excess` is over 20 s and the break has no ban phase and no side switch, or is of the kind the others it is compared with are. Absent without `expected` or `banPhase`. | Inferred |
 
 - A break is the time between two recordings, not between two rounds: it holds the end-of-round replay, the operator picks, and whatever else the lobby waited for. It can say a break was long. It cannot say why, and a pause shorter than the spread of a match's breaks does not show.
 - The test match: 31.6, 28.2, 95.4, 31.7, 27.9, 180.9, 30.5, 73.1 and 59.0 s. Operators were banned after rounds 3, 6 (the side switch) and 9. The other six give 31.0 s as `expected`, and the 73.1 s after round 8 is `pauseSuspected`: nothing in the two rounds explains it, and nothing confirms a pause either.
-- Ranked bans before every round, so its breaks have no plain ones to compare with: `expected` is absent in all 148 breaks of the real folder. They are 57 to 88 s, each within 10 s or so of its match's median, 17 s once before a file the game did not finish, and 7 to 10 s shorter before overtime.
+- Ranked bans before every round, so its breaks have no plain ones and are compared with each other: none of the real folder's Ranked breaks is `pauseSuspected`. They are 57 to 88 s, each within 10 s or so of its match's median, 17 s once before a file the game did not finish, and 7 to 10 s shorter before overtime.
 
 ## Movement
 

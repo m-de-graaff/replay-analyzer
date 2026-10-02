@@ -594,8 +594,11 @@ fn objective(
 ) -> Option<Objective> {
     let seconds = |frame: Option<u32>| clock.seconds(frame).unwrap_or(0.0);
     let spans = clock.timeline.spans();
-    let prep_end = match spans.as_slice() {
-        [prep, _, ..] if prep.phase == Phase::Prep => prep.recording_end?,
+    // A custom game can be set to play without a prep phase: the feed
+    // still names the finder, and nothing is asked of the score.
+    let (prep_end, prep) = match spans.as_slice() {
+        [prep, _, ..] if prep.phase == Phase::Prep => (prep.recording_end?, true),
+        [action, ..] if action.phase == Phase::Action => (action.recording_start?, false),
         _ => return None,
     };
 
@@ -678,6 +681,7 @@ fn objective(
 
     let (find, source, inferred) = match (said.first(), prep_score, jumps.first()) {
         (Some((find, _)), _, _) => (find, Source::Feed, false),
+        _ if !prep => return Some(Objective::default()),
         (None, Some(find), _) => (find, Source::Score, false),
         (None, None, Some(find)) if not_found_in_prep => (find, Source::Score, true),
         _ => {

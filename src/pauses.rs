@@ -518,8 +518,10 @@ pub struct Break {
     /// next one's.
     pub duration: f64,
     /// What the match's plain breaks take: the median of those with no ban
-    /// phase, no side switch and no overtime round on either side. Absent
-    /// when the match has fewer than three such breaks. Inferred.
+    /// phase, no side switch and no overtime round on either side. A match
+    /// with fewer than three such breaks gives the median of its commonest
+    /// kind of break to the breaks of that kind, when there are three.
+    /// Inferred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<f64>,
     /// `duration` less `expected`.
@@ -535,8 +537,9 @@ pub struct Break {
     /// The round before or the round after is an overtime round.
     pub overtime: bool,
     /// The break is more than [`LONG_BREAK`] seconds over `expected` with
-    /// no ban phase and no side switch to explain it. Inferred, and absent
-    /// when one of those is.
+    /// no ban phase and no side switch to explain it, or over what the
+    /// other breaks of its kind take. Inferred, and absent when one of
+    /// those is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause_suspected: Option<bool>,
 }
@@ -594,24 +597,52 @@ pub fn breaks(rounds: &[Round]) -> Vec<Break> {
     out
 }
 
-/// Compares each break with the plain ones of its match.
+fn median(mut of: Vec<f64>) -> Option<f64> {
+    of.sort_by(f64::total_cmp);
+    let mid = of.len() / 2;
+    match (of.get(mid), mid.checked_sub(1).and_then(|i| of.get(i))) {
+        (Some(&upper), Some(&lower)) if of.len() % 2 == 0 => Some((upper + lower) / 2.0),
+        (Some(&upper), _) => Some(upper),
+        _ => None,
+    }
+}
+
+/// Compares each break with the plain ones of its match. A match with too
+/// few plain breaks (Ranked bans before every round, a 1v1 switches sides
+/// after every round) compares the breaks of its commonest kind with each
+/// other instead, and leaves the rest unrated.
 fn rate(breaks: &mut [Break]) {
-    let mut plain: Vec<f64> = (breaks.iter())
+    let plain: Vec<f64> = (breaks.iter())
         .filter(|b| b.plain())
         .map(|b| b.duration)
         .collect();
     if plain.len() < MIN_PLAIN_BREAKS {
+        let kind = |b: &Break| Some((b.ban_phase?, b.side_switch?, b.overtime));
+        let Some(commonest) = (breaks.iter().filter_map(kind))
+            .max_by_key(|k| breaks.iter().filter(|b| kind(b) == Some(*k)).count())
+        else {
+            return;
+        };
+        let alike = |b: &Break| kind(b) == Some(commonest);
+        let durations: Vec<f64> = (breaks.iter().filter(|b| alike(b)))
+            .map(|b| b.duration)
+            .collect();
+        if durations.len() < MIN_PLAIN_BREAKS {
+            return;
+        }
+        let Some(median) = median(durations) else {
+            return;
+        };
+        for b in breaks.iter_mut().filter(|b| alike(b)) {
+            let excess = b.duration - median;
+            b.expected = Some(millis(median));
+            b.excess = Some(millis(excess));
+            b.pause_suspected = Some(excess > LONG_BREAK);
+        }
         return;
     }
-    plain.sort_by(f64::total_cmp);
-    let mid = plain.len() / 2;
-    let median = match (
-        plain.get(mid),
-        mid.checked_sub(1).and_then(|i| plain.get(i)),
-    ) {
-        (Some(&upper), Some(&lower)) if plain.len() % 2 == 0 => (upper + lower) / 2.0,
-        (Some(&upper), _) => upper,
-        _ => return,
+    let Some(median) = median(plain) else {
+        return;
     };
     for b in breaks {
         let excess = b.duration - median;
@@ -965,6 +996,30 @@ mod tests {
         rate(&mut breaks);
         assert!(breaks.iter().all(|b| b.expected.is_none()));
         assert!(breaks.iter().all(|b| b.pause_suspected.is_none()));
+        // A match whose breaks are all of one kind compares them with each
+        // other: a 1v1 that switches sides after every round.
+        let switch = |n, d| Break {
+            side_switch: Some(true),
+            ..plain(n, d)
+        };
+        let mut breaks = vec![
+            switch(1, 30.0),
+            switch(2, 78.0),
+            switch(3, 28.0),
+            switch(4, 32.0),
+        ];
+        breaks.push(Break {
+            overtime: true,
+            ..switch(5, 90.0)
+        });
+        rate(&mut breaks);
+        assert_eq!(breaks[1].expected, Some(31.0));
+        assert_eq!(breaks[1].pause_suspected, Some(true));
+        assert_eq!(breaks[0].pause_suspected, Some(false));
+        assert_eq!(
+            (breaks[4].expected, breaks[4].pause_suspected),
+            (None, None)
+        );
         // Bans that were not read leave the question open.
         let mut breaks = vec![plain(1, 30.0), plain(2, 30.0), plain(3, 30.0)];
         breaks.push(Break {

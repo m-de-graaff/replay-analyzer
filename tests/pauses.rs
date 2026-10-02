@@ -272,7 +272,7 @@ fn real_rounds_have_no_pause() {
     );
     eprintln!(
         "{breaks} breaks in {matches} matches, {rated} with a level to compare with, \
-         {suspected} long without bans or a side switch"
+         {suspected} long for their match"
     );
     assert!(rounds > 0, "no Y11S3 rounds under {}", root.display());
     let stalls = [

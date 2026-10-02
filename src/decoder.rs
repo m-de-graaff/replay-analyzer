@@ -58,6 +58,10 @@
 //!   defuser timer as the game wrote it; the seconds a plant or disable
 //!   given up had to go. The defuser is no longer a placement of its
 //!   carrier's.
+//! - Y11S3 (profile Y9S4): the feed's lines that are no kills, with a
+//!   flag for a round with a BattlEye line; leavers, reconnects and seats;
+//!   pauses inferred from the round clock, and the breaks between rounds;
+//!   text chat and voice reported as not recorded.
 
 use serde::Serialize;
 
@@ -143,7 +147,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 15,
+        revision: 16,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

@@ -1832,8 +1832,10 @@ impl<'a> Parser<'a> {
                 .collect();
             unknown.sort_unstable();
             unknown.dedup();
+            // An id not known is a line kept raw, not a fault: only what
+            // could not be read lowers the status.
             if !unknown.is_empty() {
-                f.at_most(Status::Partial).warn(format!(
+                f.warn(format!(
                     "platform values not seen before, left out: {unknown:?}"
                 ));
             }
@@ -1895,8 +1897,10 @@ impl<'a> Parser<'a> {
                 Status::Decoded,
                 round.system_messages.len(),
             );
+            // An id not known is a line kept raw, not a fault: only what
+            // could not be read lowers the status.
             if !unknown.is_empty() {
-                f.at_most(Status::Partial).warn(format!(
+                f.warn(format!(
                     "feed lines of unknown message ids: {}",
                     unknown.join(", ")
                 ));

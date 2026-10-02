@@ -148,7 +148,7 @@ fn check(name: &str, round: &Round) {
     let unknown = lines.iter().filter(|l| l.kind == Kind::Unknown).count();
     assert_eq!(flag.unknown_messages, unknown, "{name}");
 
-    // `decodeStatus` counts the lines, and is partial for unknown ids.
+    // `decodeStatus` counts the lines, and names unknown ids in a warning.
     let status = round
         .decode
         .get("feedbackMessages")
@@ -156,11 +156,11 @@ fn check(name: &str, round: &Round) {
     assert_eq!(status.count, lines.len(), "{name}");
     let ids = (lines.iter()).any(|l| l.kind == Kind::Unknown && l.message_id.is_some());
     if ids {
-        assert_eq!(status.status, Status::Partial, "{name}");
         assert!(!status.warnings.is_empty(), "{name}");
     } else if status.warnings.is_empty() {
         assert_eq!(status.status, Status::Decoded, "{name}");
     }
+    assert_ne!(status.status, Status::Missing, "{name}");
 }
 
 #[test]

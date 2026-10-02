@@ -83,6 +83,13 @@ pub struct MatchUpdate {
     /// name (see [`crate::vitals`]); effects without a name are left out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub victim_effects: Vec<&'static str>,
+    /// Y11S3: the fire, gas or swarm area of `areas[]` the victim's body
+    /// was in at the kill, with `inAreaSource: derived` (see
+    /// [`crate::join`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area: Option<crate::areas::InArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area_source: Option<&'static str>,
     /// Round clock as displayed in game, e.g. `2:41`.
     pub time: String,
     #[serde(serialize_with = "whole_number_as_int")]
@@ -138,6 +145,8 @@ impl MatchUpdate {
             downed_by: String::new(),
             finish: false,
             victim_effects: Vec::new(),
+            in_area: None,
+            in_area_source: None,
             time: clock.display.clone(),
             time_in_seconds: clock.seconds,
             message: String::new(),

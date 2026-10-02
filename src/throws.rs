@@ -35,7 +35,11 @@
 //! where the object left the hand, and every update after it one position,
 //! about 30 a second while the object moves. The game writes no velocity:
 //! direction and speed are taken from the second and third position, as
-//! the first step is often cut short. The flight is the run of positions
+//! the first step is often cut short. An object thrown at something an arm
+//! away sticks within that first step, and its next positions are it
+//! settling by millimetres: when the second step has less than a twentieth
+//! of the first step's speed, or no speed to the centimetre a second, the
+//! throw has no direction and no speed. The flight is the run of positions
 //! without a pause; where it stops is where the object came to rest. A
 //! drone goes on to be driven without a pause, so its flight is cut at the
 //! landing: the first impact that leaves it without vertical speed.
@@ -70,7 +74,7 @@ use serde::Serialize;
 
 use crate::entities::Hash;
 use crate::loadout::{
-    DESCRIPTOR, Descriptor, Input, MOVEMENT_STREAM, UPDATE, When, descriptor, hud_items, messages,
+    DESCRIPTOR, Descriptor, Input, MOVEMENT_STREAM, UPDATE, When, descriptor, messages,
 };
 use crate::types::item_name;
 
@@ -123,6 +127,10 @@ const IMPACT: f64 = 1.0;
 /// Steps whose velocity is within this of the first step's are the steady
 /// ones a drone leaves the hand with (m/s; gravity adds 0.3 a step).
 const STEADY: f64 = 0.5;
+/// A second step with less than this part of the first step's speed is no
+/// flight: nothing in the air loses nineteen twentieths of its speed in a
+/// thirtieth of a second. The object struck something in its first step.
+const STUCK: f64 = 0.05;
 /// Path points closer than this to the one before are left out (metres).
 const STEP: f64 = 0.05;
 /// The most points a path keeps.
@@ -492,13 +500,36 @@ fn place(p: [f32; 3]) -> [f64; 3] {
     p.map(|v| round(f64::from(v), 3))
 }
 
-/// Unit vector and metres a second of the step from `a` to `b`.
+/// Unit vector and metres a second of the step from `a` to `b`. A step
+/// that took no time, or whose speed is nothing to the centimetre a
+/// second, has no heading.
 fn heading(a: (f64, [f32; 3]), b: (f64, [f32; 3])) -> Option<([f64; 3], f64)> {
     let (dt, length) = (b.0 - a.0, distance(a.1, b.1));
-    (dt > 0.0 && length > 0.0).then(|| {
-        let unit = [0, 1, 2].map(|i| round(f64::from(b.1[i] - a.1[i]) / length, 4));
-        (unit, round(length / dt, 2))
-    })
+    if dt <= 0.0 || length <= 0.0 {
+        return None;
+    }
+    let speed = round(length / dt, 2);
+    let unit = [0, 1, 2].map(|i| round(f64::from(b.1[i] - a.1[i]) / length, 4));
+    (speed > 0.0).then_some((unit, speed))
+}
+
+/// The direction and speed an object left the hand with, from the
+/// positions of its flight: those of the second step. The first step is
+/// no measure: it starts where the release message put the object, which
+/// can be a frame old, so it comes out too short or too long. When the
+/// second step has less than [`STUCK`] of the first's speed, the object
+/// struck something in its first step and stuck there, and its second
+/// step is it settling, not flying: it has no heading then.
+fn launch(run: &[(f64, [f32; 3])]) -> Option<([f64; 3], f64)> {
+    match run {
+        [a, b, c, ..] => {
+            let second = heading(*b, *c)?;
+            let stuck = heading(*a, *b).is_some_and(|first| second.1 < first.1 * STUCK);
+            (!stuck).then_some(second)
+        }
+        [a, b] => heading(*a, *b),
+        _ => None,
+    }
 }
 
 /// The slot of `body` that holds `asset`.
@@ -507,8 +538,10 @@ fn slot_of(body: &Descriptor, asset: u64) -> Option<Slot> {
     CARRIED.iter().find(|c| holds(c.0)).map(|c| c.1)
 }
 
-/// Reads every throw and launch from the movement stream.
-pub(crate) fn decode(input: &Input) -> Decoded {
+/// Reads every throw and launch from the movement stream. `items` is
+/// each player's ability and gadget item as the HUD has them
+/// ([`hud_items`](crate::loadout::hud_items)).
+pub(crate) fn decode(input: &Input, items: &[[Option<u64>; 2]]) -> Decoded {
     let data = input.data;
     let blocks: Vec<(usize, usize, Option<u32>)> = input.blocks(MOVEMENT_STREAM).collect();
     let block = |b: &(usize, usize, Option<u32>)| data.get(b.0..b.1).unwrap_or_default();
@@ -648,7 +681,6 @@ pub(crate) fn decode(input: &Input) -> Decoded {
         let i = shown.partition_point(|f| *f <= frame).checked_sub(1);
         i.and_then(|i| readings.get(i)).copied().unwrap_or(0)
     };
-    let items = hud_items(input);
     let body = |player: &crate::header::Player| {
         let entity = player.entities.as_ref()?.movement?;
         latest.get(&u64::from(entity)).copied()
@@ -684,10 +716,7 @@ pub(crate) fn decode(input: &Input) -> Decoded {
             _ => id.and_then(item_name).or(ammunition.map(|a| a.1)),
         };
         let run = r.points.get(..flight(&r.points, r.driven)).unwrap_or(&[]);
-        let step = match run {
-            [_, a, b, ..] | [a, b] => heading(*a, *b),
-            _ => None,
-        };
+        let step = launch(run);
         out.throws.push(Throw {
             username: player.username.clone(),
             slot,
@@ -965,5 +994,57 @@ mod tests {
         assert_eq!((unit, speed), ([0.6, 0.0, 0.8], 10.0));
         assert_eq!(heading((0.0, [0.0; 3]), (0.0, [1.0, 0.0, 0.0])), None);
         assert_eq!(heading((0.0, [0.0; 3]), (1.0, [0.0; 3])), None);
+        // Half a millimetre in a fifth of a second is no movement.
+        assert_eq!(heading((0.0, [0.0; 3]), (0.2, [0.0, 0.0005, 0.0])), None);
+    }
+
+    #[test]
+    fn the_launch_is_the_second_step_unless_the_object_stuck_in_the_first() {
+        let step = |points: &[(f64, [f32; 3])]| launch(points).map(|h| h.1);
+        // The first step is cut short: the second is the throw.
+        let thrown = [
+            (0.0, [0.0; 3]),
+            (0.03, [0.1, 0.0, 0.0]),
+            (0.06, [0.4, 0.0, 0.0]),
+        ];
+        assert_eq!(step(&thrown), Some(10.0));
+        // The first step is too long, from a stale position: still the
+        // second.
+        let stale = [
+            (0.0, [0.0; 3]),
+            (0.034, [2.59, 0.0, 0.0]),
+            (0.068, [3.15, 0.0, 0.0]),
+        ];
+        assert_eq!(step(&stale), Some(16.47));
+        // A Kiba Barrier thrown at the floor in front of the player: stuck
+        // by its second position, then creeping half a millimetre (a real
+        // round of 2026-10-02).
+        let stuck = [
+            (0.0, [9.392, -11.688, 0.711]),
+            (0.035, [9.255343, -11.665669, 0.635_476_35]),
+            (0.240, [9.255343, -11.666211, 0.635_476_35]),
+            (0.486, [9.255343, -11.666732, 0.635_476_35]),
+        ];
+        assert_eq!(launch(&stuck), None);
+        // Stuck, and drifting 6 mm a step as it unfolds (test round 3).
+        let drifting = [
+            (0.0, [0.0; 3]),
+            (0.034, [0.13, 1.07, 0.03]),
+            (0.068, [0.1365, 1.07, 0.03]),
+        ];
+        assert_eq!(launch(&drifting), None);
+        // A flash charge bobbing where it was let go is as slow as it is.
+        let bobbing = [
+            (0.0, [0.0, 0.0, 0.0]),
+            (0.034, [0.0, 0.0, -0.018]),
+            (0.068, [0.0, 0.0, -0.037]),
+        ];
+        assert_eq!(step(&bobbing), Some(0.56));
+        // Two positions are one step; one is none.
+        assert_eq!(step(&thrown[..2]), Some(3.33));
+        assert_eq!(step(&thrown[..1]), None);
+        // An object that did not move in its first step takes the second.
+        let late = [(0.0, [0.0; 3]), (0.03, [0.0; 3]), (0.06, [0.3, 0.0, 0.0])];
+        assert_eq!(step(&late), Some(10.0));
     }
 }

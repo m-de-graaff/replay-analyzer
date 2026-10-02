@@ -23,7 +23,8 @@
 //! byte, `fe` alone when the object is destroyed, else a record:
 //!
 //! ```text
-//! +0   u8 kind        0 melee, 1 bullet
+//! +0   u8 kind        0 not a bullet, 1 another player's bullet, 2 and 3
+//!                     the recorder's own bullet, predicted and confirmed
 //! +1   f32 x, y, z    where it was hit, in the object's own space
 //! +13  f32 1.0        +17 4 x f32
 //! +33  u64 body       who did it         +41 u64 0

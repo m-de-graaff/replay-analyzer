@@ -58,8 +58,15 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `players[].maxHealth` | The operator's maximum health: 100, 110 or 125. Replays hold no armor rating; this is what the game has in its place. | Y11S3+ |
 | `matchFeedback[].teamKill`, `finish`, `downedBy`, `victimEffects` | On kills: the victim was a teammate; the victim was down, and who downed them; the status effects the victim was under. | Y11S3+ |
 | `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
-| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`. | Y8S1+ (detail Y11S3+) |
+| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`, and `gadgetsDeployed`, `gadgetsDestroyed`, `gadgetsLost`, `reinforcements`, `barricades`, `breaches`, `breachesOpened` and `trapsTriggered` (see [What is joined onto other events](#what-is-joined-onto-other-events)). | Y8S1+ (detail Y11S3+) |
 | `weaponActivity`, `shots`, `bulletHits`, `throws`, `meleeHits`, `shieldActions` | What players held, fired, reloaded, threw and struck. See [Weapons and shooting](#weapons-and-shooting). | Y11S3+ |
+| `gadgets`, `mapCameras` | Every gadget object placed or thrown: what, whose, where, when, its states, the statuses put on it, each time it went off as a trap, and how it ended, with who destroyed it where the scoreboard tells. The map's own cameras, with when each was destroyed. See [Gadgets, world and destruction](#gadgets-world-and-destruction). | Y11S3+ |
+| `deviceRemovals`, `gadgetStatuses`, `trapTriggers` | The same events for what is no entry of `gadgets`: drones and cameras destroyed, a status on a drone or a camera's mount, a trap no object was matched to. | Y11S3+ |
+| `scoreChanges` | Every change of a player's score, with what it was probably for. | Y11S3+ |
+| `reinforcements`, `barricades` | Who put up what, where, when and on which wall, hatch, door or window; when a reinforcement was opened, and how a barricade was destroyed. | Y11S3+ |
+| `destruction`, `surfaces`, `breaches` | What damaged the map and its panels, bullets apart; the holes that left (derived); every breach device with what became of it. | Y11S3+ |
+| `areas`, `environment`, `lightScreens` | Smoke, fire, gas and swarm areas with their source and owner; gas pipes, fire extinguishers and metal detectors set off; the light screens of Sens. | Y11S3+ |
+| `matchFeedback[].inArea`, `hits[].inArea`, `hits[].gadgetOwner`, `shots[].throughSmoke`, `effects[].jammer` | The area a victim stood in, the owner of the barbed wire that hurt, whether a shot passed through smoke, and whose Signal Disruptor jammed a player. All derived, each with its source. | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
 | `activity` | Who carried the defuser, plants and disables with their outcome, what each player held, reloads and ability signals. See [Activity](#activity). | Y11S3+ |
 | `movement` | With `--movement`: position, view direction, stance, lean, aiming, gait, rappel, falls, what each player looked through and what they placed. See [Movement](#movement). | Y11S3+ |
@@ -98,7 +105,7 @@ Every round also says where it came from and how far it can be trusted:
 | `replay.parser` | Parser version and the decoder profile and revision chosen for the build. A decoding fix bumps the revision of the profiles it touches, so stored rounds with an older `(decoder, decoderRevision)` than `--decoders` lists for their build are the ones to re-parse. `untestedBuild` flags builds newer than any the decoders were checked against (9883691, 9901603 and 9918362, all `Y11S3_Alpha04`). |
 | `replay.container` | Y8S4+: the streams the round was recorded in (id, name hash, role where known, frames covered, snapshot blocks, record count), the compressed blocks, `recordingId`, and `complete`, false when the game did not finish writing the file. See [File format notes](#file-format-notes). |
 | `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What a replay never records (text feed messages, from Y9S1) is `notInVersion`, and a player who never spawned has no body to link, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. Of the 167 real rounds in one `MatchReplay` folder, the 6 untrusted ones were 3 unfinished files and 3 rounds that were not played out (no result). |
-| `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
+| `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `skips` lists moments the game moved on by more than the recording's clock did (Y11S3; see [File format notes](#file-format-notes)). `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
 | `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes and the stream it was seen in, known or not. `unknownStreams` lists streams whose role is unknown and `streamsNotSeen` known ones the replay lacks, so a stream or field added by a patch stands out. |
 | `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. The game writes `isspectator` only for spectators, so it reads `false` when absent. `matchResult` appears only on the round that ends the match, as the result of the team numbered 1 (`teams[].color`): 2 won, 1 lost, 7 the game ended the match with no winner. |
 
@@ -225,7 +232,7 @@ What the file does not hold, after searching every stream:
 - **The body part of a hit.** A hit says limb or not. A headshot is known only for a kill, from the kill feed, so a headshot rate over all hits cannot be had.
 - **Who fired the bullet that hit.** Neither the hit nor the damage names the shooter; `shooter` is matched by ray and says so (`shooterSource`).
 - **Melee swings and melee hits on players.** See [Melee and shields](#melee-and-shields).
-- **A detonation.** A thrown object is removed; nothing says it went off.
+- **A detonation.** A thrown object is removed; nothing says it went off. `gadgets[].end` says `wentOff` for the types that end no other way, which is inferred (see [Gadgets, world and destruction](#gadgets-world-and-destruction)).
 
 ### Weapon handling
 
@@ -273,6 +280,7 @@ Over those rounds and every eighth real round, each of 12,180 consecutive drops 
 | `shots[].slot`, `weapon` | The loadout slot that fired: `primary` or `secondary` for a gun, `ability` or `gadget` for a device that shoots (Twitch's drone, a bulletproof camera). `weapon` is the item in it as `{id, name}`, the id `loadouts` and the kill feed use. |
 | `shots[].origin`, `direction` | The muzzle in map coordinates (metres, z up) and a unit vector. |
 | `shots[].distance`, `eyeDistance` | Metres to what the bullet struck first, from the muzzle and from the shooter's eye. |
+| `shots[].throughSmoke` | `true` when that path passes through a smoke cloud of `areas[]`. Derived: the cloud's radius is assumed. Left out otherwise. |
 | `bulletHits[].victim`, `position` | The player struck and where, in map coordinates. |
 | `bulletHits[].damage`, `limb`, `result` | Health taken, whether an arm or leg was struck, and `alive`, `down` or `dead` after it. Absent for a bullet in a body that was already down or dead. |
 | `bulletHits[].shooter`, `shooterSource`, `shot` | Who fired, how that is known (`ray`), and the index of the shot in `shots`. Absent when no shot fits. |
@@ -280,7 +288,7 @@ Over those rounds and every eighth real round, each of 12,180 consecutive drops 
 How they are found:
 
 - **Shots.** In the `movement` stream a gun's `607385fe` update ends in a list of events. Event `06` (63 bytes) is the gun firing: muzzle position, direction, and the distance to the impact from the eye and from the muzzle. The game repeats the event in every update while an automatic gun fires, and a player's own recording repeats each about 16 times, so a shot is a run of events of one gun with the same direction and distance. A shotgun writes one event per shell. The gun is linked to the body that carries it and the body to its player, as loadouts are.
-- **Hits.** A bullet striking a body spawns an effect in the `FXChannel` stream (`f5ee6a3d`): asset `d5 6d 41 58`, the body as its target, and where it struck in parameter `56 95 b5 31`.
+- **Hits.** A bullet striking a body spawns an effect in the `FXChannel` stream (`f5ee6a3d`): asset `d5 6d 41 58`, the body as its target, and where it struck in the vector parameter `56 95 b5 31`. The stream's records are read whole, section by section (see [The world](#the-world)).
 - **Damage.** The update of the body that took the damage ends in a 24-byte block: the health left as a share of the maximum, a damage multiplier (1.0, about 0.75 for a limb), the state after (1 alive, 3 down, 4 dead) and the damage type (0 for a bullet). `damage` is the drop of that share since the body's block before, times the player's maximum health.
 - **Shooter.** Nothing names it. `shooter` is the player whose shot passes within 0.6 m of the hit at about that time.
 
@@ -300,7 +308,7 @@ In the test rounds 133 of 155 guns that fired agree exactly with the HUD's count
 - A shell is one shot, and of its pellets in one body only the first carries the damage.
 - Launcher abilities drop ammunition without a fire event; their rounds are in `throws`.
 - Fire events and damage blocks are found by their shape at the end of a message; what precedes them in the message is not decoded.
-- Bullets that hit walls are in the `DecalChannel` stream and are not output, so a hit through a wall is not marked.
+- Bullets that strike a destructible wall, floor or barricade leave a record in its damage list, with the shooter's body: they are counted in `surfaces[]` (see [Destruction, surfaces and breaches](#destruction-surfaces-and-breaches)) and not listed one by one. The marks of `DecalChannel` are not read. A bullet hit on a player is still not marked as having gone through a wall.
 
 ### Throws and launches
 
@@ -314,12 +322,12 @@ In the test rounds 133 of 155 guns that fired agree exactly with the HUD's count
 | `id`, `name` | The item, as `loadouts` names that slot. Launcher ammunition has only a `name`, from a table, marked `inferred: true`. |
 | `subMunition` | `true` for what another object let go: Candela charges, cluster charge pucks, Kawan swarms. |
 | `origin` | Where it left the hand or muzzle, in map coordinates (metres, z up). |
-| `direction`, `speed` | Unit vector and metres a second of the first full step of the flight. |
+| `direction`, `speed` | Unit vector and metres a second of the first full step of the flight. Absent for an object that stuck to something within its first step. |
 | `path` | `[seconds since release, x, y, z]`, thinned to at most 60 points. |
 | `end`, `flightTime` | Where the flight stopped and how long it took. |
 | `ended`, `endedAfter` | `deleted` (the game removed the object) or `returned` (taken back into its pool), and seconds since the release. Absent when it was still there at the end of the recording. |
 
-How it is found: the `movement` stream creates each object with a `617385fe` message that lists its component classes. Everything a player can let go of has a component of class `8490f616` in its `607385fe` updates: a `u8` mask, then a `u16` (bit 01), the owner's `playerid` (02), the owner's alliance (04) and a flag (08) that is 1 once the object is released and 0 when it is taken back. A throw is the update that sets the flag to 1. That message carries the release position, and each update after it one position, about 30 a second. The game writes no velocity, so direction and speed come from the second and third position. The item is the slot of the thrower's body (`PrimaryGadget`, `SecondaryGadget`, `Drone`) whose asset equals the object's. Launcher ammunition is in no slot and is named by a table of 20 assets, each assigned to the launcher of the only operator who fires it. A drone is driven straight after it lands, so its path is cut at the landing. Objects are pooled and created under the map, so the position an object is created at is not where it was thrown from.
+How it is found: the `movement` stream creates each object with a `617385fe` message that lists its component classes. Everything a player can let go of has a component of class `8490f616` in its `607385fe` updates: a `u8` mask, then a `u16` (bit 01), the owner's `playerid` (02), the owner's alliance (04) and a flag (08) that is 1 once the object is released and 0 when it is taken back. A throw is the update that sets the flag to 1. That message carries the release position, and each update after it one position, about 30 a second. The game writes no velocity, so direction and speed come from the second and third position; the first step starts at a position that can be a frame old and is no measure. An object thrown at something an arm away sticks within that first step, and its next positions are it settling by millimetres: when the second step has less than a twentieth of the first step's speed, the throw has no direction and no speed. The item is the slot of the thrower's body (`PrimaryGadget`, `SecondaryGadget`, `Drone`) whose asset equals the object's. Launcher ammunition is in no slot and is named by a table of 20 assets, each assigned to the launcher of the only operator who fires it. A drone is driven straight after it lands, so its path is cut at the landing. Objects are pooled and created under the map, so the position an object is created at is not where it was thrown from.
 
 | | Test rounds (10) | Real rounds (167) |
 |---|---:|---:|
@@ -327,11 +335,11 @@ How it is found: the `movement` stream creates each object with a `617385fe` mes
 | Count drops of hand-thrown items with a release at most 1.1 s before | 168 of 168 | 2,362 of 2,366 |
 | Count drops of launchers with a release | 48 of 48 | 367 of 371 |
 
-The count drops 0.38 s after the release (median). Grenades in free flight fit a parabola of 9.3 m/s�.
+The count drops 0.38 s after the release (median). Grenades in free flight fit a parabola of 9.3 m/s².
 
 - `ended` is the object being removed. For a grenade that is within a frame or two of it going off; for a gadget it may be minutes later.
 - No release was found for Thatcher's EMP grenade.
-- Gadgets that are placed, not thrown (barbed wire, deployable shields, breach charges, cameras on walls), are another class (`4c60869a`) and are not covered.
+- Gadgets that are placed, not thrown (barbed wire, deployable shields, breach charges, cameras on walls), are another class (`4c60869a`) and are in `gadgets[]`, as is every thrown gadget that stays where it lands (see [Gadgets](#gadgets)).
 - A few pooled sub-munitions are released without ever being given an owner (8 in the real rounds); they are left out and counted in `decodeStatus.throws`.
 - Both of Capitao's bolts share one name, as do both of Zofia's grenades: which asset is which type is not known. Four assets seen in real rounds have no name.
 - Drones report the 15.9 m/s they leave the hand with.
@@ -341,12 +349,12 @@ The count drops 0.38 s after the release (median). Grenades in free flight fit a
 
 `meleeHits` lists every melee hit on a barricade or a destructible part of the map; `shieldActions` lists what players did with a held shield. Both come from the `movement` stream.
 
-Anything that can be damaged carries a damage list in its update messages: a `u32` count, then one entry per hit. An entry is a kind byte (0 melee, 1 bullet), the hit point in the object's own space, the body that did it, a damage id and a list of impacts; an entry of the single byte `fe` says the object is destroyed. A melee hit is an entry with damage id 34118943362.
+Anything that can be damaged carries a damage list in its update messages: a `u32` count, then one entry per hit. An entry is a kind byte (0 for anything that is not a bullet, 1 for another player's bullet, 2 and 3 for the recording player's own bullet as their game predicted it and as it was confirmed), the hit point in the object's own space, the body that did it, a damage id and a list of impacts; an entry of the single byte `fe` says the object is destroyed. A melee hit is an entry with damage id 34118943362.
 
 | Key | What it holds |
 |---|---|
 | `meleeHits[].username` | The player whose body the entry names. |
-| `target`, `object` | `barricade`, `mapObject` (a wall, hatch or prop: an id that is the same in every round on the map) or `entity` (another entity that takes damage), and the id of what was hit. The file does not say whether a map object is a wall, a hatch or a prop. |
+| `target`, `object` | `barricade`, `mapObject` (a wall, hatch or prop: an id that is the same in every round on the map) or `entity` (another entity that takes damage), and the id of what was hit. The file does not say whether a map object is a wall, a hatch or a prop; `destruction[]` gives a kind from a catalog. |
 | `hit` | Which melee hit on that object it is, from 1, starting over once it broke. The game's own counter also counts bullets. |
 | `broke` | The hit destroyed the barricade. A barricade takes three hits; a reinforced one took ten. |
 | `position` | Where the hit landed, in map coordinates (`point`, relative to the object, when the object's place is not known). |
@@ -423,7 +431,7 @@ Every hit on a player is in the movement stream, on the victim's body. `hits[]` 
 
 - About 1.3% of the health losses the HUD shows have no hit found for them.
 - **Body part is not recorded.** A kill's `headshot` is; for other hits a `multiplier` near 0.75 fits a limb hit, which is unconfirmed.
-- **Whether a hit went through a wall is not recorded.**
+- **Whether a hit went through a wall is not recorded.** A fire or gas hit names the area the victim stood in (`inArea`), and a barbed wire hit the owner of the nearest wire (`gadgetOwner`); both are derived (see [What is joined onto other events](#what-is-joined-onto-other-events)).
 
 ### Health, overheal, armor and heals
 
@@ -444,7 +452,7 @@ The kinds are inferred from those signs, and **the giver is inferred too**: the 
 
 ### Status effects
 
-Each player's HUD keeps a list of the effects on them. `effects[]` has one entry per stretch: `username`, `type` (the game's number), `name`, `buff` (true for the player's own or a teammate's ability), when it started and `seconds`. An effect names neither the gadget nor the player behind it.
+Each player's HUD keeps a list of the effects on them. `effects[]` has one entry per stretch: `username`, `type` (the game's number), `name`, `buff` (true for the player's own or a teammate's ability), when it started and `seconds`. An effect names neither the gadget nor the player behind it; for a jammed player (type 8), `jammer` is the owner of the nearest Signal Disruptor, with `jammerSource: "nearest"`.
 
 The numbers are the game's; **the names are inferred** from which operator was in every round a type showed up in:
 
@@ -556,6 +564,263 @@ Ability signals:
 Checked on the ten test rounds and 167 real ones: only attackers carry the defuser and never two at once, every plant starts with the carrier, and every plant or disable the kill feed completes has a `Completed` interaction by the same player.
 
 Not recorded: what a player interacts with beyond the defuser. No per-player property names an interaction or its progress. Reinforcing, barricading and placing come from the movement stream (`movement.placements`, `deploying`); a revive shows as `doing: reviving` on both players, and the state stream names no reviver.
+## Gadgets, world and destruction
+
+From Y11S3, full reads of files the game finished writing carry what was put into the world and what happened to it. The `movement` stream is read once into a list of every entity and map object with what its updates said over time, and the `FXChannel` stream once into a list of effects; everything below is read from those two lists and the HUD. Numbers are from the 10 test rounds and from the 175 rounds of a real `MatchReplay` folder (15 maps) that have a world.
+
+| Key | What it holds | How |
+|---|---|---|
+| `gadgets[]` | Every gadget object: what, whose, where, when, its states, and how it ended. | Read; the name from the loadout slot or a table; who destroyed it inferred |
+| `mapCameras[]` | The map's default cameras, with when each was destroyed. | Read |
+| `deviceRemovals[]` | Drones and cameras destroyed, with who and how. | The event read; who and how inferred |
+| `gadgetStatuses[]`, `trapTriggers[]` | Statuses and trap triggers of things that are no entry of `gadgets[]`. | See [What happens to gadgets](#what-happens-to-gadgets) |
+| `scoreChanges[]` | Every change of a player's score. | Read; the reason inferred |
+| `reinforcements[]`, `barricades[]` | Every reinforcement and barricade: who, where, when, on what. | Read; a removal by hand by proximity |
+| `destruction[]` | What damaged the map and its panels, bullets apart. | Read; what a map object is from a catalog |
+| `surfaces[]` | Holes and patches of bullet holes. | Derived |
+| `breaches[]` | Every breach device and what became of it. | Read; what stopped one is a guess |
+| `areas[]` | Smoke, fire, gas and swarm areas. | Read; the owner by proximity, a cloud's radius assumed |
+| `environment[]` | Gas pipes, fire extinguishers and metal detectors set off. | Read; which object and who by a table or by proximity |
+| `lightScreens[]` | The light screens of R.O.U. Projector Systems. | Read; the owner by proximity |
+
+Nothing inferred is given as read: an inferred value has a field next to it that says where it is from (`bySource`, `meansSource`, `causeSource`, `usernameSource`, `kindSource`, `radiusSource`, `inAreaSource`, `jammerSource`, ...), or `inferred: true` or `derived: true`.
+
+### The world
+
+A snapshot or record of the `movement` stream is a `u16` count and that many messages, `u64 object, u32 size, payload`. A payload is one of four:
+
+```text
+617385fe create  +4 u64 id, +16 3 x f32 position, +28 4 x f32 rotation, +45 u64 archetype,
+                 +53 u32 n, n class hashes, u64 asset, u32, u32 count, count x {u64 item, slot hash, u32}
+627385fe create of a map object: the same with one class and no slots, 131 bytes
+637385fe delete
+607385fe update  u8 mask
+  mask & 80        u8 sub, then in this order
+     sub & 01      f32 x, y, z (metres, z up), u32 0
+     sub & 02      f32 x, y, z, w rotation quaternion
+     sub & 04      u8 live: 1 while the object is in use
+     sub & 08      u16 flags
+     sub & 10      u8 n, n x attach or detach operations
+  mask & (40 >> i) the component of class i of the create message
+```
+
+The `u16` mask the sections above describe is these two bytes read together. `sub` `1f` is the full state an object is created with. The game creates what a round may need long before it is used, at (0, 0, -100), and moves an object to its place when a player uses it.
+
+| Class | Component |
+|---|---|
+| `4c60869a` placed | `u8 m`; `01`: `u16` type index, `u8` variant; `02`: `u64` playerid of who places it; `04`: `u64` the object it is fixed to |
+| `8490f616` owner | `u8 m`; `01`: `u16` type index; `02`: `u64` playerid; `04`: `u32` alliance; `08`: `u8` released (1 out of the hand, 0 taken back) |
+| `513b13b2` state | `u8 m`; `01`: `u8`; `02`: `u8`; `04`: a state machine's blob, a hash and the state |
+| `587f5a72` device | A camera or a drone: its own id, field of view, and in its full form a destroyed byte, a captured byte and the object it is mounted on |
+| `6ea51c35` damage | `u32 count`, then per entry `fe` (the object is destroyed) or a record of 109 bytes and 40 per impact |
+
+A component of any other class has no known size: the walk of a message stops there and keeps what it read, which happens in about one update in fifteen. A damage record holds a kind byte (0 not a bullet, 1 another player's bullet, 2 the recording player's own bullet as their game predicted it, 3 the same bullet confirmed), the point struck in the object's own space, the body or gadget that did it, a damage id that says what did it, and the impacts with their normals.
+
+A record of `FXChannel` is a `u8` mask and one section per set bit, each a `u32` count and its entries: `01` spawn (36 bytes: the effect asset, the object it is attached to, an instance number, the object it plays on), `04` int, `08` float, `10` vector and `20` quaternion parameters of an instance, `02` stop, `40` a list of points (the cells of a fire, gas or swarm area), `80` sound. The sections come in that order, not in the order of the bits.
+
+| | Test rounds (10) | Real rounds (175) |
+|---|---:|---:|
+| Updates of followed objects read | 1,028,173 | 13,850,502 |
+| Updates that did not hold what their mask promises | 0 | 0 |
+
+Every effects record of those rounds (422,731) reads to its last byte.
+
+### Gadgets
+
+A placed gadget is an entity with the placed component that is no panel and not the defuser. A thrown one has the owner component and one of three class lists; drones have more classes and stay in `throws`. One entity can be several gadgets in a round, one after the other.
+
+| Key | What it holds |
+|---|---|
+| `entity` | The entity's id, in hex. |
+| `kind` | `placed` or `thrown`. |
+| `typeIndex`, `asset` | The type index its component states, and the object's asset id. |
+| `name`, `nameSource`, `inferred`, `slot` | The name of the owner's loadout slot whose asset is the object's (`slot`), else the asset's row in a table of 228 assets (`table`), else the type index's row in a table of 72 (`typeIndex`). `inferred` marks a name no loadout slot ever gave: what a launcher fires and what a gadget leaves behind. |
+| `username`, `usernameSource` | The player its component names. The expanded Kiba Barrier, the posts of an R.O.U. Projector System and the deployed D.O.M. panel name nobody and take the owner of the nearest thrown object that left them behind (`nearest`, with `parent`). |
+| `position`, `rotation`, `origin` | Where it was deployed or came to rest, and where its placement started or it left the hand. |
+| `host`, `hostKind` | The object it is fixed to, and `reinforcedWall`, `reinforcedHatch` or `barricade` when that is a panel. |
+| `placing`, `released`, `deployed`, `rested` | When the placement started or it left the hand, when it went live, when a thrown one came to rest. |
+| `cancels` | Placements of this object called off before this one. |
+| `states[]` | Each state of its state machine: the names `Invalid`, `Closed`, `Opening`, `Opened`, `Closing`, `Idle`, `InAir`, `Landing` where the state is the CRC-32 of one, else the four bytes. |
+| `statuses[]`, `triggers[]` | What was put on it, and each time it went off as a trap (below). |
+| `end` | How it left play (below). |
+
+A count dropping in the HUD (`loadouts[].ability.uses`, `gadget.uses`) says a gadget was used; the object says it was deployed. In the test rounds every one of the 118 count drops of a placed gadget has exactly one object of that player and name, deployed from 0.8 s before the drop to 0.3 s after it (an Armor Pack's count drops up to 2.1 s after).
+
+| | Test rounds | Real rounds |
+|---|---:|---:|
+| Gadgets | 499 | 5,563 |
+| Placed / thrown | 205 / 294 | 2,022 / 3,541 |
+| Named by the loadout slot / by the table | 269 / 230 | 4,092 / 1,471 |
+| With an owner | 499 | 5,549 |
+| Fixed to a reinforcement or a barricade | 18 | 72 |
+
+**How a gadget ended.** `end.signals` is what the entity showed, read: `returned` (the owner flag back to 0), `notLive`, `broken` (an `fe` entry in its damage list), `destroyedFlag` (a camera's), `inert` (flags `4000` on barbed wire or a Welcome Mat, which stay where they are), `deleted`, `pooled`. `end.goneAfter` is the seconds from the first signal to the object going. The same signals mean a detonation for one type and a destruction for another, so by themselves they give `end.how` as `presentAtEnd`, `destroyed` (`broken`, `destroyedFlag`, or barbed wire gone inert), `wentOff` (a Welcome Mat gone inert), `pickedUp` or `removed`.
+
+`end.cause` then says more, and where it is from (`causeSource`):
+
+| `cause` | `causeSource` | Told by | Test | Real |
+|---|---|---|---:|---:|
+| `destroyed` | `score` | An opponent's score rises by the gadget's points as it goes (below). | 57 | 723 |
+| `destroyed` | `signals` | Read: the destroyed flag, an `fe` entry, a wire gone inert, with no scorer. | 1 | 18 |
+| `intercepted` | `adsFired` or `score` | A projectile deleted as an Active Defense System fires. | 0 | 9 |
+| `detonated` | `type` | A grenade, charge or canister deleted and nothing else; a Razorbloom past `Opening`. | 100 | 874 |
+| `triggered` | `type` or `signals` | A trap deleted without first going out of use; a Welcome Mat gone inert. | 2 | 88 |
+| `used` | `type` | A Mag-NET deleted and nothing else. | 3 | 55 |
+| `pickedUp` | `hudGadgetState` | The HUD's state of one of the owner's gadgets of that name goes back to 0. | 0 | 24 |
+| `roundEnd` | `time` | Deleted in the last second of the recording. | 0 | 7 |
+
+A cause turns a `how` of `removed` into `destroyed`, `wentOff` or `pickedUp`, with `end.source` `inferred` unless the cause was read from the signals. A gadget with no cause keeps what the signals said: 211 ends in the test rounds and 1,683 in the real ones stay `removed`. Among those are the flash charges of a Candela, the pellets of an X-KAIROS and the posts of a light screen, for which no rule is written.
+
+**Pick-up has no byte of its own.** A gadget taken back shows the same `notLive` and delete as one destroyed. `pickedUp` with `source: inferred` and no cause is a placed gadget deleted 0.7 to 1.1 s after it went out of use, the time it takes to pick one up (21 in the real rounds); the HUD rule above found 24.
+
+### What happens to gadgets
+
+**Who destroyed a gadget is not in the file. There is no feed for it.** What is read is the scoreboard: `MatchScore` on each player's scoreboard object, one total per frame. `scoreChanges[]` lists every change as `username`, `delta`, `total`, and a `reason` with `reasonSource: "coincidence"`: what else happened in the same frames (a kill, an assist, a gadget deployed, a reinforcement, a gadget destroyed, a trap going off). 202 of 1,015 changes in the test rounds and 2,635 of 14,740 in the real ones have no reason.
+
+`by` with `bySource: "score"` is the player whose score rises by the gadget's points from 0.25 s before to 0.13 s after the removal: 10 for most gadgets, 20 for a Black Eye, Welcome Mat or Claymore, 5 for a T.R.I.P. Connector, and a teammate's -10 first (`friendly`). One write pays for as many removals as its amount covers. When more removals were in the window than it pays for, those it took say `ambiguous`.
+
+| | Test rounds | Real rounds |
+|---|---:|---:|
+| Gadgets with a scorer | 57 | 724 |
+| Of those `ambiguous` / `friendly` | 9 / 4 | 42 / 50 |
+| Drones and cameras that say destroyed, with a scorer | 62 of 62 | 634 of 659 |
+| Removals with a scorer where a shot of anyone passes the gadget: the scorer is among the shooters | 87 of 89 | 947 of 959 |
+
+That last row is the check on the rule: shots are read from another part of the file, and in 1,034 of 1,048 cases (98.7%) the player the scoreboard paid is one of those whose shot passed within 0.6 m of the gadget in the 0.45 s before. In 13 of the other 14 the shooter was the scorer's teammate.
+
+`means` says how: `bullet` with `meansSource: "shotRay"` when a shot of that player passes the gadget (with `weapon`), else `explosion` with `meansSource: "proximity"` when an explosive of theirs ended within 0.35 s and 8 m. Of the gadgets with a `by`, 26 and 13 in the test rounds and 363 and 200 in the real ones have one; 18 and 169 have none. A gadget destroyed by a cause that gives no score (its owner's own explosive, fire) has no `by`.
+
+Drones and the cameras of the map are no entries of `gadgets[]`. Their removals are `deviceRemovals[]` (65 and 674), the same fields with the entity, its `name` and its owner. A removal of an entity that is no gadget and has no known cause is left out and counted in `decodeStatus.gadgetEvents` (25 and 238): swarms, panes, pooled objects.
+
+**Statuses** are effects the game spawns on a gadget, until their stop: `empDisabled`, `frozen`, `hacking`, `hacked`, `caught` (by a Mag-NET), `adsFired`; `captured` is the alliance of the owner component being rewritten. Which effect asset is which status is inferred from who is in every round it shows in. `by` is the player who scored for it (`bySource: "score"`): 15 of 24 in the test rounds, 249 of 368 in the real ones. A status of something that is no gadget of `gadgets[]` (a drone, a camera's mount: 2 and 35) is in `gadgetStatuses[]` with its entity.
+
+**Traps.** `gadgets[].triggers[]` has one entry per time a trap went off: `marker` (what says so), `victims[]`, `nearestEnemy` with its distance, and the `points` its owner scored.
+
+| Trap | Marker | Test | Real |
+|---|---|---:|---:|
+| Razorbloom Shell | Its state machine goes from `Closed` to `Opening` | 8 | 73 |
+| Banshee Sonic Defense | An effect on it | 5 | 50 |
+| Proximity Alarm | An effect on it | 0 | 45 |
+| F-NATT Dread Mine | The HUD's list of Fenrir's mines: `State` becomes 3 | 3 | 45 |
+| Gu Mine, Entry Denial Device, Claymore, Grzmot Mine | Deleted without first going out of use | 2 | 84 |
+| Welcome Mat | Flags `4000` | 0 | 4 |
+
+A victim is a hit or a status effect of the type the trap deals, in the same frames (`victimSource: "time"`): 11 of 18 triggers in the test rounds and 208 of 301 in the real ones name one. A mine of Fenrir's list that no entity was matched to is in `trapTriggers[]` (4 in the real rounds).
+
+### Reinforcements and barricades
+
+Whatever closes a wall, a hatch, a door or a window is one kind of entity: the placed and the damage component and two empty slots. Its asset says which panel it is. A panel starts with its first position that is not the pool, with the playerid of who places it; it is complete at `live` 1, and the object it is fixed to (`host`) is written then or up to four frames later. One that went back to the pool before that was called off (`cancelled`); one placed with no owner is the map's own (`default`).
+
+| | Test rounds | Real rounds |
+|---|---:|---:|
+| Reinforcements completed (wall / hatch) | 91 (68 / 23) | 1,292 (1,198 / 94) |
+| Called off | 2 | 42 |
+| Opened | 27 | 229 |
+| Barricades the map placed | 180 | 3,295 |
+| Barricades players placed (Castle's) | 32 (0) | 134 (79) |
+| Barricades destroyed | 101 | 685 |
+
+A wall reinforcement takes 4.08 s from start to complete (1,245 of 1,266 within 0.1 s of that), a hatch reinforcement 4.41 s, a barricade 2.53 s and Castle's 2.82 s. `width` is by the asset and inferred (`widthInferred`): nine assets, taken to run from 1.6 to 2.4 m.
+
+**Reinforcements are a pool of 10 a team shares**, not two per player: no team put up more than 10 in any of the 185 rounds, 52 teams put up exactly 10, and one player put up three in a test round. `reinforcements[].opened` is when the panel's intact flag was cleared (flags `8000` to `0000`); a hatch reinforcement that is opened also gets an `fe` entry (`destroyed`).
+
+How a barricade ended is the last record of its damage list up to its `fe` entry, at most 2 s old: `bullet`, `melee`, `explosion`, `gadget` (with the gadget and its owner) or `other`, all with `source: "read"` (100 of 101 in the test rounds, 574 of 685 in the real ones). With no such record the barricade was taken down by hand or gone through, which the file does not say: the nearest body within 2.5 m is named with `source: "proximity"`, as `removed` when it stands 0.3 to 0.5 m from the panel and `brokenThrough` otherwise (1 and 111).
+
+### Destruction, surfaces and breaches
+
+`destruction[]` has one entry for the records of one instigator and damage id that follow each other within 0.15 s: `cause` (`id`, `name`, `category`), `username`, the `instigator` when it is a gadget, the `position` of the first record, and `objects[]` with `kind`, `impacts`, and `opened` or `destroyed` when that followed within 0.35 s. `username` is the player whose body the record names, or the owner of the gadget it names.
+
+- **Bullets are left out**: `shots` has them. Their impacts are counted in `surfaces`.
+- **Debris is left out.** Records of the cause `Physics collision (debris, props)` name no player; they are 508 of 980 events in the test rounds and 2,717 of 7,904 in the real ones, and `decodeStatus.destruction` counts them.
+- **What a damage id stands for** is a table built from 184 rounds. A name confirmed by the entity or player that did it is read; one worked out by exclusion has `inferred: true`.
+- **Hole size is not in the file.** A record gives impact points and normals, no extent.
+
+**Wall, floor or hatch is not in the file either.** A panel says what it is by its asset (`reinforcedWall`, `reinforcedHatch`, `barricade`). A map object does not: its `kind` comes with a `kindSource`.
+
+| `kindSource` | What it is | Objects of events, test | Real |
+|---|---|---:|---:|
+| `catalog` | A table of 2,483 objects of 15 maps, built from the impacts on each object over 184 rounds | 440 | 4,305 |
+| `impacts` | The vote of this round's bullet and melee impacts on the object, when four in five agree: a floor has impacts with a vertical normal in its own plane, a wall has them along one axis within its thickness | 24 | 540 |
+| `derived` | A hatch known by the record a hatch reinforcement leaves on the hatch under it | 8 | 19 |
+
+**`surfaces[]` is derived, every entry of it** (`derived: true`): the impact points of bullets and of causes that remove material, on walls, floors and hatches, put together when closer than 0.45 m in one plane. `width` and `height` are the extent of the points, not the size of a hole. The labels are this parser's rules of thumb with its own thresholds, not the game's:
+
+| Label | Rule | Test | Real |
+|---|---|---:|---:|
+| `verticalPlay` | On a floor: an explosive, breach or ability cause, a hatch that was destroyed, or 8 points and more | 80 | 744 |
+| `rotationHole` | On a wall: such a cause, or 12 points over 0.6 x 0.9 m and more, most of them by defenders | 84 | 414 |
+| `breach` | The same, most of them by attackers | 30 | 358 |
+| `murderHole` | On a wall: a melee hit, or 8 points within 0.6 m | 40 | 358 |
+| `bulletHoles` | Anything else of three bullet impacts and more | 321 | 2,230 |
+
+`breaches[]` has one entry per breach device: a charge a player places (Hard Breach Charge, Breach Charge, Exothermic Charge, S.E.L.M.A. Aqua Breacher), a breaching projectile (Ash, Zofia, Gonne-6, Kali), an X-KAIROS volley, or a run of Maverick's torch on one object. `outcome` is read: `detonated` (records name the device), `destroyed` (`live` back to 0 with no record), `removed`, `armedAtEnd`, `noDestruction`, `burned`. `affected[]` lists the objects its records landed on, `openedReinforcement` says one of them is a reinforcement it opened, and `reinforcedBy` names who had put that reinforcement up.
+
+| | Test rounds | Real rounds |
+|---|---:|---:|
+| Breach devices | 28 | 591 |
+| Detonated / burned | 25 / 0 | 369 / 173 |
+| Opened a reinforcement | 20 | 171 |
+| Destroyed before going off | 1 | 31 |
+| Of those, with a `stoppedBy` | 0 | 28 |
+
+Every Exothermic Charge (7) and X-KAIROS volley (4) of the test rounds went off and opened a reinforcement.
+
+**What stopped a breach charge is not written.** A charge that died without going off gets `near[]`: a Shock Wire or Electroclaw within 2.5 m, a defender's bullet within 1.3 m, an explosion within 3 m, each within 0.3 s. `stoppedBy` (`electricity`, `shot`, `explosion`) names one of those with `stoppedBySource: "proximity"`: 21, 3 and 4 in the real rounds. It is what was near, not what did it. With nothing of the kind near, nothing is named: the one destroyed charge of the test rounds, a Hard Breach Charge on a reinforced hatch that died 0.14 s after it was armed, has no `stoppedBy`.
+
+### Areas, environment and light screens
+
+An area is an effect with a position and no parent, of one of seven assets. It starts in the frame of its spawn and ends in the frame of its stop.
+
+| `kind` | From | Lasts | Test | Real |
+|---|---|---|---:|---:|
+| `smoke` | A smoke grenade or a smoke bolt | 14.0 s, 17.0 s | 5 | 77 |
+| `fire` | A Volcan canister, a Shumikha grenade, a fire bolt, a gas pipe, a Logic Bomb | 1.8 to 19.9 s | 33 | 207 |
+| `gas` | A Remote Gas Grenade | 9.8 s | 10 | 33 |
+| `swarm` | A Kawan hive | 15.8 s | 13 | 79 |
+| `extinguisher` | The burst of a fire extinguisher | 7.0 s | 23 | 119 |
+
+- **Fire, gas and swarm areas carry their cells** (`points`), which the game writes again as the area spreads; the last list is kept. Their `source` is told by the entity without classes the game puts at the effect's place in the same frame: all 56 in the test rounds and all 319 in the real ones have one.
+- **Smoke has no size in the file.** A smoke cloud has no cells: `radius` is 3.0 m (2.5 m for an extinguisher) with `radiusSource: "assumed"`.
+- **Whose area it is, is not written with it.** `username` is the owner of the gadget that was within 0.5 m as the area started and was deleted just before (`usernameSource: "proximity"`), for a swarm the nearest owned entity within 1 m (`nearest`), for a Logic Bomb's fire the Dokkaebi whose ability count dropped 7.0 to 8.2 s before (`abilityUse`). All 56 areas that can have an owner in the test rounds and 318 of 320 in the real ones name one; the fire of a gas pipe and the cloud of a fire extinguisher have none.
+- **Who set off a Volcan canister** is the shooter of a shot that ended within 0.6 m of the fire in the second before (`triggerSource: "shotRay"`), else the thrower of an object that ended within 5 m (`explosion`).
+
+`environment[]` lists gas pipes blown up (5 and 76), fire extinguishers burst (23 and 119) and metal detectors sounding or switched off (75 and 139). A fire extinguisher is the map object its cloud is attached to, and who shot it the last body in its damage list (`bySource: "read"`). A gas pipe's explosion has no parent: the pipe is the map object a per-map table lists within 1.5 m (`objectSource: "table"`), else one found by its flags changing or by distance. Who walked through a metal detector is not written: `by` is the nearest body within 1.5 m (`bySource: "nearest"`).
+
+`lightScreens[]` groups the posts of an R.O.U. Projector System by the projector that rolled past as each light came up, and takes that projector's owner (`usernameSource: "proximity"`).
+
+### What is joined onto other events
+
+| Key | What it holds | Test | Real |
+|---|---|---:|---:|
+| `matchFeedback[].inArea` | On a kill or a death: the fire, gas or swarm area the victim's body was in, as `{area, kind, source, username}`, with `inAreaSource: "derived"`. The body is within 1.0 m of one of the area's cells, the cell from 1.0 m below it to 2.2 m above. | 2 of 66 | 11 of 1,270 |
+| `hits[].inArea` | The same for a fire or gas hit (type 36 or 9). | 24 of 24 | 86 of 92 |
+| `shots[].throughSmoke` | The bullet's path from the muzzle to what it struck passes within the assumed radius of a smoke cloud that is there. The burst of a fire extinguisher does not count. | 20 of 5,375 | 751 of 63,734 |
+| `effects[].jammer` | On a jammed player (type 8): the owner of the nearest Signal Disruptor within 3.5 m of the player or of a device of theirs, with `jammerSource: "nearest"`. | 5 of 5 | 218 of 218 |
+| `hits[].gadgetOwner` | On a barbed wire hit (type 12): the owner of the nearest wire in use within 1.5 m, with `gadgetOwnerSource: "nearest"`. | 12 of 14 | 42 of 45 |
+| `reinforcements[].opened`, `breaches[].reinforcedBy`, `gadgets[].hostKind` | See above. | | |
+
+`stats[]`, and the match totals, count per player:
+
+| Key | What it counts |
+|---|---|
+| `gadgetsDeployed` | Entries of `gadgets[]` that are in one of the player's loadout slots. What a launcher fires and what a gadget leaves behind is not counted. |
+| `gadgetsDestroyed` | Gadgets, drones and cameras of the other team the player is named for (`by`). Inferred, as `by` is. |
+| `gadgetsLost` | The player's own gadgets, drones and cameras that were destroyed, by anyone. |
+| `reinforcements`, `barricades` | Those the player completed. |
+| `breaches`, `breachesOpened` | Breach devices the player used, and how many opened a reinforcement. A soft wall has no flag that says it was opened, so a soft breach counts in `breaches` only. |
+| `trapsTriggered` | Times a trap of the player went off. |
+
+### Not recorded, or not decoded
+
+- **Who destroyed a gadget, and with what.** Inferred from the scoreboard and the shots, as above.
+- **Mute's jammer at work.** Nothing on a Signal Disruptor says what it jams. A jam shows only as the jammed player's effect; which jammer it is, is the nearest.
+- **Who a Grzmot Mine stunned, and what an Airjab or a Trax Stinger did to whom.** No marker was found. Jackal's scans show only as the tracked player's effects.
+- **What barbed wire hurt.** A wire has no marker as it hurts; a hit names the nearest wire.
+- **What stopped a breach charge, hole size, the size of a smoke cloud, whether a map object is a wall, and whether a gadget was picked up**: see above.
+- **Areas that were there when the recording started** are left out: when they started is not known.
+- **What some devices are.** Some entities that say destroyed and pay a scorer name no owner and are in no loadout slot (9 in the test rounds, 96 in the real ones, nearly all of type index 300); they are listed in `deviceRemovals[]` with their asset and no `name`.
+
+`decodeStatus` adds `world` (updates read), `gadgets`, `gadgetEvents` (removals, statuses and triggers, on a gadget or listed), `scoreChanges`, `panels`, `destruction`, `breaches`, `surfaces` (always `inferred`) and `areas`, each with a count and what was left out.
 
 ## Players and identity
 
@@ -661,12 +926,13 @@ block                        "CMPRV002" (stored as a u64), u32 raw size, u32 pac
 
 Decompressed, each snapshot is a u64 length and the snapshot. The main stream holds every stream's records, each a u32 frame, u32 size, u32 0 and the payload, so every packet belongs to a frame and the index gives its time. Reading only the header needs no decompression for Y8S4+ (`ReadMode::Header`); before Y8S4 everything is one zstd stream.
 
-- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. Only the first four and `TimelineChannel` are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
+- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects: spawns, their parameters, stops and the cells of areas), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. `WorldChannel` is the phase timer and nothing else: 5 to 7 records and 17 to 25 bytes in most rounds, each a mask byte, a `u32` timer in milliseconds and a `u16` phase flag (4 in prep, 8 in action, 16 once the round is decided). Read are `HUDChannel`, `EntityChannel`, `ControllerChannel`, `FXChannel` and `TimelineChannel`; `DecalChannel`, `SoundChannel`, `MarkerChannel` and `WorldChannel` are not. `movement` and `state` have a record at nearly every update, 35 ms apart.
 - **Recording ids.** Stream ids come from one counter per run of the game. A round takes its main id (`recordingId`) and one per stream, and the next recording starts right after, so a skipped id is a recording that was started and never saved. The folder name ends in the same run's process id.
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.
 - **Temporary files.** A current install has an empty `DissectTmp` folder next to `MatchReplay`, and the process id and stream id in the reported `.tmprec` names match what round files hold. No `.tmprec` file was available, so their contents are unchecked.
 - **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet).
+- **Skipped game time.** A recording can leave out game time without a gap in its frames: two or more players who were walking are, a tenth of a second later, metres further on than anyone can run. `timing.skips` lists each such moment with `at`, `until`, the `seconds` missing (the median of what the players' speed says) and how many `bodies` jumped; it is inferred from the bodies, and `decodeStatus.timing` is `partial` with it. 22 skips of 0.3 to 1.0 s in 12 of the 175 real rounds, none in the test rounds. Whatever is timed across one is that much shorter than it was: in the one round checked against other evidence a second is missing as action starts, a wall reinforcement that takes 4.08 s is up in 3.06 s, and two melee hits of one player are 0.76 s apart where the game allows no less than 1.02 s.
 - **Stray records.** Binary data between record runs can read as records. In one real round such a "record" covered a team object's first record and moved its properties to another object. Two rules reject them: an array record claiming an index of 65536 or more (real ones reach 64), and any record that does not name its object yet covers records that do (a `23` or `1b` and what follows) ending exactly where it ends.
 
 The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 2 ms of `endtime`. The header `datetime` is the recording PC's local time, not UTC.
@@ -710,4 +976,4 @@ Reproduce with `cargo build --release` and `R6_DISSECT=… REPLAY_TOOL=… bench
 
 `cargo test` checks the replays in `test_recordings/valid/` against facts known from the game, compares output against a `.rec.json` expectation where one sits next to a replay, and checks that everything in `test_recordings/invalid/` is rejected. It also re-packs a replay into the Y8S4+ chunked layout to cover that path. Set `R6_TEST_DATA` to test against another folder. Replay tests are skipped when the data is missing.
 
-Set `R6_MATCH_REPLAY` to a game `MatchReplay` folder to also check real match folders: file and folder names agree with the headers, every round lands in one session, nothing is found twice, and loadout counts add up. The folder changes as matches are played, so these tests check what holds for any such folder.
+Set `R6_MATCH_REPLAY` to a game `MatchReplay` folder to also check real match folders: file and folder names agree with the headers, every round lands in one session, nothing is found twice, loadout counts add up, and what holds for the gadgets, panels, destruction and areas of any round holds for each of them. The folder changes as matches are played, so these tests check what holds for any such folder.

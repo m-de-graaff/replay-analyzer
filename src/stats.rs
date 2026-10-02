@@ -64,6 +64,35 @@ pub struct PlayerRoundStats {
     /// Y11S3: health heals gave this player.
     #[serde(skip_serializing_if = "is_zero")]
     pub healing_received: u32,
+    /// Y11S3: gadgets of `gadgets` this player put out that are in one of
+    /// their loadout slots. What a launcher fires and what a gadget leaves
+    /// behind (a post, a pellet) is not counted.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_deployed: u32,
+    /// Y11S3: gadgets, drones and cameras of the other team this player is
+    /// named for destroying. Who destroyed a gadget is inferred from the
+    /// scoreboard (see [`crate::gadget_events`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_destroyed: u32,
+    /// Y11S3: this player's gadgets, drones and cameras that were
+    /// destroyed, by anyone.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_lost: u32,
+    /// Y11S3: reinforcements and barricades this player put up.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reinforcements: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub barricades: u32,
+    /// Y11S3: breach devices this player used, and how many of them
+    /// opened a reinforcement. A soft wall has no flag that says it was
+    /// opened, so a soft breach counts in `breaches` only.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub breaches: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub breaches_opened: u32,
+    /// Y11S3: times a trap of this player went off.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub traps_triggered: u32,
     /// Seconds spent on drones (any phase, own or a teammate's).
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
@@ -98,6 +127,22 @@ pub struct PlayerMatchStats {
     pub team_kills: u32,
     #[serde(skip_serializing_if = "is_zero")]
     pub healing_given: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_deployed: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_destroyed: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gadgets_lost: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reinforcements: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub barricades: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub breaches: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub breaches_opened: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub traps_triggered: u32,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
@@ -164,6 +209,59 @@ impl Round {
             s.health > 0 && s.recording_time.is_some_and(|t| t < time - 0.05)
         };
         player.samples.iter().rev().find(earlier).map(|s| s.health)
+    }
+
+    /// Y11S3: what each player put out, put up, broke and lost, from the
+    /// gadgets, panels and breaches of the round. `find` gives a player's
+    /// index in `stats`.
+    fn world_stats(&self, stats: &mut [PlayerRoundStats], find: &dyn Fn(&str) -> Option<usize>) {
+        use crate::gadget_events::{Cause, Verdict};
+        use crate::gadgets::How;
+        let mut count = |username: Option<&str>, field: fn(&mut PlayerRoundStats) -> &mut u32| {
+            if let Some(s) = username.and_then(find).and_then(|i| stats.get_mut(i)) {
+                *field(s) += 1;
+            }
+        };
+        // Who broke something of the other team's.
+        let breaker = |v: &Verdict| v.by.clone().filter(|_| !v.friendly);
+        for g in &self.gadgets {
+            let owner = g.username.as_deref();
+            if g.slot.is_some() && g.parent.is_none() {
+                count(owner, |s| &mut s.gadgets_deployed);
+            }
+            if g.end.how == How::Destroyed {
+                count(owner, |s| &mut s.gadgets_lost);
+            }
+            let by = g.end.verdict.as_ref().and_then(breaker);
+            count(by.as_deref(), |s| &mut s.gadgets_destroyed);
+            for _ in &g.triggers {
+                count(owner, |s| &mut s.traps_triggered);
+            }
+        }
+        if let Some(events) = &self.gadget_events {
+            for r in &events.removals {
+                if matches!(r.verdict.cause, Cause::Destroyed | Cause::Intercepted) {
+                    count(r.subject.username.as_deref(), |s| &mut s.gadgets_lost);
+                }
+                let by = breaker(&r.verdict);
+                count(by.as_deref(), |s| &mut s.gadgets_destroyed);
+            }
+            for t in &events.traps {
+                count(t.username.as_deref(), |s| &mut s.traps_triggered);
+            }
+        }
+        for r in self.reinforcements.iter().filter(|r| r.completed.is_some()) {
+            count(r.username.as_deref(), |s| &mut s.reinforcements);
+        }
+        for b in self.barricades.iter().filter(|b| b.completed.is_some()) {
+            count(b.username.as_deref(), |s| &mut s.barricades);
+        }
+        for b in &self.breaches {
+            count(b.username.as_deref(), |s| &mut s.breaches);
+            if b.opened_reinforcement == Some(true) {
+                count(b.username.as_deref(), |s| &mut s.breaches_opened);
+            }
+        }
     }
 
     pub fn winning_team(&self) -> usize {
@@ -251,6 +349,7 @@ impl Round {
                 }
             }
         }
+        self.world_stats(&mut stats, &find);
         for o in &self.observation {
             if let Some(i) = find(&o.username) {
                 if o.tool.is_drone() {
@@ -361,6 +460,14 @@ pub fn match_stats<'a>(rounds: impl IntoIterator<Item = &'a Round>) -> Vec<Playe
             s.revives_given += p.revives_given;
             s.team_kills += p.team_kills;
             s.healing_given += p.healing_given;
+            s.gadgets_deployed += p.gadgets_deployed;
+            s.gadgets_destroyed += p.gadgets_destroyed;
+            s.gadgets_lost += p.gadgets_lost;
+            s.reinforcements += p.reinforcements;
+            s.barricades += p.barricades;
+            s.breaches += p.breaches;
+            s.breaches_opened += p.breaches_opened;
+            s.traps_triggered += p.traps_triggered;
             s.drone_seconds += p.drone_seconds;
             s.camera_seconds += p.camera_seconds;
         }

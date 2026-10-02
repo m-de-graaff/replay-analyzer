@@ -35,6 +35,14 @@
 //!   death written through the down state is no longer a revive, and a
 //!   kill that ends the round is no longer a down; `damageTaken` counts
 //!   hits, so the killing blow is in and an overheal wearing off is out.
+//! - Y11S3 (profile Y9S4): the world of the movement stream and the effects
+//!   stream: gadgets with how they ended and who destroyed them, statuses,
+//!   trap triggers, score changes, reinforcements, barricades, destruction,
+//!   surfaces, breaches, areas, environment objects and light screens;
+//!   kills, hits, shots and effects name the area, wire or jammer they
+//!   were in; gadget, panel and breach counts in the stats; skips of game
+//!   time in `timing`. A throw that stuck in its first step has no
+//!   direction.
 
 use serde::Serialize;
 
@@ -120,7 +128,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 12,
+        revision: 13,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

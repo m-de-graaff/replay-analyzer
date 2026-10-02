@@ -286,6 +286,19 @@ pub struct Hit {
     /// Seconds since the recording started, to the frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording_time: Option<f64>,
+    /// A barbed wire hit (type 12): the owner of the nearest wire in use,
+    /// with `gadgetOwnerSource: nearest` (see [`crate::gadget_events`]).
+    /// Nothing marks a wire as it hurts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gadget_owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gadget_owner_source: Option<&'static str>,
+    /// A fire or gas hit (type 36 or 9): the area of `areas[]`
+    /// the victim's body stood in, with `inAreaSource: derived`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area: Option<crate::areas::InArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area_source: Option<&'static str>,
     /// Who the shot and aim rules name for a bullet, also when the timeline
     /// names the attacker: kept to measure the rules against the timeline.
     #[serde(skip)]
@@ -1122,6 +1135,10 @@ fn hits(
             phase: at.phase,
             elapsed: at.elapsed,
             recording_time: at.recording_time,
+            gadget_owner: None,
+            gadget_owner_source: None,
+            in_area: None,
+            in_area_source: None,
             estimate: guess.and_then(|(by, rule)| Some((name(by)?, rule))),
         });
     }

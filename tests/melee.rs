@@ -85,6 +85,7 @@ fn check(round: &Round, name: &str, counts: &mut Counts) {
         .map(|l| l.username.as_str())
         .collect();
     counts.rounds += 1;
+    let skips = round.timing.as_ref().map_or(&[][..], |t| &t.skips);
 
     let hits = &round.melee_hits;
     for w in hits.windows(2) {
@@ -160,9 +161,17 @@ fn check(round: &Round, name: &str, counts: &mut Counts) {
                 "{name}: {object} goes from {a:?} to {b:?}"
             );
             assert_eq!(a.target, b.target, "{name}: {object}");
-            // One player cannot swing again within 0.9 s.
+            // One player cannot swing again within 0.9 s of game time
+            // (1.02 s is the least in 524 pairs of 188 rounds). Where the
+            // recording skips game time between the two, the hits are
+            // that much closer on its clock than they were.
             if a.username == b.username {
-                let gap = seconds(b) - seconds(a);
+                let skipped: f64 = skips
+                    .iter()
+                    .filter(|s| s.at < seconds(b) && s.until > seconds(a))
+                    .map(|s| s.seconds)
+                    .sum();
+                let gap = seconds(b) - seconds(a) + skipped;
                 assert!(
                     gap >= 0.9,
                     "{name}: {object} hit twice in {gap:.3} s by {}",

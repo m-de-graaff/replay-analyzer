@@ -338,6 +338,14 @@ pub struct Effect {
     /// Still listed when the recording ended.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub open: bool,
+    /// Type 8 (jammed): the owner of the Signal Disruptor nearest to the
+    /// player or to a device of theirs, with `jammerSource: nearest` (see
+    /// [`crate::gadget_events`]). The file does not say which jammer it
+    /// is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jammer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jammer_source: Option<&'static str>,
 }
 
 /// A stretch in which the damage a player deals to teammates is turned
@@ -1078,6 +1086,8 @@ impl<'a> Tracker<'a> {
             start: self.stamp(l.frame, l.at),
             seconds: round_ms((end - start).max(0.0)),
             open,
+            jammer: None,
+            jammer_source: None,
         };
         if let Some(slot) = self.effects.get_mut(l.index) {
             *slot = Some(effect);

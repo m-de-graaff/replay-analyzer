@@ -4,12 +4,20 @@
 //! modelled as newtypes over the raw id so unknown values (new seasons) survive
 //! a round trip instead of failing to parse.
 
+mod map_tables;
+pub(crate) mod gadget_tables;
+pub(crate) mod damage_tables;
+pub(crate) mod map_tables_kinds;
+mod fx_tables;
 mod tables;
 
 use std::fmt;
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
+pub(crate) use map_tables::{PanelAsset, panel_asset};
+pub(crate) use fx_tables::{EnvObject, env_object, env_objects};
+pub use fx_tables::{FxAsset, fx_asset};
 pub use tables::{AttachmentInfo, attachment_info, item_kind, item_name};
 use tables::{MAPS, OPERATORS, PLAYLISTS, ROLE_IMAGES};
 

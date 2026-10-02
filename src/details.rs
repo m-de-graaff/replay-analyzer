@@ -175,6 +175,10 @@ pub struct ObservationSession {
     pub recording_time: Option<f64>,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub seconds: f64,
+    /// Y11S3: the entity id of the device, as `drones` and `cameras` give
+    /// it: the one the player table gave the player as the session started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// The equipment a player spawned with on one operator. Replays carry ids

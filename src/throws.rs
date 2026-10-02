@@ -459,7 +459,7 @@ fn flight(points: &[(f64, [f32; 3])], driven: bool) -> usize {
 
 /// `points` without those closer than [`STEP`] to the one kept before,
 /// and no more than [`PATH_POINTS`] of them. The first and last stay.
-fn thin(points: &[(f64, [f32; 3])]) -> Vec<(f64, [f32; 3])> {
+pub(crate) fn thin(points: &[(f64, [f32; 3])]) -> Vec<(f64, [f32; 3])> {
     let mut out: Vec<(f64, [f32; 3])> = Vec::new();
     for (i, p) in points.iter().enumerate() {
         let far = out.last().is_none_or(|l| distance(l.1, p.1) >= STEP);
@@ -488,7 +488,7 @@ fn round(v: f64, digits: i32) -> f64 {
     (v * scale).round() / scale
 }
 
-fn place(p: [f32; 3]) -> [f64; 3] {
+pub(crate) fn place(p: [f32; 3]) -> [f64; 3] {
     p.map(|v| round(f64::from(v), 3))
 }
 

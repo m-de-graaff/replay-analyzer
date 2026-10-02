@@ -621,12 +621,12 @@ impl PlayerTables {
 
 /// One player's entry in a table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TableEntry {
-    player_id: u64,
+pub(crate) struct TableEntry {
+    pub player_id: u64,
     /// The body reference, when the entry sets it; 0 takes the body away.
-    body: Option<u64>,
+    pub body: Option<u64>,
     /// The view reference, when the entry sets it; 0 for none.
-    view: Option<u64>,
+    pub view: Option<u64>,
 }
 
 /// Mask bits that each add one byte to an entry. `08` and `10` come with
@@ -645,7 +645,7 @@ const LIST_SET: u8 = 0x20;
 const MAX_LIST: usize = 16;
 
 /// The entries of a table, when `payload` is one to its last byte.
-fn table_entries(payload: &[u8]) -> Option<Vec<TableEntry>> {
+pub(crate) fn table_entries(payload: &[u8]) -> Option<Vec<TableEntry>> {
     let (&count, mut rest) = payload.split_first()?;
     let mut out = Vec::with_capacity(usize::from(count));
     for _ in 0..count {

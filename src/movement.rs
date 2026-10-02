@@ -63,6 +63,9 @@ const DRONE_CAMERA: Hash = [0x47, 0xE5, 0xF6, 0x00];
 const DEVICE: Hash = [0x58, 0x7F, 0x5A, 0x72];
 /// Class of whatever a player puts in place: it names the player.
 const PLACED: Hash = [0x4C, 0x60, 0x86, 0x9A];
+/// Class of the round's objective things: the defuser, which is also
+/// [`PLACED`], and the bombs of the map.
+const OBJECTIVE: Hash = [0xD0, 0xF6, 0x59, 0x29];
 /// Class of the section that names an object's player: [`BODY`]'s last.
 const IDENTITY: Hash = BODY[4];
 
@@ -485,6 +488,103 @@ fn device_update(classes: &[Hash], msg: &[u8]) -> (Option<[f32; 3]>, Option<u64>
     (out.position, player)
 }
 
+/// One update of the defuser, as far as it says anything. The defuser is
+/// created in the snapshot with the classes [`PLACED`] and [`OBJECTIVE`],
+/// at (0, 0, 0), where it stays while a player carries it.
+///
+/// ```text
+/// 4c60869a   <mask u8>  01 <u32>; 02 <playerid u64> who holds it
+///                       04 <object u64> what it sits on
+/// d0f65929   <mask u8>  01 <u8> a bomb: 1 on the round's two
+///                       02 <u8> a bomb: ff, and 0 once the round is decided
+///                       04 <u8> a bomb: its number, 1 or 2
+///                       08 <u8> state bits, the same on the defuser and
+///                               the two bombs: 08 lying in the world,
+///                               02 planted, 01 and 04 not known
+///                       then <u8 0> unless the mask is 0
+/// ```
+///
+/// A bomb is an object of the map (`627385fe`) with [`OBJECTIVE`] alone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DefuserUpdate {
+    /// Frame of the record; `None` in the stream's snapshot.
+    pub frame: Option<u32>,
+    pub position: Option<[f32; 3]>,
+    /// Whether the update carries a rotation.
+    pub turned: bool,
+    pub shown: Option<u8>,
+    /// The player now holding it.
+    pub player_id: Option<u64>,
+    pub state: Option<u8>,
+}
+
+/// A bomb of the map: every site of the map has two, and the round's two
+/// are `active`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BombSite {
+    pub object: u64,
+    pub position: [f32; 3],
+    pub active: bool,
+    /// 1 or 2 within its site; 0 until an update says.
+    pub index: u8,
+}
+
+/// What an update of the defuser (`defuser`) or of a bomb says; the third
+/// value is a bomb's `02` field. `None` unless it reads to its last byte.
+fn objective_update(msg: &[u8], defuser: bool) -> Option<(DefuserUpdate, BombSite, Option<u8>)> {
+    let mut r = Reader { d: msg, p: 0 };
+    let mut moved = Update::default();
+    let (mut out, mut bomb, mut live) = (DefuserUpdate::default(), BombSite::default(), None);
+    let flags = r.u8()?;
+    let (placed, own) = if defuser { (0x40, 0x20) } else { (0, 0x40) };
+    if flags & !(0x80 | placed | own) != 0 {
+        return None;
+    }
+    if flags & 0x80 != 0 {
+        transform(&mut r, &mut moved)?;
+    }
+    if flags & placed != 0 {
+        let mask = r.u8()?;
+        if mask & !0x07 != 0 {
+            return None;
+        }
+        if mask & 0x01 != 0 {
+            r.u32()?;
+        }
+        if mask & 0x02 != 0 {
+            out.player_id = Some(r.u64()?);
+        }
+        if mask & 0x04 != 0 {
+            r.u64()?;
+        }
+    }
+    if flags & own != 0 {
+        let mask = r.u8()?;
+        if mask & !0x0F != 0 {
+            return None;
+        }
+        if mask & 0x01 != 0 {
+            bomb.active = r.u8()? == 1;
+        }
+        if mask & 0x02 != 0 {
+            live = Some(r.u8()?);
+        }
+        if mask & 0x04 != 0 {
+            bomb.index = r.u8()?;
+        }
+        if mask & 0x08 != 0 {
+            out.state = Some(r.u8()?);
+        }
+        if mask != 0 {
+            r.u8()?;
+        }
+    }
+    out.position = moved.position;
+    out.turned = moved.heading.is_some();
+    out.shown = moved.shown;
+    (r.p == msg.len()).then_some((out, bomb, live))
+}
+
 /// A body's state blob: one fixed block of the character's state, sent
 /// whole in nearly every update. No hashes inside; fields are u32 unless
 /// noted, at these offsets:
@@ -615,6 +715,14 @@ pub struct Stream {
     pub entities: HashMap<u64, Entity>,
     /// Everything a player placed, in stream order.
     pub placed: Vec<Placed>,
+    /// Every update of the defuser, in stream order.
+    pub defuser: Vec<DefuserUpdate>,
+    /// The bombs of the map, in the order they were created.
+    pub bombs: Vec<BombSite>,
+    /// The frame the bombs said the round was decided in.
+    pub decided: Option<u32>,
+    /// Updates of the defuser and the bombs that could not be read.
+    pub unread: usize,
 }
 
 /// Reads the stream's blocks in order: `(payload, frame)`, the snapshot
@@ -622,6 +730,7 @@ pub struct Stream {
 pub fn read<'a>(blocks: impl Iterator<Item = (&'a [u8], Option<u32>)>) -> Stream {
     let mut index: HashMap<u64, usize> = HashMap::new();
     let mut out = Stream::default();
+    let mut defuser = None;
     for (payload, frame) in blocks {
         for m in messages(payload) {
             if m.class == CREATE {
@@ -633,6 +742,9 @@ pub fn read<'a>(blocks: impl Iterator<Item = (&'a [u8], Option<u32>)>) -> Stream
                         ..Track::default()
                     });
                 }
+                if e.classes == [PLACED, OBJECTIVE] {
+                    defuser = Some(m.object);
+                }
                 out.entities.entry(m.object).or_insert(e);
                 continue;
             }
@@ -643,10 +755,40 @@ pub fn read<'a>(blocks: impl Iterator<Item = (&'a [u8], Option<u32>)>) -> Stream
                         position: [x, y, z],
                         ..Entity::default()
                     });
+                    let bomb = created(m.body).is_some_and(|e| e.classes == [OBJECTIVE]);
+                    if bomb && !out.bombs.iter().any(|b| b.object == m.object) {
+                        out.bombs.push(BombSite {
+                            object: m.object,
+                            position: [x, y, z],
+                            ..BombSite::default()
+                        });
+                    }
                 }
                 continue;
             }
             if m.class != UPDATE {
+                continue;
+            }
+            if Some(m.object) == defuser {
+                match objective_update(m.body, true) {
+                    Some((u, ..)) => out.defuser.push(DefuserUpdate { frame, ..u }),
+                    None => out.unread += 1,
+                }
+                continue;
+            }
+            if let Some(b) = out.bombs.iter_mut().find(|b| b.object == m.object) {
+                let Some((u, said, live)) = objective_update(m.body, false) else {
+                    out.unread += 1;
+                    continue;
+                };
+                b.position = u.position.unwrap_or(b.position);
+                b.active |= said.active;
+                if said.index != 0 {
+                    b.index = said.index;
+                }
+                if live == Some(0) && out.decided.is_none() {
+                    out.decided = frame;
+                }
                 continue;
             }
             let Some(t) = index.get(&m.object).map(|&i| &mut out.tracks[i]) else {
@@ -1123,25 +1265,24 @@ impl PlayerTrack {
     }
 }
 
-/// Reads every player's track, view sessions and placements. `blocks` are
-/// the movement stream's snapshot and records (see [`read`]); a body
+/// Every player's track, view sessions and placements, from the movement
+/// stream as [`read`] gives it; a body
 /// belongs to the player whose `playerid` it carries, or whose
 /// `entities.movement` it is.
 ///
 /// A track runs from the moment the game shows the body (an attacker's is
 /// created a moment before prep ends) to the first sample of the dead
 /// body, which closes it: a dead body keeps sending for a few seconds.
-pub(crate) fn decode<'a>(
-    blocks: impl Iterator<Item = (&'a [u8], Option<u32>)>,
+pub(crate) fn decode(
+    stream: &Stream,
     players: &[Player],
     views: &[ViewChange],
     frame_times: &[f64],
 ) -> Movement {
-    let stream = read(blocks);
     let time = |frame: Option<u32>| frame_times.get(frame.unwrap_or(0) as usize).copied();
     let player = |id: u64| players.iter().find(|p| p.id == id && id != 0);
     let mut out = Movement {
-        views: view_sessions(views, &stream, players, frame_times),
+        views: view_sessions(views, stream, players, frame_times),
         ..Movement::default()
     };
     for p in players {
@@ -1191,6 +1332,50 @@ pub(crate) fn decode<'a>(
                     t.deploying[started].value.then_some(stopped.time)
                 }),
         });
+    }
+    out
+}
+
+/// Where each player's body was over a round and nothing else: enough to
+/// say where something happened without the whole of [`Movement`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Positions {
+    /// Per player, in the order of the header: sample times, and the
+    /// position at each.
+    players: Vec<(Vec<f64>, Vec<[f32; 3]>)>,
+}
+
+impl Positions {
+    /// Where the player at `index` of the header's list was `time` seconds
+    /// into the recording: their last sample by then, since a body that
+    /// stands still sends nothing. `None` before the body is shown, and
+    /// for a player without one. A dead player stays where they died.
+    pub(crate) fn at(&self, index: usize, time: f64) -> Option<[f32; 3]> {
+        let (times, positions) = self.players.get(index)?;
+        let last = times.iter().rposition(|&t| t <= time)?;
+        positions.get(last).copied()
+    }
+}
+
+/// Every player's positions and nothing else, as [`decode`] gives them.
+pub(crate) fn positions(stream: &Stream, players: &[Player], frame_times: &[f64]) -> Positions {
+    let time = |frame: Option<u32>| frame_times.get(frame.unwrap_or(0) as usize).copied();
+    let mut out = Positions::default();
+    for p in players {
+        let body = p.entities.as_ref().and_then(|e| e.movement).map(u64::from);
+        let mine = |t: &&Track| (p.id != 0 && t.player_id == Some(p.id)) || Some(t.object) == body;
+        let (mut times, mut places) = (Vec::new(), Vec::new());
+        for t in stream.tracks.iter().filter(mine) {
+            for s in t.samples.iter().filter(|s| s.shown) {
+                let Some(at) = time(s.frame) else { continue };
+                times.push(millis(at));
+                places.push(rounded(s.position));
+                if s.state.doing == DEAD {
+                    break;
+                }
+            }
+        }
+        out.players.push((times, places));
     }
     out
 }

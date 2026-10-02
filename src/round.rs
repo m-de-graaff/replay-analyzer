@@ -149,6 +149,10 @@ pub struct Round {
     /// triggers that are of no gadget of `gadgets` (see
     /// [`crate::gadget_events`] and [`crate::join`]).
     pub gadget_events: Option<crate::gadget_events::GadgetEvents>,
+    /// Y11S3: what the round's objective did, joined from the sections
+    /// above: the defuser's carriers, drops, plants and disables (full
+    /// reads; see [`crate::objective`]).
+    pub objective_state: Option<crate::objective::Objective>,
 }
 
 /// How far apart, in seconds, the timeline's entry for a kill, down or
@@ -415,6 +419,8 @@ impl Serialize for Round {
             activity: Option<&'a Activity>,
             #[serde(skip_serializing_if = "Option::is_none")]
             movement: Option<&'a Movement>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            objective_state: Option<&'a crate::objective::Objective>,
         }
         let vitals = self.vitals.as_ref();
         let gadget_events = self.gadget_events.as_ref();
@@ -475,6 +481,7 @@ impl Serialize for Round {
             census: self.census.as_ref(),
             activity: self.activity.as_ref(),
             movement: self.movement.as_ref(),
+            objective_state: self.objective_state.as_ref(),
         }
         .serialize(s)
     }
@@ -1046,9 +1053,11 @@ impl<'a> Parser<'a> {
             self.round_end();
             self.resolve_intel();
             self.resolve_activity();
-            if options.movement {
-                self.resolve_movement();
+            let stream = self.movement_stream();
+            if let (true, Some(stream)) = (options.movement, &stream) {
+                self.resolve_movement(stream);
             }
+            self.resolve_objective(stream.as_ref());
         }
         self.measure_records();
         if options.census {
@@ -1572,6 +1581,70 @@ impl<'a> Parser<'a> {
                 // What most ability values mean is read from a few
                 // operators' behaviour.
                 r.field("ability", Status::Inferred, a.ability.len());
+            }
+            // The objective joins the fields above with the defuser and
+            // the bombs of the movement stream: why a carry ended is
+            // worked out, the rest is read. A game mode other than Bomb
+            // has its name and nothing else.
+            if let Some(o) = &round.objective_state {
+                match &o.bomb {
+                    Some(b) => {
+                        let f = r.field("objectiveState", Status::Inferred, b.carrier.len());
+                        for w in &b.warnings {
+                            f.at_most(Status::Partial).warn(w.clone());
+                        }
+                        let read = |decoded: bool| match decoded {
+                            true => Status::Decoded,
+                            false => Status::Inferred,
+                        };
+                        let f = r.field("defuserDrops", read(b.drops_decoded), b.drops.len());
+                        if !b.drops_decoded {
+                            f.warn("no defuser in the movement stream: drops are the ends of carries, at the carrier");
+                        }
+                        let f = r.field("bombSites", Status::Decoded, b.sites.len());
+                        if b.sites.len() != 2 {
+                            f.warn(format!("{} bombs are in play, not 2", b.sites.len()));
+                        }
+                        // The bomb of the round's plant: named by the game
+                        // or the nearer one.
+                        let done = |p: &&crate::objective::Interaction| {
+                            p.outcome == crate::activity::InteractionOutcome::Completed
+                        };
+                        if let Some(p) = b.plants.iter().find(done) {
+                            let named = p.site.as_ref().map(|s| s.source);
+                            let decoded = named == Some(crate::objective::SiteSource::Decoded);
+                            let f =
+                                r.field("plantSite", read(decoded), usize::from(named.is_some()));
+                            if !decoded {
+                                f.warn("the recording does not name the bomb the defuser is on: the nearer one");
+                            }
+                        }
+                        let located = (b.plants.iter().chain(&b.disables))
+                            .filter(|i| i.position.is_some())
+                            .count();
+                        let f = r.field("objectivePositions", Status::Decoded, located);
+                        if located < b.plants.len() + b.disables.len() {
+                            f.at_most(Status::Partial).warn(format!(
+                                "{} of {} plants and disables are by a player whose body was not found",
+                                b.plants.len() + b.disables.len() - located,
+                                b.plants.len() + b.disables.len()
+                            ));
+                        }
+                        if b.planted_at.is_some() {
+                            let timed = usize::from(b.defuser_time_left.is_some());
+                            let f = r.field("defuserTimer", read(b.timer_decoded), timed);
+                            if !b.timer_decoded {
+                                f.warn("the timer was not written after the plant: time left is its length less the time since");
+                            }
+                        }
+                    }
+                    None => {
+                        r.field("objectiveState", Status::NotInVersion, 0).warn(format!(
+                            "game mode {}: only the defuser of Bomb is decoded",
+                            o.mode
+                        ));
+                    }
+                }
             }
             if let Some(m) = &round.movement {
                 let tracked = m.players.iter().filter(|t| !t.time.is_empty()).count();
@@ -3294,21 +3367,25 @@ impl<'a> Parser<'a> {
         self.round.activity = Some(activity);
     }
 
-    /// Y11S3: every player's track, from the movement stream (see
-    /// [`crate::movement`]).
-    fn resolve_movement(&mut self) {
+    /// Y11S3: the movement stream's bodies, entities, defuser and bombs
+    /// (see [`crate::movement::read`]).
+    fn movement_stream(&self) -> Option<crate::movement::Stream> {
         if self.code() < version::Y11S3 {
-            return;
+            return None;
         }
-        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
-            return;
-        };
+        let (map, container) = (self.records.as_ref()?, self.round.container.as_ref()?);
         let data = self.data;
         let blocks =
             crate::loadout::blocks(map, &container.streams, crate::loadout::MOVEMENT_STREAM)
                 .filter_map(|(start, end, frame)| Some((data.get(start..end)?, frame)));
+        Some(crate::movement::read(blocks))
+    }
+
+    /// Y11S3: every player's track, from the movement stream (see
+    /// [`crate::movement`]).
+    fn resolve_movement(&mut self, stream: &crate::movement::Stream) {
         let movement = crate::movement::decode(
-            blocks,
+            stream,
             &self.round.header.players,
             &self.player_tables.views,
             &self.frame_times,
@@ -3392,6 +3469,31 @@ impl<'a> Parser<'a> {
             }
         }
         self.join_status = Some(counts);
+    }
+
+    /// Y11S3: what the objective did, joined from the activity, the
+    /// defuser and the bombs of the movement stream, the timeline of kills
+    /// and downs, the clock and where the players were (see
+    /// [`crate::objective`]).
+    fn resolve_objective(&mut self, stream: Option<&crate::movement::Stream>) {
+        let (Some(activity), Some(stream)) = (&self.round.activity, stream) else {
+            return;
+        };
+        let players = &self.round.header.players;
+        let positions = crate::movement::positions(stream, players, &self.frame_times);
+        let combat = self.round.combat.as_ref();
+        let objective = crate::objective::derive(&crate::objective::Input {
+            header: &self.round.header,
+            activity,
+            events: combat.map_or(&[], |c| &c.events),
+            feed: &self.round.match_feedback,
+            life_events: &self.round.life_events,
+            timeline: &self.round.timeline,
+            stream,
+            positions: &positions,
+            frame_times: &self.frame_times,
+        });
+        self.round.objective_state = Some(objective);
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes

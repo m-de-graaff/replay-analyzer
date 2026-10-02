@@ -76,6 +76,7 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `matchFeedback[].inArea`, `hits[].inArea`, `hits[].gadgetOwner`, `shots[].throughSmoke`, `effects[].jammer` | The area a victim stood in, the owner of the barbed wire that hurt, whether a shot passed through smoke, and whose Signal Disruptor jammed a player. All derived, each with its source. | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
 | `activity` | Who carried the defuser, plants and disables with their outcome, what each player held, reloads and ability signals. See [Activity](#activity). | Y11S3+ |
+| `objectiveState` | The game mode and, for Bomb, what the defuser did: the round's two bombs, each carry with how it started and ended, where the defuser was dropped, came to lie and was picked up, plants and disables with where the defuser is, on which bomb, and what was left on the defuser timer. See [Objective](#objective). | Y11S3+ |
 | `movement` | With `--movement`: position, view direction, stance, lean, aiming, gait, rappel, falls, what each player looked through and what they placed. See [Movement](#movement). | Y11S3+ |
 
 Each round also carries a `round` block with the round itself in one place:
@@ -750,7 +751,7 @@ A kill in `matchFeedback` gains two derived fields. Both say what was on the kil
 
 `movement.views[]` lists what each player looked through when not their own eyes: `username`, `kind` (`drone`, `camera`, or `teammate` for a dead player following one), the `device` id, its `owner`, `fixed` for a camera of the map, a camera's `position`, and `start` and `end`. One entry per device, where `observation` merges a run of cameras into one session.
 
-`movement.placements[]` lists what players put in place: `kind` (`reinforcement`, `barricade`, `gadget`), who, the `asset` and `object` ids, the `position`, the `time` the placing started and the `end`, when the player's hands were done with it. A reinforcement takes 4.5 seconds and a barricade 2.9; one that ends sooner was given up.
+`movement.placements[]` lists what players put in place (the defuser is not among them; see [Objective](#objective)): `kind` (`reinforcement`, `barricade`, `gadget`), who, the `asset` and `object` ids, the `position`, the `time` the placing started and the `end`, when the player's hands were done with it. A reinforcement takes 4.5 seconds and a barricade 2.9; one that ends sooner was given up.
 
 Where the data lives:
 
@@ -782,8 +783,8 @@ From Y11S3 a full read adds `activity`: what the HUD objects of the state stream
 
 | Key | What it holds | How |
 |---|---|---|
-| `defuser[]` | Each stretch a player carried the defuser: `username`, `start`, and `end` unless they still had it when the file ended. It ends at a plant, at the carrier's death or down, or when it is dropped; compare `end` with the kill feed and `interactions` to tell which. | Decoded (`HasDefuser`) |
-| `interactions[]` | Each plant or disable: `username`, `kind`, `start`, `end` and `outcome`: `Completed`, `Aborted` (given up, or the player died) or `Unfinished` (the round was decided first). | Decoded (`DefuserInteractionType`, `IsDefuserStarted`) |
+| `defuser[]` | Each stretch a player carried the defuser: `username`, `start`, and `end` unless they still had it when the file ended. It ends at a plant, at the carrier's death or down, or when it is dropped; `objectiveState.bomb.carrier[]` says which. | Decoded (`HasDefuser`) |
+| `interactions[]` | Each plant or disable: `username`, `kind`, `start`, `end` and `outcome`: `Completed`, `Aborted` (given up, or the player died) or `Unfinished` (the round was decided first). One not completed adds `remaining`, the seconds it still had to go of the 7 it takes. | Decoded (`DefuserInteractionType`, `IsDefuserStarted`, the countdown text) |
 | `equipped[]` | Each change of what a player holds: `Nothing`, `Drone`, `Primary`, `Secondary`, `Ability` or `Gadget`. `Nothing` is a player busy with their hands: placing, reinforcing, planting, between two weapons. | Decoded (`EquippedWeaponType`) |
 | `reloads[]` | Each reload starting and ending, per weapon. | Decoded (`IsReloading`) |
 | `ability[]` | Each change of a signal on the ability or gadget slot: `slot`, `signal` and `value`. See below. | Mostly inferred |
@@ -1063,6 +1064,105 @@ An area is an effect with a position and no parent, of one of seven assets. It s
 - **What some devices are.** Some entities that say destroyed and pay a scorer name no owner and are in no loadout slot (9 in the test rounds, 96 in the real ones, nearly all of type index 300); they are listed in `deviceRemovals[]` with their asset and no `name`.
 
 `decodeStatus` adds `world` (updates read), `gadgets`, `gadgetEvents` (removals, statuses and triggers, on a gadget or listed), `scoreChanges`, `panels`, `destruction`, `breaches`, `surfaces` (always `inferred`) and `areas`, each with a count and what was left out.
+
+## Objective
+
+From Y11S3 a full read adds `objectiveState`: what the round's objective did, in one place. `mode` is the header's game mode. A Bomb round (`Bomb`, `QuickMatchBomb`) adds `bomb`; any other mode has `mode` alone, because no recording of Secure Area or Hostage has been seen and nothing about them is decoded. A section for each would sit beside `bomb`.
+
+```json
+"objectiveState": {
+  "mode": { "name": "Bomb", "id": 327933806 },
+  "bomb": {
+    "sites": [
+      { "index": 1, "object": "60572f71b8", "name": "B Lockers", "position": [-54.453, 8.401, -3.8] },
+      { "index": 2, "object": "60572f3500", "name": "B CCTV Room", "position": [-68.022, 7.681, -3.8] }
+    ],
+    "carrier": [
+      { "username": "Bassetto.L5", "team": 0, "start": 0.069, "end": 218.509, "started": "spawn", "ended": "downed",
+        "endedBy": "vitaking.FaZe", "position": null, "endPosition": [-49.762, 12.512, -3.801] }
+    ],
+    "drops": [
+      { "username": "Bassetto.L5", "team": 0, "reason": "downed", "by": "vitaking.FaZe", "time": "0:06", "phase": "Action",
+        "elapsed": 218, "recordingTime": 218.442, "position": [-49.762, 12.512, -3.374], "restPosition": [-49.762, 12.512, -3.804],
+        "pickup": { "username": "PSYCHO.L5", "time": "0:04", "phase": "Action", "elapsed": 220, "recordingTime": 220.141,
+                    "secondsOnGround": 1.699, "byOther": true } }
+    ],
+    "plants": [
+      { "username": "Bassetto.L5", "team": 0, "side": "Attack", "start": 215.315, "end": 218.442, "outcome": "Aborted", "remaining": 3.908,
+        "time": "0:09", "phase": "Action", "elapsed": 215, "position": [-49.758, 12.509, -3.801], "endPosition": [-49.762, 12.512, -3.801],
+        "defuserPosition": [-49.752, 12.513, -3.801],
+        "site": { "index": 1, "name": "B Lockers", "source": "nearest", "distances": [6.25, 18.9] } }
+    ],
+    "disables": [
+      { "username": "Handyy.FaZe", "team": 1, "side": "Defense", "start": 263.959, "end": 270.979, "outcome": "Completed",
+        "time": "0:11", "phase": "Planted", "elapsed": 264, "position": [-49.521, 12.199, -3.801], "endPosition": [-49.521, 12.199, -3.801],
+        "defuserPosition": [-49.321, 12.286, -3.801],
+        "site": { "index": 1, "name": "B Lockers", "source": "decoded", "distances": [6.44, 19.26] },
+        "defuserTimeLeft": 11.877, "defuserTimeLeftAtEnd": 4.856 }
+    ],
+    "plantedAt": 230.873, "defuserTimer": 45, "defuserTimeLeft": 4.856
+  }
+}
+```
+
+That is round 7 of the test match, shortened to one entry per list.
+
+| Key | What it holds | How |
+|---|---|---|
+| `mode` | The game mode, as in the header. | Decoded |
+| `sites[]` | The round's two bombs: the game's number for each (`index`, 1 or 2), its `object` (the same in every round on the map), its `position`, and `name`, the header's two site names taken in order. | Decoded; the names by order, assumed |
+| `carrier[]` | Each stretch of `activity.defuser[]` with the player's `team`, how it `started` and `ended`, `endedBy` (who downed or killed the carrier), and the carrier's `position` at the start and `endPosition` at the end. | Stretch decoded (`HasDefuser`), reasons derived |
+| `carrier[].started` | `spawn`: the game gave the player the defuser, before action started or from a carrier it took it from. `pickup`: they took it off the ground. | Derived |
+| `carrier[].ended` | `planted`, `downed`, `died`, `dropped` (put down), `roundEnd` (still carrying when the round was decided or the file ended) or `reassigned` (the game gave it to someone else). See below for how each is told. | Derived |
+| `drops[]` | Each time the defuser left its carrier without a plant: who lost it, the clock (`time`, `phase`, `elapsed`, `recordingTime`), `position`, where it was let go (at the carrier's hands), and `restPosition`, where it came to lie. | Decoded (the defuser object) |
+| `drops[].reason`, `by` | `downed`, `died` or `dropped`, and who downed or killed the carrier. | Derived (the timeline) |
+| `drops[].pickup` | Who picked it up and when, `secondsOnGround`, and `byOther` (false when the player who lost it took it back); null when nobody did. | Decoded (the defuser object) |
+| `plants[]`, `disables[]` | Each entry of `activity.interactions[]` with `team`, `side`, the round clock at its start (`time`, `phase`, `elapsed`), the player's `position` at the start and `endPosition` at the end (null for one the round's end cut short), and `remaining`: the seconds one that did not complete still had to go. | Decoded |
+| `defuserPosition` | Where the defuser is planted: for a plant where this one put it, completed or not; for a disable where the round's plant did. | Decoded (the defuser object) |
+| `site` | The bomb a plant or disable is at: `index`, `name`, `source` and `distances`, the metres over the ground from the defuser to each of `sites`. `source` is `decoded` when the game names the bomb the defuser is on, which it does for a completed plant in a spectator's or an attacker's recording, and `nearest` otherwise. | Decoded or derived, as `source` says |
+| `plantedAt` | Seconds since the recording started when the plant completed. | Decoded (`IsDefuserStarted`) |
+| `defuserTimeLeft`, `defuserTimeLeftAtEnd` | Seconds left on the defuser timer: on a disable at its start and at its end, on the round when it was decided. The game writes the timer every dozen frames and at every frame near a whole second; a moment between two samples is taken between them, and one after the last sample is that sample, since the timer stops with the disable that completes. | Decoded (`TimerInMilliseconds`) |
+| `defuserTimer` | Length of the defuser timer in seconds. The file has no such value: after a plant the round clock shows what is left in whole seconds, rounded down, and every reading of every planted round says 45. The timer's first sample is about 44.94. | Derived (the clock) |
+
+Where the data lives:
+
+- **The defuser is an object of the movement stream**, created in the round's opening snapshot at (0, 0, 0), where it stays while a player carries it. When it is dropped a state bit turns on and the update carries the position it was let go at; position-only updates follow as it falls, and the last is where it lies. A pickup puts it back at (0, 0, 0) and names the player, unless it is the one who dropped it. The position and rotation it is planted at arrive when a plant starts; a plant given up puts it at (0, 0, -100). The layout is at `DefuserUpdate` in `src/movement.rs`. Before, `movement.placements[]` listed it as a gadget its carrier placed at the origin; it no longer does.
+- **Every site's two bombs are objects of the map**, eight on a map with four sites. The round's two say so in the snapshot, each with its number.
+- **The state stream** has the timer on the clock object, the number of the bomb the defuser is on on the game-mode object, and the countdown of each plant and disable as text (`7.000` to `0.000`) on the player's interaction object; see the top of `src/activity.rs`.
+
+How a carry's end is told. A carry is a stretch of the HUD's `HasDefuser`, which follows the defuser itself by a few frames. The first of these that fits:
+
+1. `planted`: a completed plant by the carrier ended within 0.5 s of the carry.
+2. `downed`, `died`, `dropped`: the defuser was dropped by the carrier during the carry, up to 0.5 s either side, and the reason is the drop's. A drop is `downed` or `died` when `timelineEvents` has the carrier going down or dying in the 0.5 s up to it; when both are there, the earlier one, which is the down. A drop with neither is `dropped`: a carrier who puts the defuser down and is shot afterwards stays `dropped`. A round without a timeline (2 of the real ones) uses the kill feed and `lifeEvents`.
+3. `roundEnd`: the carry has no end, or ends at or after the round was decided.
+4. `downed`, `died`: the carrier fell in the 0.5 s before the carry ended and the defuser never lay anywhere, because a teammate had it in the same frame. Seen once. Such a carry still gets a drop, at the carrier's feet and with no `restPosition`.
+5. `reassigned`: none of these. The game gave the defuser to another player without it lying anywhere. Seen twice: once 12 seconds before action started, and once in action, from one attacker straight to another in one frame. Why is not known.
+
+A recording whose movement stream has no defuser would fall back on the carries alone, with every drop at its carrier's feet and `dropped` for a carry nothing else explains; none of the rounds checked is one.
+
+Positions of players are those of the body, at the feet, from the movement stream: the last sample at or before the moment, since a body that stands still sends nothing. They are there on every full read, with or without `--movement`. An attacker has no body before prep ends, so a `spawn` carry has a null `position`.
+
+Checked on the ten test rounds and 174 real ones (288 carries, 215 drops, 103 pickups, 65 plants, 10 disables):
+
+- The defuser and `HasDefuser` tell the same story in all 184 rounds: every drop falls in a carry of the player's, every pickup starts a carry of the player's, and every carry that lost the defuser has one drop. The HUD follows the defuser by 0.14 s at most, and in a player's own recording can be 0.005 s ahead. In 25 carries `HasDefuser` never ended although the defuser was dropped; the HUD alone would have them as `roundEnd`.
+- Every `downed` and `died` drop has its timeline entry, 0 to 0.07 s before it (166 drops).
+- A defuser is let go about a metre at most from where its carrier's body is as the carry ends (0.02 m at the median), and comes to lie within 1.3 m of there over the ground.
+- Every plant puts the defuser within a metre of the planter, and every disable is from within 2.5 m of it. No player moves more than a metre during either.
+- Of the 33 completed plants the game names the bomb of 15: every one in the spectator's recordings of the test match and 11 of 29 in players' own. The nearer bomb is the same one in 14; in the other the defuser is 7.0 m from one bomb and 8.7 m from the one the game names. `distances` shows such a call.
+- The timer is there in all 33 planted rounds. At the start of a disable it is 0.01 to 0.07 s below 45 less the time since the plant, and a disable's `time` is its `defuserTimeLeft` rounded down, or a second off when the clock turns within a tenth of a second of it. When a disable ends the round, the round's `defuserTimeLeft` is that disable's `defuserTimeLeftAtEnd`.
+- `remaining` is within a quarter second of 7 less the time the plant or disable ran.
+- The objective is the same whether or not the movement was read.
+
+What is not there, or not known:
+
+- **A defuser that went off.** No round checked ended that way, so the timer reaching 0 has not been seen.
+- **Two of the defuser's state bits.** `08` is lying in the world and `02` planted; `01` and `04` turn on at moments that fit no event known here (`04` some time before a disable starts), and are not in the output.
+- **Which bomb is A.** The game numbers the round's bombs 1 and 2. That 1 is A, and that the header's two site names are in that order, is assumed: nothing in the file says so.
+- **A header that names the wrong site.** In 1 of the 184 rounds the header's `site` is that of the round before, while the bombs in play, the defenders' spawns and the plant are at another. The bombs are right, and the names on `sites` are then wrong. A single round cannot tell; a match folder can, and `folder.warnings` names the round when the same site name goes with other bombs elsewhere in the match.
+- **Why the game moved the defuser** in the two `reassigned` carries, and whether a carrier who leaves the match reads that way: no carrier left in the rounds checked.
+- **Other game modes.** Secure Area and Hostage give `mode` only.
+
+`decodeStatus` gains `objectiveState` (carries; `inferred`, or `notInVersion` for a mode other than Bomb), `defuserDrops` (`decoded`, or `inferred` without the defuser object), `bombSites`, `objectivePositions` (plants and disables with the player's position), and in a planted round `plantSite` (`decoded` when the game names the bomb, `inferred` for the nearer one) and `defuserTimer` (`decoded` when the timer was written).
 
 ## Players and identity
 

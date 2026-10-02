@@ -49,6 +49,15 @@
 //!   were in; gadget, panel and breach counts in the stats; skips of game
 //!   time in `timing`. A throw that stuck in its first step has no
 //!   direction.
+//! - Y11S3 (profile Y9S4): the objective, joined from what is decoded: how
+//!   each carry of the defuser started and ended, drops and pickups, where
+//!   plants and disables happened and what the defuser timer had left.
+//! - Y11S3 (profile Y9S4): the defuser and the bombs of the movement
+//!   stream: where the defuser was dropped, came to lie and was planted,
+//!   who picked it up, the round's two bombs and the one of the plant; the
+//!   defuser timer as the game wrote it; the seconds a plant or disable
+//!   given up had to go. The defuser is no longer a placement of its
+//!   carrier's.
 
 use serde::Serialize;
 

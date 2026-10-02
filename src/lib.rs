@@ -40,6 +40,7 @@ pub mod markers;
 pub mod matches;
 pub mod melee;
 pub mod movement;
+pub mod objective;
 pub mod outcome;
 pub mod panels;
 pub mod records;

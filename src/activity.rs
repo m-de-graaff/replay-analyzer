@@ -13,6 +13,8 @@
 //!       8d68f855 "HasDefuser" u8                   1 while the player carries the defuser
 //!       e58c06e9 "DefuserInteractionType" u32      0 planting, 1 disabling, 2 idle
 //!       e9a37feb "DefuserInteractionProgress" f32  1.0 -> 0.0 (not read)
+//!       a9c858d9 text                              seconds left of the plant or
+//!                                                  disable, "7.000" -> "0.000"
 //!   e8d1e539 "PlayerLoadoutVM" -> 579fb57b "PlayerLoadoutViewModel"
 //!       66ac7724 "EquippedWeaponType" u32          0 nothing, 1 drone, 2 primary,
 //!                                                  3 secondary, 4 ability, 5 gadget
@@ -42,10 +44,19 @@
 //! when action starts. A value counts for a player only while its object is
 //! the last one linked to its field, all the way up to the controller.
 //!
-//! Two things are not per player. The game-mode object's `ff39f408`
+//! Some things are not per player. The game-mode object's `ff39f408`
 //! "IsDefuserStarted" (u8) turns 1 when a plant completes and 0 when a
 //! disable does: in the record that puts the player back to idle, or in
-//! the stream's next one, a frame later. And each team's view model (class `d2b1c612`,
+//! the stream's next one, a frame later. Its `2f5e6441` (u32) is the number
+//! of the bomb the defuser is planted on, 1 or 2, and 0 while it is not
+//! known: it comes with the plant in a spectator's recording and an
+//! attacker's, and late or never in a defender's. The clock object's
+//! `1837466c` "TimerInMilliseconds" (u32) is what is left of the timer that
+//! runs: of the defuser's once `IsDefuserStarted` is 1, starting near
+//! 44,940. It is written every dozen frames and at every frame near a
+//! whole second, goes on through a disable, stops with the disable that
+//! completes, and is written 0 in the frame the clock's `bb094fd3`
+//! "TimerState" turns 3, when the round is decided. And each team's view model (class `d2b1c612`,
 //! with its players' controllers in the array `a87a2c30` "PlayersVM") links
 //! through field `478b9617` a pool object: class `80deb4bc` for defenders,
 //! whose `67de20f8` (u32) is how many reinforcements the team has left. It
@@ -75,8 +86,16 @@ const INTERACTION_TYPE: Hash = [0xE5, 0x8C, 0x06, 0xE9];
 /// `DefuserInteractionType` values; 2 is idle.
 const PLANTING: u32 = 0;
 const DISABLING: u32 = 1;
-/// Game-mode object: `IsDefuserStarted`.
+/// Defuser interaction: the seconds left of it, as text.
+const COUNTDOWN: Hash = [0xA9, 0xC8, 0x58, 0xD9];
+/// Game-mode object: `IsDefuserStarted`, and the bomb the defuser is on.
 const DEFUSER_STARTED: Hash = [0xFF, 0x39, 0xF4, 0x08];
+const PLANTED_BOMB: Hash = [0x2F, 0x5E, 0x64, 0x41];
+/// Clock object: `TimerInMilliseconds` and `TimerState`, 3 once the round
+/// is decided.
+const TIMER: Hash = [0x18, 0x37, 0x46, 0x6C];
+const TIMER_STATE: Hash = [0xBB, 0x09, 0x4F, 0xD3];
+const DECIDED: u32 = 3;
 
 /// Controller -> the player's `PlayerLoadoutViewModel`.
 const LOADOUT_FIELD: Hash = [0xE8, 0xD1, 0xE5, 0x39];
@@ -203,6 +222,10 @@ pub struct DefuserInteraction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<f64>,
     pub outcome: InteractionOutcome,
+    /// Seconds of the plant or disable still to go when it was given up or
+    /// cut short, of the 7 it takes. Absent for a completed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<f64>,
 }
 
 /// What a player holds (`EquippedWeaponType`).
@@ -343,6 +366,15 @@ pub struct Activity {
     pub reloads: Vec<Reload>,
     /// Pools whose team could not be told from its players are left out.
     pub reinforcement_pool: Vec<PoolChange>,
+    /// What was left of the defuser timer, in milliseconds, each time the
+    /// game wrote it after the plant: `(seconds since the recording
+    /// started, milliseconds)`.
+    #[serde(skip)]
+    pub defuser_timer: Vec<(f64, u32)>,
+    /// The number of the bomb the defuser was planted on, 1 or 2, when the
+    /// recording says.
+    #[serde(skip)]
+    pub planted_bomb: Option<u32>,
 }
 
 /// What an object is to a player.
@@ -387,6 +419,11 @@ struct Reader<'a> {
     ended: Vec<(usize, usize)>,
     /// A defuser property was written in this frame.
     defuser_written: bool,
+    /// Per player: the seconds last shown on their plant or disable.
+    countdown: Vec<Option<f64>>,
+    /// The timer written in this frame, and whether the round is decided.
+    timer: Option<u32>,
+    decided: bool,
 
     /// The latest value of everything else, to tell changes from resends.
     equipped: HashMap<usize, u32>,
@@ -414,6 +451,7 @@ impl<'a> Reader<'a> {
             interaction: vec![None; players.len()],
             carrying: vec![None; players.len()],
             interacting: vec![None; players.len()],
+            countdown: vec![None; players.len()],
             ..Reader::default()
         }
     }
@@ -535,6 +573,13 @@ impl<'a> Reader<'a> {
     }
 
     fn value(&mut self, obj: u32, hash: Hash, value: &[u8], time: f64) {
+        if hash == COUNTDOWN {
+            let seconds = std::str::from_utf8(value).ok().and_then(|s| s.parse().ok());
+            if let (Some(seconds), Some((player, Part::Interaction))) = (seconds, self.part(obj)) {
+                self.countdown[player] = Some(seconds);
+            }
+            return;
+        }
         let number = match *value {
             [v] => u32::from(v),
             [a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
@@ -549,6 +594,13 @@ impl<'a> Reader<'a> {
                 }
                 self.defuser_written = true;
             }
+            PLANTED_BOMB if wide => {
+                if self.started == Some(true) && number != 0 {
+                    self.out.planted_bomb.get_or_insert(number);
+                }
+            }
+            TIMER if wide => self.timer = Some(number),
+            TIMER_STATE if wide => self.decided = number == DECIDED,
             REINFORCEMENTS_LEFT if wide => {
                 if self.owner(obj).is_some_and(|l| l.2 == REINFORCEMENT_POOL)
                     && self.pools.insert(obj, number) != Some(number)
@@ -647,6 +699,11 @@ impl<'a> Reader<'a> {
     fn end_frame(&mut self, time: f64) {
         let turned = self.turned.take();
         self.records += 1;
+        // The timer is the defuser's from the frame of the plant, whatever
+        // the order the two are written in, until the round is decided.
+        if let (Some(left), Some(true), false) = (self.timer.take(), self.started, self.decided) {
+            self.out.defuser_timer.push((time, left));
+        }
         if !std::mem::take(&mut self.defuser_written) {
             return;
         }
@@ -657,6 +714,7 @@ impl<'a> Reader<'a> {
             let i = &mut self.out.interactions[at];
             if ended + 1 == record && turned == Some(i.kind == InteractionKind::Plant) {
                 i.outcome = InteractionOutcome::Completed;
+                i.remaining = None;
             }
         }
         for player in 0..self.usernames.len() {
@@ -697,6 +755,7 @@ impl<'a> Reader<'a> {
                 } else {
                     InteractionOutcome::Aborted
                 };
+                i.remaining = self.countdown[player].take().filter(|_| !completed);
                 if wanted.is_none() && turned.is_none() {
                     self.ended.push((at, record));
                 }
@@ -708,6 +767,7 @@ impl<'a> Reader<'a> {
                     start: time,
                     end: None,
                     outcome: InteractionOutcome::Unfinished,
+                    remaining: None,
                 });
                 self.out.interactions.len() - 1
             });
@@ -728,6 +788,11 @@ impl<'a> Reader<'a> {
     }
 
     fn finish(mut self, players: &[Player]) -> Activity {
+        for (player, going) in self.interacting.iter().enumerate() {
+            if let Some(at) = *going {
+                self.out.interactions[at].remaining = self.countdown[player];
+            }
+        }
         let changes = std::mem::take(&mut self.pool_changes);
         self.out.reinforcement_pool = changes
             .into_iter()

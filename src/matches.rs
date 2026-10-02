@@ -243,6 +243,8 @@ pub fn analyze(rounds: &[Round]) -> FolderReport {
         ));
     }
 
+    site_names(&mut report, rounds);
+
     let mut numbers: Vec<u32> = rounds.iter().map(|r| r.header.round_number + 1).collect();
     for r in rounds {
         let Some(from_name) = r
@@ -355,6 +357,44 @@ fn recording_gaps(rounds: &[Round], report: &mut FolderReport) {
                 file_name(b)
             ));
         }
+    }
+}
+
+/// Warns of a round whose header names a site and whose bombs in play are
+/// another's: the same name goes with the same two bombs in every other
+/// round of the match (Y11S3 full reads). The header is the one that is
+/// wrong there, with the site of an earlier round.
+fn site_names(report: &mut FolderReport, rounds: &[Round]) {
+    let bombs = |r: &Round| -> Option<Vec<String>> {
+        let sites = &r.objective_state.as_ref()?.bomb.as_ref()?.sites;
+        (sites.len() == 2).then(|| sites.iter().map(|s| s.object.clone()).collect())
+    };
+    let played: Vec<(&Round, Vec<String>)> = (rounds.iter())
+        .filter_map(|r| Some((r, bombs(r)?)))
+        .collect();
+    let rounds_with = |site: &str, pair: &[String]| {
+        let same = |(r, p): &&(&Round, Vec<String>)| r.header.site == site && p == pair;
+        played.iter().filter(same).count()
+    };
+    for (r, pair) in &played {
+        let site = r.header.site.as_str();
+        let others = played
+            .iter()
+            .filter(|(o, p)| o.header.site == site && p != pair);
+        let Some((_, usual)) = others.max_by_key(|(_, p)| rounds_with(site, p)) else {
+            continue;
+        };
+        if rounds_with(site, pair) >= rounds_with(site, usual) {
+            continue;
+        }
+        let named = (played.iter()).find(|(o, p)| p == pair && o.header.site != site);
+        let really = named.map_or(String::new(), |(o, _)| {
+            format!(", those of {}", o.header.site)
+        });
+        report.warnings.push(format!(
+            "{}: the header names the site {site}, but the bombs in play are others{really}",
+            file_name(r)
+        ));
     }
 }
 

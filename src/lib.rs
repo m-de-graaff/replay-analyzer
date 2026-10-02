@@ -49,6 +49,7 @@ pub mod presence;
 pub mod records;
 pub mod report;
 pub mod round;
+pub mod settings;
 pub mod shots;
 pub mod sound;
 pub mod stats;

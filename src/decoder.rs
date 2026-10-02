@@ -143,7 +143,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 14,
+        revision: 15,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

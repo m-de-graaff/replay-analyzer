@@ -76,7 +76,10 @@ pub use loadout::LoadoutChange;
 pub use matches::Match;
 pub use outcome::{ReasonSource, RoundInfo, RoundOutcome};
 pub use report::{DecodeReport, Status};
-pub use round::{ReadMode, ReadOptions, Round, decompressed_bytes};
+pub use round::{
+    PlayerScoreboard, ReadMode, ReadOptions, Round, ScoreTotals, ScoreboardEntry,
+    decompressed_bytes,
+};
 pub use stats::{PlayerMatchStats, PlayerRoundStats};
 pub use summary::MatchSummary;
 pub use timeline::{PhaseSpan, Timeline};

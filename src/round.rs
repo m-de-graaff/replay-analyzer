@@ -171,9 +171,44 @@ pub struct WeaponReady {
     pub elapsed: f64,
 }
 
+/// The totals on a player's scoreboard object (Y11S3+): match totals, or
+/// what a round added to them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoreTotals {
+    /// `MatchScore`. It can go below zero.
+    pub score: i32,
+    /// `MatchKills`: a kill of a player an opponent downed counts for
+    /// whoever downed them, and a team kill for nobody.
+    pub kills: u32,
+    /// `MatchDeaths`.
+    pub deaths: u32,
+    /// `MatchAssists`.
+    pub assists: u32,
+    /// `MatchGameModeActions`: in Bomb, the defusers the player planted.
+    pub game_mode_actions: u32,
+}
+
+/// A player's scoreboard over a round (Y11S3+).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerScoreboard {
+    pub username: String,
+    /// The match totals in the round's opening snapshot.
+    pub start: ScoreTotals,
+    /// The match totals when the recording ends.
+    pub end: ScoreTotals,
+    /// What the round added: `end` less `start`.
+    pub round: ScoreTotals,
+    /// `MatchPlacement`, in the opening snapshot only. 0 in every round
+    /// seen.
+    pub placement: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScoreboardEntry {
-    pub score: u32,
+    /// The match total. From Y11S3 it can go below zero.
+    pub score: i32,
     /// Cumulative match assists as shown on the scoreboard.
     pub assists: u32,
     /// Number of assist updates seen during this round.
@@ -182,6 +217,12 @@ pub struct ScoreboardEntry {
     pub kills: Option<u32>,
     /// Y11S3+: cumulative match deaths as shown on the scoreboard.
     pub deaths: Option<u32>,
+    /// Y11S3+: `MatchGameModeActions`, defusers planted in Bomb.
+    pub game_mode_actions: Option<u32>,
+    /// Y11S3+: `MatchPlacement`.
+    pub placement: Option<u32>,
+    /// Y11S3+: the totals in the round's opening snapshot.
+    pub start: Option<ScoreTotals>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +231,8 @@ enum ScoreField {
     Assists,
     Kills,
     Deaths,
+    GameModeActions,
+    Placement,
 }
 
 /// How much of the replay to read.
@@ -300,6 +343,39 @@ impl Round {
             .and_then(|id| self.scoreboard.get(&id).copied())
             .unwrap_or_default()
     }
+
+    /// Y11S3+: every player's scoreboard at the start and the end of the
+    /// round, and what the round added.
+    pub fn scoreboards(&self) -> Vec<PlayerScoreboard> {
+        let players = self.header.players.iter();
+        let boards = players.filter_map(|p| {
+            let e = self.scoreboard_for(p);
+            let start = e.start?;
+            let end = ScoreTotals {
+                score: e.score,
+                kills: e.kills.unwrap_or(start.kills),
+                deaths: e.deaths.unwrap_or(start.deaths),
+                assists: e.assists,
+                game_mode_actions: e.game_mode_actions.unwrap_or(start.game_mode_actions),
+            };
+            let round = ScoreTotals {
+                score: end.score.wrapping_sub(start.score),
+                kills: end.kills.saturating_sub(start.kills),
+                deaths: end.deaths.saturating_sub(start.deaths),
+                assists: end.assists.saturating_sub(start.assists),
+                game_mode_actions: (end.game_mode_actions)
+                    .saturating_sub(start.game_mode_actions),
+            };
+            Some(PlayerScoreboard {
+                username: p.username.clone(),
+                start,
+                end,
+                round,
+                placement: e.placement.unwrap_or(0),
+            })
+        });
+        boards.collect()
+    }
 }
 
 /// The decompressed dissect stream, for debugging the format.
@@ -318,6 +394,8 @@ impl Serialize for Round {
             round: RoundInfo,
             match_feedback: &'a [MatchUpdate],
             stats: Vec<PlayerRoundStats>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            scoreboard: Vec<PlayerScoreboard>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             bans: &'a [Ban],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -429,6 +507,7 @@ impl Serialize for Round {
             round: self.info(),
             match_feedback: &self.match_feedback,
             stats: self.player_stats(),
+            scoreboard: self.scoreboards(),
             bans: &self.bans,
             health: &self.health,
             life_events: &self.life_events,
@@ -536,6 +615,8 @@ enum Packet {
     WeaponReady,
     ScoreboardKills,
     ScoreboardDeaths,
+    ScoreboardGameModeActions,
+    ScoreboardPlacement,
     TimerState,
     DefuserStarted,
     InteractionLink,
@@ -544,7 +625,7 @@ enum Packet {
 }
 
 impl Packet {
-    const COUNT: usize = 25;
+    const COUNT: usize = 27;
 
     fn name(self) -> &'static str {
         match self {
@@ -568,6 +649,8 @@ impl Packet {
             Packet::WeaponReady => "weaponReady",
             Packet::ScoreboardKills => "scoreboardKills",
             Packet::ScoreboardDeaths => "scoreboardDeaths",
+            Packet::ScoreboardGameModeActions => "scoreboardGameModeActions",
+            Packet::ScoreboardPlacement => "scoreboardPlacement",
             Packet::TimerState => "timerState",
             Packet::DefuserStarted => "defuserStarted",
             Packet::InteractionLink => "interactionLink",
@@ -577,7 +660,7 @@ impl Packet {
     }
 }
 
-const PACKETS: [(Packet, &[u8]); 24] = [
+const PACKETS: [(Packet, &[u8]); 26] = [
     (Packet::Player, &[0x22, 0x07, 0x94, 0x9B, 0xDC]),
     (Packet::AttackerSwap, &[0x22, 0xA9, 0x26, 0x0B, 0xE4]),
     (Packet::Spawn, &[0xAF, 0x98, 0x99, 0xCA]),
@@ -596,6 +679,8 @@ const PACKETS: [(Packet, &[u8]); 24] = [
     (Packet::WeaponReady, &crate::entities::WEAPON_READY),
     (Packet::ScoreboardKills, &[0x1C, 0xD2, 0xB1, 0x9D]),
     (Packet::ScoreboardDeaths, &[0xCD, 0x9C, 0x5D, 0x72]),
+    (Packet::ScoreboardGameModeActions, &[0x31, 0xA3, 0xD4, 0xD2]),
+    (Packet::ScoreboardPlacement, &[0x83, 0x10, 0xF4, 0xF4]),
     (Packet::TimerState, &TIMER_STATE),
     (Packet::DefuserStarted, &DEFUSER_STARTED),
     (Packet::InteractionLink, &INTERACTION_LINK),
@@ -823,14 +908,19 @@ struct Parser<'a> {
     ban_slots: Vec<crate::entities::BanSlot>,
     /// Problems found while reading bans, for `decodeStatus.bans`.
     ban_warnings: Vec<String>,
-    /// Y11S3 scoreboard values by username, and the first assists value
-    /// seen (the total going into the round). Players are only known once
-    /// their pick packet is read, often after their scoreboard's first
-    /// values, so these are handed over at the end.
-    scoreboard_by_name: HashMap<String, (ScoreboardEntry, Option<u32>)>,
+    /// Y11S3 scoreboard values by username, and which of them were seen
+    /// (a bit per `ScoreField`): the first value of each is the total
+    /// going into the round. Players are only known once their pick packet
+    /// is read, often after their scoreboard's first values, so these are
+    /// handed over at the end.
+    scoreboard_by_name: HashMap<String, (ScoreboardEntry, u8)>,
     /// Scoreboard kills just credited, with where: the kill-feed entries
     /// written right after them are the kills they count.
     pending_credits: Vec<(String, usize)>,
+    /// Feed kills no credit was waiting for, as index in `match_feedback`
+    /// and where: the scoreboard sometimes credits a kill a frame after
+    /// its feed entry.
+    uncredited_kills: Vec<(usize, usize)>,
     /// Offset in `data` of the packet being read. Events keep it, so they can
     /// be placed on the recording's clock once the round is read.
     packet_at: usize,
@@ -953,6 +1043,7 @@ impl<'a> Parser<'a> {
             ban_warnings: Vec::new(),
             scoreboard_by_name: HashMap::new(),
             pending_credits: Vec::new(),
+            uncredited_kills: Vec::new(),
             packet_at: 0,
             reading_offsets: Vec::new(),
             records: None,
@@ -1985,6 +2076,10 @@ impl<'a> Parser<'a> {
             Packet::WeaponReady => self.read_weapon_ready(c),
             Packet::ScoreboardKills => self.read_scoreboard_object(c, ScoreField::Kills),
             Packet::ScoreboardDeaths => self.read_scoreboard_object(c, ScoreField::Deaths),
+            Packet::ScoreboardGameModeActions => {
+                self.read_scoreboard_object(c, ScoreField::GameModeActions)
+            }
+            Packet::ScoreboardPlacement => self.read_scoreboard_object(c, ScoreField::Placement),
         }
     }
 
@@ -2568,12 +2663,21 @@ impl<'a> Parser<'a> {
             // Y11S3: the scoreboard credits the kill right before the feed
             // entry, sometimes to a teammate (who downed the victim) rather
             // than the player the feed names.
-            if let Some(credited) = self.take_credit(&username, c.pos()) {
+            let credit = self.take_credit(&username, c.pos());
+            let credited = credit.is_some();
+            if let Some(Some(credited)) = credit {
                 u.credited_to = credited;
             }
+            // A team kill is credited to nobody.
+            let team_kill = self.team_of(&username).is_some()
+                && self.team_of(&username) == self.team_of(&target);
             u.target = target;
             u.headshot = Some(headshot);
             u.weapon = weapon;
+            if !credited && !team_kill && self.code() >= version::Y11S3 {
+                let at = (self.round.match_feedback.len(), c.pos());
+                self.uncredited_kills.push(at);
+            }
             self.push(u);
         }
         Ok(())
@@ -4064,58 +4168,110 @@ impl<'a> Parser<'a> {
     }
 
     /// Y11S3+: a value written to a player's scoreboard object. Values are
-    /// match totals; the first assists value seen is the total going into
-    /// the round.
+    /// match totals; the first value seen of each is that of the opening
+    /// snapshot, the total going into the round.
     fn read_scoreboard_object(&mut self, c: &mut Cursor, field: ScoreField) -> Result<()> {
         let Some(name) = self.scoreboard_owner(c) else {
             return Ok(());
         };
         let v = c.u32()?;
-        let (e, base) = self.scoreboard_by_name.entry(name.clone()).or_default();
+        let (e, seen) = self.scoreboard_by_name.entry(name.clone()).or_default();
+        let bit = 1 << field as u8;
+        let first = *seen & bit == 0;
+        *seen |= bit;
+        let start = e.start.get_or_insert_default();
         match field {
-            ScoreField::Score => e.score = v,
+            ScoreField::Score => {
+                e.score = v as i32;
+                if first {
+                    start.score = v as i32;
+                }
+            }
             ScoreField::Assists => {
-                let base = *base.get_or_insert(v);
+                if first {
+                    start.assists = v;
+                }
                 e.assists = v;
-                e.assists_from_round = v.saturating_sub(base);
+                e.assists_from_round = v.saturating_sub(start.assists);
+            }
+            ScoreField::GameModeActions => {
+                if first {
+                    start.game_mode_actions = v;
+                }
+                e.game_mode_actions = Some(v);
+            }
+            ScoreField::Placement => e.placement = Some(v),
+            ScoreField::Deaths => {
+                if first {
+                    start.deaths = v;
+                }
+                e.deaths = Some(v);
             }
             ScoreField::Kills => {
-                if e.kills.is_some_and(|k| v > k) {
-                    self.pending_credits.push((name, c.pos()));
+                if first {
+                    start.kills = v;
                 }
+                let credits = e.kills.map_or(0, |k| v.saturating_sub(k));
                 e.kills = Some(v);
+                for _ in 0..credits {
+                    if !self.credit_earlier_kill(&name, c.pos()) {
+                        self.pending_credits.push((name.clone(), c.pos()));
+                    }
+                }
             }
-            ScoreField::Deaths => e.deaths = Some(v),
         }
         Ok(())
     }
 
-    /// The teammate the scoreboard credited with the kill `killer` is named
-    /// for in the feed, when that is not `killer`. Credits older than
-    /// `CREDIT_WINDOW` bytes are dropped; a credit to the killer is used up
-    /// first.
-    fn take_credit(&mut self, killer: &str, at: usize) -> Option<String> {
+    fn team_of(&self, name: &str) -> Option<usize> {
+        let players = &self.round.header.players;
+        Some(players.iter().find(|p| p.username == name)?.team_index)
+    }
+
+    /// The scoreboard credit for the kill `killer` is named for in the
+    /// feed: `Some(None)` when it went to `killer`, the teammate's name
+    /// when it went to one, `None` when no credit was waiting. Credits
+    /// older than `CREDIT_WINDOW` bytes are dropped; a credit to the killer
+    /// is used up first.
+    fn take_credit(&mut self, killer: &str, at: usize) -> Option<Option<String>> {
         self.pending_credits
             .retain(|(_, from)| at.saturating_sub(*from) < CREDIT_WINDOW);
         if let Some(i) = self.pending_credits.iter().position(|(n, _)| n == killer) {
             self.pending_credits.remove(i);
-            return None;
+            return Some(None);
         }
-        let team = |name: &str| {
-            let p = self
-                .round
-                .header
-                .players
-                .iter()
-                .find(|p| p.username == name)?;
-            Some(p.team_index)
-        };
-        let killer_team = team(killer)?;
+        let killer_team = self.team_of(killer)?;
         let i = self
             .pending_credits
             .iter()
-            .position(|(n, _)| team(n) == Some(killer_team))?;
-        Some(self.pending_credits.remove(i).0)
+            .position(|(n, _)| self.team_of(n) == Some(killer_team))?;
+        Some(Some(self.pending_credits.remove(i).0))
+    }
+
+    /// Gives a kill credited to `name` at `at` to a feed kill written just
+    /// before it that no credit was waiting for: the killer's own, else a
+    /// teammate's, which is then `creditedTo` of that kill.
+    fn credit_earlier_kill(&mut self, name: &str, at: usize) -> bool {
+        self.uncredited_kills
+            .retain(|(_, from)| at.saturating_sub(*from) < CREDIT_WINDOW);
+        let feed = &self.round.match_feedback;
+        let killer = |&(i, _): &(usize, usize)| feed.get(i).map(|u| u.username.as_str());
+        let own = |k: &(usize, usize)| killer(k) == Some(name);
+        let team = self.team_of(name);
+        let mate = |k: &(usize, usize)| {
+            team.is_some() && killer(k).and_then(|n| self.team_of(n)) == team
+        };
+        let kills = &self.uncredited_kills;
+        let Some(at) = kills.iter().position(own).or_else(|| kills.iter().position(mate)) else {
+            return false;
+        };
+        let (i, _) = self.uncredited_kills.remove(at);
+        if let Some(u) = self.round.match_feedback.get_mut(i)
+            && u.username != name
+        {
+            u.credited_to = name.to_owned();
+        }
+        true
     }
 
     /// Files the Y11S3 scoreboard values under each player's packet id.
@@ -4145,7 +4301,7 @@ impl<'a> Parser<'a> {
         c.skip(13)?;
         let id = c.array::<4>()?;
         if self.round.player_index_by_id(id).is_some() {
-            self.round.scoreboard.entry(id).or_default().score = score;
+            self.round.scoreboard.entry(id).or_default().score = score as i32;
         }
         Ok(())
     }

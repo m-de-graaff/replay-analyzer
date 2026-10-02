@@ -70,6 +70,7 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `gadgets`, `mapCameras` | Every gadget object placed or thrown: what, whose, where, when, its states, the statuses put on it, each time it went off as a trap, and how it ended, with who destroyed it where the scoreboard tells. The map's own cameras, with when each was destroyed. See [Gadgets, world and destruction](#gadgets-world-and-destruction). | Y11S3+ |
 | `deviceRemovals`, `gadgetStatuses`, `trapTriggers` | The same events for what is no entry of `gadgets`: drones and cameras destroyed, a status on a drone or a camera's mount, a trap no object was matched to. | Y11S3+ |
 | `scoreChanges` | Every change of a player's score, with what it was probably for. | Y11S3+ |
+| `scoreboard` | Per player: the match totals of score, kills, deaths, assists and plants at the start and the end of the round, and what the round added. See [Scoreboard](#scoreboard). | Y11S3+ |
 | `reinforcements`, `barricades` | Who put up what, where, when and on which wall, hatch, door or window; when a reinforcement was opened, and how a barricade was destroyed. | Y11S3+ |
 | `destruction`, `surfaces`, `breaches` | What damaged the map and its panels, bullets apart; the holes that left (derived); every breach device with what became of it. | Y11S3+ |
 | `areas`, `environment`, `lightScreens` | Smoke, fire, gas and swarm areas with their source and owner; gas pipes, fire extinguishers and metal detectors set off; the light screens of Sens. | Y11S3+ |
@@ -155,7 +156,7 @@ The library equivalent is `library::scan(path, ReadMode::Header)`.
 ### Limits worth knowing
 
 - **Replays hold no rank, rank points, max rank or reputation.** All 167 rounds of a real `MatchReplay` folder (21 ranked, 4 unranked and 5 quick matches) and the 10 test rounds were searched: every header key, every property of every object in the state stream, every other stream, number scans for rank-point values, and text in ASCII and UTF-16. The per-player profile object holds the same 21 properties in ranked, unranked, quick and custom matches, and none is a rank. The in-game scoreboard shows ranks, so the game must fetch them from Ubisoft's services. Use the players' `profileID` with Ubisoft's stats services (or the R6 Data API) for lobby strength.
-- **Replays hold no server region and no ping.** The same rounds were searched for the data-center names the game itself uses (`gamelift/eu-west-1` and so on, plain and hashed), for region, host and IP text, and for any per-player value that behaves like latency. The scoreboard object carries score, kills, deaths, assists, a placement that is always 0 and a per-match counter, and nothing else. The only geographic hint is the recording PC's UTC offset (`timing`).
+- **Replays hold no server region and no ping.** The same rounds were searched for the data-center names the game itself uses (`gamelift/eu-west-1` and so on, plain and hashed), for region, host and IP text, and for any per-player value that behaves like latency. The scoreboard object carries score, kills, deaths, assists, defuser plants and a placement that is always 0, and nothing else (see [Scoreboard](#scoreboard)). A second search walked every property of every object in the state stream of 38 rounds (28 real, recorded as a player, and the 10 test rounds) and tried the hashes of about 490,000 names for ping, latency and connection quality against every hash seen: no property is one, and none behaves like one. The only geographic hint is the recording PC's UTC offset (`timing`).
 - **`endedEarly`** comes from `matchresult`. A forfeit, where a team surrenders, should carry 1 or 2 like a normal ending and so get a winner, but no forfeit has been seen. Value 7 has been seen once: the server ended a ranked match 0.03 s into round 4, with no clock, both teams marked as losing and a system notice no other round has. The cause, which the file does not say, may be a ban of a cheating player, which ends a match for everyone.
 - **Dual Front** (6v6, respawns) has not been seen in a replay, and no source says whether it records one. Pick packets are split into teams by `maxPlayersPerTeam`, and `picks` can hold several operators per player, but respawns are not decoded.
 
@@ -169,6 +170,46 @@ The library equivalent is `library::scan(path, ReadMode::Header)`.
 Y11S3 attacker swaps are linked through the player's state object, because the caster UI id older seasons use is shared by a whole team there.
 
 Y11S3 scoreboard packets no longer carry ids that match players; they are linked through each player's scoreboard object instead (see [Players and identity](#players-and-identity)).
+
+## Scoreboard
+
+From Y11S3 every player has a scoreboard object (`PlayerStatsViewModel`, `players[].entities.scoreboard`). It holds seven properties and nothing else, the same seven in each of the 1,837 objects looked at (10 test rounds, 175 real ones). All are match totals: the round's opening snapshot carries what the match stood at, and each later write replaces a total.
+
+| Property | Hash | In `scoreboard[]` | What it is |
+|---|---|---|---|
+| `MatchKills` | `1cd2b19d` | `kills` | Kills the game credits. A kill of a player an opponent downed goes to whoever downed them, not to the finisher; a team kill goes to nobody. |
+| `MatchDeaths` | `cd9c5d72` | `deaths` | Deaths, team kills and deaths without a killer included. |
+| `MatchAssists` | `4d737f9e` | `assists` | Assists. Nothing else in the file records one. |
+| `MatchGameModeActions` | `31a3d4d2` | `gameModeActions` | In Bomb, defusers planted. Disabling one does not count. Only Bomb rounds were seen. |
+| `MatchScore` | `ecda4f80` | `score` | Score, signed: it went below zero mid-round in 3 real rounds. |
+| `MatchPlacement` | `8310f4f4` | `placement` | 0 in every snapshot, never written after it. |
+| `MatchPlacementLabel` | `841d24ab` | not in the output | A text list, empty in every snapshot. |
+
+`scoreboard[]` has one entry per player:
+
+| Field | Meaning | Decoded or inferred |
+|---|---|---|
+| `start` | The totals in the opening snapshot: what the match stood at going into the round. | Decoded |
+| `end` | The totals when the recording ends. | Decoded |
+| `round` | `end` less `start`: the round's score, kills, deaths, assists and plants. | Derived |
+| `placement` | As above. | Decoded |
+
+How it compares with the rest of the round, over the 10 test rounds and 178 real ones (1,867 players):
+
+- **Deaths** equal the feed's in every case, and `stats[].died` is `round.deaths == 1`.
+- **Kills** equal the feed's in every case once a kill is counted for `matchFeedback[].creditedTo` where it has one, and team kills are left out. `stats[].kills` counts what the feed names a player for, so it differs from `round.kills` for a finisher, for the player who downed, and for a team killer.
+- **Score**: `round.score` is the sum of the player's `scoreChanges[].delta` in every case. `stats[].score` is `end.score`, a match total.
+- **Assists**: `stats[].assists` is `round.assists`.
+- **Round to round**: a round starts on the totals the round before ended on. Of 1,557 player pairs, 1,533 do; 20 are across a round that is missing from its folder, 3 are a plant counted after the recording stopped, and 1 is the reconnect below.
+- **Headshots are not on the scoreboard.** They come from the kill feed (`matchFeedback[].headshot`, summed in `stats[].headshots`); every kill has the flag.
+
+`scoreChanges[]` is the raw history of `MatchScore`: each change with `delta`, `total` and when. Only the `reason` on it is inferred (see [What happens to gadgets](#what-happens-to-gadgets)).
+
+Limits:
+
+- **A player who reconnects mid-round gets a new scoreboard object**, and what is written to it is not read: 1 of the 1,867 (10 points missing from `end.score`). The next round's `start` has the right total.
+- **A plant can be counted without a `DefuserPlantComplete`** in the feed, when the round is decided while the defuser is being planted (4 real rounds).
+- **A player who left before the round** keeps a scoreboard object with frozen totals; they are not in `players` and have no entry.
 
 ## Bans
 
@@ -407,7 +448,7 @@ It is joined onto the events the parser already had:
 | `lifeEvents[].by` | Who downed the player, or who revived them. All 32 revives and 314 of 319 downs name someone. |
 | `lifeEvents[].self` | The player revived themselves (6 of 32: Doc's and Finka's own abilities). |
 | `lifeEvents[].outcome` | For a down: `Finished` (with `finishedBy`), `Revived`, `DownAtEnd`, or `Died` when the player died with no killer named. |
-| `matchFeedback[].finish`, `downedBy` | The kill ended a down, and who dealt that down. Where the scoreboard credits the kill to another player (`creditedTo`), it is always the downer. |
+| `matchFeedback[].finish`, `downedBy` | The kill ended a down, and who dealt that down. Where the scoreboard credits the kill to another player (`creditedTo`), it is the downer, in all but 1 of 22 such kills in the test and real rounds: there the feed names the player who dealt the down and the scoreboard credits a teammate. |
 | `matchFeedback[].teamKill` | The timeline lists the kill as a team kill (12 in the real folder, the same 12 whose killer and victim share a team). |
 
 - **No bleed-out has been seen.** No player bled out in 174 rounds, so what one looks like is untested. It should read as `Died`. The bleed-out timer itself (`DBNOProgress`) is in the file and not output.
@@ -1181,7 +1222,7 @@ Every player in `players[]` carries:
 | `renamedTo` | The name the game gave the player as the match ended. See [Names](#names). | Y11S3+ | Decoded |
 | `cosmetics` | Uniform, headgear, operator card, weapon skins, charms and attachments, as asset ids. See [Cosmetics](#cosmetics). | Y11S3+ | Decoded |
 
-Kill feed entries name their players' `profileID` and `targetProfileID`. From Y11S3 a kill can also carry `creditedTo`: the scoreboard credits a kill to the teammate who downed the victim when another player finished them, while the feed names the finisher. With those credits counted, the scoreboard's kill and death totals match the kill feed in every test round.
+Kill feed entries name their players' `profileID` and `targetProfileID`. From Y11S3 a kill can also carry `creditedTo`: the scoreboard credits a kill to the teammate who downed the victim when another player finished them, while the feed names the finisher. The credit is written within a frame of the feed entry, before or after it. With those credits counted, the scoreboard's kill and death totals match the kill feed in every test round and in the 178 real rounds checked.
 
 `weaponReady` lists each change of the controller's `CanFire` flag (`ready`, `phase`, `elapsed`). Attackers hold it at `false` through prep, on their drones, until their body spawns; in action it drops while a drone or gadget is in hand, not on reloads or swaps between guns. `weaponActivity` says what a player held (see [Weapon handling](#weapon-handling)).
 

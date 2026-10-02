@@ -15,7 +15,10 @@ pub struct PlayerRoundStats {
     pub username: String,
     #[serde(skip)]
     pub team_index: usize,
-    pub score: u32,
+    /// The player's match score when the recording ends: a total, not the
+    /// round's points (those are `scoreboard[].round.score`). From Y11S3
+    /// it can be below zero.
+    pub score: i32,
     #[serde(skip)]
     pub operator: String,
     pub kills: u32,

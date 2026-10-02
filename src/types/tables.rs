@@ -5,7 +5,7 @@ use super::ItemKind::{self, Ability, Gadget, Primary, Secondary};
 use super::TeamRole::{self, Attack, Defense};
 
 /// `(name, id, role)` for every known operator. `Recruit` has no fixed role.
-pub(super) const OPERATORS: &[(&str, u64, Option<TeamRole>)] = &[
+pub(crate) const OPERATORS: &[(&str, u64, Option<TeamRole>)] = &[
     ("Recruit", 359656345734, None),
     ("Castle", 92270642682, Some(Defense)),
     ("Aruni", 104189664704, Some(Defense)),

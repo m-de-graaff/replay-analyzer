@@ -11,6 +11,7 @@
 pub mod activity;
 pub mod analytics;
 pub mod areas;
+pub mod catalog;
 pub mod census;
 pub mod combat;
 pub mod container;

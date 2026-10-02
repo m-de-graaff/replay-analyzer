@@ -19,7 +19,8 @@ pub(crate) use map_tables::{PanelAsset, panel_asset};
 pub(crate) use fx_tables::{EnvObject, env_object, env_objects};
 pub use fx_tables::{FxAsset, fx_asset};
 pub use tables::{AttachmentInfo, attachment_info, item_kind, item_name};
-use tables::{MAPS, OPERATORS, PLAYLISTS, ROLE_IMAGES};
+pub(crate) use tables::OPERATORS;
+use tables::{MAPS, PLAYLISTS, ROLE_IMAGES};
 
 /// Serializes as `{"name": ..., "id": ...}`.
 fn serialize_named<S: Serializer>(s: S, name: &str, id: u64) -> Result<S::Ok, S::Error> {

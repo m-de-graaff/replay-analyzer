@@ -290,6 +290,10 @@ pub struct Hit {
     /// names the attacker: kept to measure the rules against the timeline.
     #[serde(skip)]
     pub estimate: Option<(String, AttackerSource)>,
+    /// Where the victim's body was before the hit: kept for
+    /// [`crate::joins`], which looks for pings near a kill.
+    #[serde(skip)]
+    pub position: Option<[f32; 3]>,
 }
 
 /// A kill, team kill, death, down or revive as the timeline record holds it.
@@ -1123,6 +1127,7 @@ fn hits(
             elapsed: at.elapsed,
             recording_time: at.recording_time,
             estimate: guess.and_then(|(by, rule)| Some((name(by)?, rule))),
+            position: tracks.before(player, frame).map(|p| p.position),
         });
     }
     if malformed > 0 {

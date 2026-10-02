@@ -89,7 +89,8 @@
 //!
 //! **Views.** The view a player table (`aca4c435`) gives a player is the
 //! id of the device they look through, which links the `observation`
-//! sessions to devices.
+//! sessions to devices. [`crate::joins`] names who spotted a player from
+//! them, and from where each device was and how it was turned.
 
 use std::collections::HashMap;
 
@@ -433,14 +434,25 @@ pub struct CameraCount {
 
 /// A player looking through a device, from the player tables.
 #[derive(Clone, Debug, PartialEq)]
-struct View {
-    username: String,
-    entity: u64,
+pub(crate) struct View {
+    pub username: String,
+    pub entity: u64,
     /// The entity is one of `drones` or `cameras`.
-    known: bool,
+    pub known: bool,
     /// Seconds since the recording started.
-    from: f64,
-    to: Option<f64>,
+    pub from: f64,
+    pub to: Option<f64>,
+}
+
+/// Where a device a player looked through was, and how it was turned.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Pose {
+    pub entity: u64,
+    pub drone: bool,
+    /// `(seconds since the recording started, position)`, as it changed.
+    pub places: Vec<(f64, [f32; 3])>,
+    /// The same for the rotation, a quaternion `[x, y, z, w]`.
+    pub turns: Vec<(f64, [f32; 4])>,
 }
 
 /// What [`decode`] found.
@@ -450,7 +462,9 @@ pub(crate) struct Decoded {
     pub cameras: Vec<Camera>,
     pub events: Vec<DeviceEvent>,
     pub camera_counts: Vec<CameraCount>,
-    views: Vec<View>,
+    pub views: Vec<View>,
+    /// One per device a view names.
+    pub poses: Vec<Pose>,
     /// What could not be read, for `decodeStatus`.
     pub warnings: Vec<String>,
 }
@@ -613,6 +627,7 @@ fn observation(r: &mut Reader) -> Option<Observation> {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Update<'a> {
     position: Option<[f32; 3]>,
+    rotation: Option<[f32; 4]>,
     /// 1 in the world, 0 out of it.
     live: Option<u8>,
     observation: Option<Observation>,
@@ -644,7 +659,8 @@ fn transform(r: &mut Reader, out: &mut Update) -> Option<()> {
         out.position = p.iter().all(|v| v.is_finite()).then_some(p);
     }
     if sub & 0x02 != 0 {
-        r.take(16)?;
+        let q: [f32; 4] = r.floats()?;
+        out.rotation = q.iter().all(|v| v.is_finite()).then_some(q);
     }
     if sub & 0x04 != 0 {
         out.live = Some(r.u8()?);
@@ -872,6 +888,7 @@ struct Made {
     /// 0 for an object of the map.
     asset: u64,
     position: [f32; 3],
+    rotation: [f32; 4],
     map: bool,
 }
 
@@ -883,6 +900,7 @@ fn made(payload: &[u8]) -> Option<Made> {
         _ => return None,
     };
     let position = Reader(payload.get(16..)?).floats()?;
+    let rotation = Reader(payload.get(28..)?).floats()?;
     let mut r = Reader(payload.get(53..)?);
     let count = r.u32()? as usize;
     if count > MAX_CLASSES {
@@ -894,6 +912,7 @@ fn made(payload: &[u8]) -> Option<Made> {
         classes,
         asset,
         position,
+        rotation,
         map,
     })
 }
@@ -961,11 +980,14 @@ struct Tracked {
     classes: Vec<Hash>,
     asset: u64,
     map: bool,
-    /// Where it was created.
+    /// Where and when it was created.
     created: [f32; 3],
+    made_at: Frame,
     events: Vec<(Frame, What)>,
     /// Each new position.
     track: Vec<(Frame, [f32; 3])>,
+    /// Each new rotation, the one it was created with first.
+    turns: Vec<(Frame, [f32; 4])>,
     state: State,
     /// Whether its first full state names an asset.
     assets: Option<bool>,
@@ -987,6 +1009,11 @@ impl Tracked {
             && self.track.last().is_none_or(|l| l.1 != p)
         {
             self.track.push((frame, p));
+        }
+        if let Some(q) = u.rotation
+            && self.turns.last().is_none_or(|l| l.1 != q)
+        {
+            self.turns.push((frame, q));
         }
         let (s, events) = (&mut self.state, &mut self.events);
         let mut note = |is: bool, what: What| {
@@ -1501,6 +1528,8 @@ pub(crate) fn decode(input: &Input, shots: &[Shot], defense: Option<usize>) -> D
                     asset: m.asset,
                     map: m.map,
                     created: m.position,
+                    made_at: frame,
+                    turns: vec![(frame, m.rotation)],
                     ..Tracked::default()
                 });
             } else if m.classes.contains(&PLACED) {
@@ -1878,6 +1907,22 @@ pub(crate) fn decode(input: &Input, shots: &[Shot], defense: Option<usize>) -> D
     }
 
     out.views = views(input, &outs, &seconds);
+    // The devices looked through, as the stream placed and turned them.
+    let timed = |frame: Frame| seconds(frame).map(millis);
+    for t in &tracked {
+        if !out.views.iter().any(|v| v.entity == t.entity) {
+            continue;
+        }
+        let places = std::iter::once((t.made_at, t.created)).chain(t.track.iter().copied());
+        out.poses.push(Pose {
+            entity: t.entity,
+            drone: t.is_drone(),
+            places: places.filter_map(|p| Some((timed(p.0)?, p.1))).collect(),
+            turns: (t.turns.iter())
+                .filter_map(|q| Some((timed(q.0)?, q.1)))
+                .collect(),
+        });
+    }
     out
 }
 

@@ -48,6 +48,18 @@ impl Serialize for MatchUpdateType {
     }
 }
 
+/// What the killer's team knew of a kill's victim: a spot or a ping.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VictimKnown {
+    /// Seconds from the mark or ping to the kill.
+    pub seconds_ago: f64,
+    /// Who pinged, or who spotted: the spot's inferred `by`, absent when
+    /// it names nobody.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
 /// One entry of the round's event feed.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +95,14 @@ pub struct MatchUpdate {
     /// name (see [`crate::vitals`]); effects without a name are left out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub victim_effects: Vec<&'static str>,
+    /// Y11S3: the killer's team saw a spot mark on the victim at most 15
+    /// seconds before the kill (derived, see [`crate::joins`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub victim_spotted: Option<VictimKnown>,
+    /// Y11S3: a player of the killer's team pinged within 3 m of where the
+    /// victim was hit, at most 15 seconds before the kill (derived).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub victim_pinged: Option<VictimKnown>,
     /// Round clock as displayed in game, e.g. `2:41`.
     pub time: String,
     #[serde(serialize_with = "whole_number_as_int")]
@@ -138,6 +158,8 @@ impl MatchUpdate {
             downed_by: String::new(),
             finish: false,
             victim_effects: Vec::new(),
+            victim_spotted: None,
+            victim_pinged: None,
             time: clock.display.clone(),
             time_in_seconds: clock.seconds,
             message: String::new(),

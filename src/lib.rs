@@ -26,6 +26,7 @@ pub mod format;
 pub mod header;
 pub mod identity;
 pub mod intel;
+pub mod joins;
 pub mod library;
 pub mod loadout;
 pub mod markers;

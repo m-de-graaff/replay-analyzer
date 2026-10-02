@@ -10,7 +10,10 @@ use replay_analyzer::{ReadMode, Round};
 /// What the research scripts found in the ten `custom_*.rec` rounds, by
 /// round number.
 const PINGS: [usize; 10] = [17, 17, 4, 11, 13, 10, 24, 21, 8, 13];
-const SPOTS: [usize; 10] = [5, 0, 2, 5, 8, 1, 9, 2, 4, 5];
+/// Spots, and the marks they are made of: a scan that goes on marks its
+/// player again (see `tests/intel_joins.rs` for the spots themselves).
+const SPOTS: [usize; 10] = [5, 0, 2, 5, 6, 1, 6, 2, 4, 2];
+const MARKS: [usize; 10] = [5, 0, 2, 5, 6, 1, 9, 2, 4, 4];
 const TRACKS: [usize; 10] = [6, 6, 8, 16, 6, 2, 0, 4, 0, 0];
 /// Device markers added; only the rounds with Solis have any.
 const DEVICES: [usize; 10] = [0, 0, 0, 0, 40, 0, 0, 0, 12, 0];
@@ -123,6 +126,7 @@ fn violations(label: &str, round: &Round) -> Vec<String> {
 fn the_test_rounds_hold_the_markers_the_research_found() {
     let mut failures = Vec::new();
     let mut counts = [[0; 10]; 4];
+    let mut marks = [0; 10];
     let mut kinds = [0; 4];
     let mut ends = [0; 4];
     for (i, (name, round)) in test_rounds().iter().enumerate() {
@@ -131,6 +135,7 @@ fn the_test_rounds_hold_the_markers_the_research_found() {
         let of = |op: DeviceOp| round.device_markers.iter().filter(move |d| d.op == op);
         counts[0][i] = round.pings.len();
         counts[1][i] = round.spots.len();
+        marks[i] = round.spots.iter().map(|s| s.marks).sum();
         counts[2][i] = round.ability_markers.len();
         counts[3][i] = of(DeviceOp::Add).count();
         for p in &round.pings {
@@ -167,6 +172,9 @@ fn the_test_rounds_hold_the_markers_the_research_found() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert_eq!(counts, [PINGS, SPOTS, TRACKS, DEVICES]);
+    // The stream holds 41 marks, 3 of them twice in one frame.
+    assert_eq!(marks, MARKS);
+    assert_eq!(MARKS.iter().sum::<usize>(), 38);
     assert_eq!(PINGS.iter().sum::<usize>(), 138);
     assert_eq!(kinds, [90, 11, 33, 4]);
     // 17 pulses of Lion and Grim, 28 markers removed, 3 cleared by a
@@ -227,7 +235,7 @@ fn a_spot_is_where_the_spotted_player_is() {
         }
     }
     println!("{compared} shots compared with {spots} spots");
-    assert_eq!(spots, 41);
+    assert_eq!(spots, 33);
 }
 
 fn match_replay_dir() -> Option<PathBuf> {

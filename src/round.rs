@@ -98,8 +98,12 @@ pub struct Round {
     pub combat: Option<crate::combat::Combat>,
     /// Y11S3: the pings players put on the map (see [`crate::markers`]).
     pub pings: Vec<crate::markers::Ping>,
-    /// Y11S3: operators spotted through a drone or camera.
-    pub spots: Vec<crate::markers::Spot>,
+    /// Y11S3: operators spotted through a drone or camera, with who
+    /// spotted them where that can be inferred (see [`crate::joins`]).
+    pub spots: Vec<crate::joins::Spot>,
+    /// Y11S3 full reads: the points spotters got for a teammate's kill of
+    /// the player they spotted (inferred).
+    pub spot_assists: Vec<crate::joins::SpotAssist>,
     /// Y11S3: the tracking markers abilities put on players.
     pub ability_markers: Vec<crate::markers::Track>,
     /// Y11S3: changes to the device markers of Solis.
@@ -110,6 +114,8 @@ pub struct Round {
     /// Y11S3 full reads: each player's operator becoming known to the other
     /// team.
     pub operator_reveals: Vec<crate::intel::Reveal>,
+    /// Y11S3 full reads: Dokkaebi hacking the phone of a dead defender.
+    pub phone_hacks: Vec<crate::intel::PhoneHack>,
     /// Y11S3 full reads: the alarms of metal detectors (see
     /// [`crate::sound`]).
     pub metal_detectors: Vec<crate::sound::MetalDetector>,
@@ -323,7 +329,9 @@ impl Serialize for Round {
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             pings: &'a [crate::markers::Ping],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
-            spots: &'a [crate::markers::Spot],
+            spots: &'a [crate::joins::Spot],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            spot_assists: &'a [crate::joins::SpotAssist],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             ability_markers: &'a [crate::markers::Track],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
@@ -332,6 +340,8 @@ impl Serialize for Round {
             objective: Option<&'a crate::intel::Objective>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             operator_reveals: &'a [crate::intel::Reveal],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            phone_hacks: &'a [crate::intel::PhoneHack],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             metal_detectors: &'a [crate::sound::MetalDetector],
             replay: ReplayInfo<'a>,
@@ -372,10 +382,12 @@ impl Serialize for Round {
             timeline_events: self.combat.as_ref().map_or(&[][..], |c| &c.events),
             pings: &self.pings,
             spots: &self.spots,
+            spot_assists: &self.spot_assists,
             ability_markers: &self.ability_markers,
             device_markers: &self.device_markers,
             objective: self.objective.as_ref(),
             operator_reveals: &self.operator_reveals,
+            phone_hacks: &self.phone_hacks,
             metal_detectors: &self.metal_detectors,
             replay: self.replay_info(),
             decode_status: &self.decode,
@@ -745,6 +757,12 @@ struct Parser<'a> {
     /// Y11S3: `(decodeStatus field, events found, warnings)` of each kind
     /// of weapon event decoded, and of what [`Parser::resolve_intel`] reads.
     weapon_status: Vec<(&'static str, usize, Vec<String>)>,
+    /// Y11S3: every mark of a spotted operator, and who looked through
+    /// which device where, kept for [`Parser::resolve_intel`] to make the
+    /// spots of.
+    spot_marks: Vec<crate::markers::SpotMark>,
+    views: Vec<crate::devices::View>,
+    poses: Vec<crate::devices::Pose>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -838,6 +856,9 @@ impl<'a> Parser<'a> {
             frame_times: Vec::new(),
             loadout_status: None,
             weapon_status: Vec::new(),
+            spot_marks: Vec::new(),
+            views: Vec::new(),
+            poses: Vec::new(),
         }
     }
 
@@ -2720,7 +2741,9 @@ impl<'a> Parser<'a> {
         self.round.melee_hits = melee.hits;
         self.round.shield_actions = melee.shields;
         self.round.pings = markers.pings;
-        self.round.spots = markers.spots;
+        self.spot_marks = markers.spots;
+        self.views = devices.views;
+        self.poses = devices.poses;
         self.round.ability_markers = markers.tracks;
         self.round.device_markers = markers.devices;
         self.round.drones = devices.drones;
@@ -2778,7 +2801,10 @@ impl<'a> Parser<'a> {
     /// the HUD objects of the state stream (see [`crate::intel`]), and the
     /// alarms of metal detectors, from the sound stream (see
     /// [`crate::sound`]). Reveals are explained by the kills of the feed
-    /// and finds told by the teams' sides, so this follows both.
+    /// and finds told by the teams' sides, so this follows both. The
+    /// scores read here name spotters, so the spots are made here too, and
+    /// with them the causes of reveals and what each kill's victim was
+    /// known by (see [`crate::joins`]).
     fn resolve_intel(&mut self) {
         if self.code() < version::Y11S3 {
             return;
@@ -2804,11 +2830,62 @@ impl<'a> Parser<'a> {
         let sound = crate::sound::decode(&input);
         let found = usize::from(intel.objective.is_some());
         self.weapon_status.extend([
-            ("intel", found + intel.reveals.len(), intel.warnings),
+            (
+                "intel",
+                found + intel.reveals.len() + intel.hacks.len(),
+                intel.warnings,
+            ),
             ("sound", sound.alarms.len(), sound.warnings),
         ]);
+
+        let sight = crate::joins::Sight {
+            views: &self.views,
+            poses: &self.poses,
+            sessions: &self.round.observation,
+            drones: &self.round.drones,
+            cameras: &self.round.cameras,
+        };
+        let (spots, spot_assists) = crate::joins::spots(
+            &self.spot_marks,
+            &header.players,
+            &sight,
+            &self.round.match_feedback,
+            &intel.gains,
+            &intel.assists,
+            |gain| clock.when(gain.at, gain.frame),
+        );
+        let mut reveals = intel.reveals;
+        let (tracks, pings) = (&self.round.ability_markers, &self.round.pings);
+        crate::joins::causes(&mut reveals, &header.players, &spots, tracks, pings);
+        // Where a victim was: the body the hit that killed them landed on,
+        // else where a bullet struck them in that moment.
+        let (combat, bullets) = (&self.round.combat, &self.round.bullet_hits);
+        let place = |kill: &MatchUpdate| {
+            let at = kill.recording_time?;
+            let off = |time: Option<f64>| time.map(|t| (t - at).abs());
+            let near = |time: Option<f64>| off(time).is_some_and(|d| d <= JOIN_WINDOW);
+            let hits = combat.iter().flat_map(|c| &c.hits);
+            let body = hits
+                .filter(|h| h.username == kill.target && near(h.recording_time))
+                .filter_map(|h| Some((off(h.recording_time)?, h.position?)))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let struck = || {
+                let on = |b: &&crate::shots::Hit| {
+                    b.victim == kill.target && near(b.when.recording_time) && b.position.is_some()
+                };
+                bullets.iter().rfind(on).and_then(|b| b.position)
+            };
+            let place = body.map(|b| b.1).or_else(struck)?;
+            Some(place.map(f64::from))
+        };
+        let feed = &mut self.round.match_feedback;
+        crate::joins::kills(feed, &header.players, &spots, pings, place);
+
+        self.round.spots = spots;
+        self.round.spot_assists = spot_assists;
         self.round.objective = intel.objective;
-        self.round.operator_reveals = intel.reveals;
+        self.round.operator_reveals = reveals;
+        self.round.phone_hacks = intel.hacks;
         self.round.metal_detectors = sound.alarms;
     }
 

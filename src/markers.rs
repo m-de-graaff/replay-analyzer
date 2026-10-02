@@ -43,16 +43,20 @@
 //! spot or on the object next to it, within half a second.
 //!
 //! A spotted operator is written once too, with the body and the team that
-//! sees it. Who spotted is not in the file; a player of the seeing team
-//! was on a drone or camera at nearly every spot, which is why it is taken
-//! to be the red ping.
+//! sees it, and again every 1.5 to 1.9 s while the scan goes on;
+//! [`crate::joins`] makes one spot of such marks. Who spotted is not in the
+//! file; a player of the seeing team was on a drone or camera at nearly
+//! every spot, which is why it is taken to be the red ping.
 //!
 //! A tracking marker is one per body and source. It is written again as it
 //! moves, and ends with a record that has `removed` set, or with one of
 //! source 14 that clears every marker of a body as its player dies. Lion's
 //! scan and Grim's swarm write a marker per pulse and never remove it: how
 //! long those show is not in the file. The sources were named by the
-//! status effect (see [`crate::vitals`]) on the marked player.
+//! status effect (see [`crate::vitals`]) on the marked player. Whose
+//! ability it was is not in the record: `by` is the one opponent of the
+//! marked player who plays the operator of that ability, and is absent
+//! when none or several do.
 //!
 //! Device markers were seen only in rounds with Solis, on attackers'
 //! devices and on objects of the map. That they are what her SPEC-IO
@@ -131,8 +135,8 @@ pub fn label_name(id: u64) -> Option<&'static str> {
 /// The name of a tracking marker's source. Inferred: each is the status
 /// effect (see [`crate::vitals::effect_name`]) that showed on the marked
 /// player; `LionScan` shows on the team that sees the marker, and
-/// `DeimosTracking` marks Deimos himself. Source 8 was seen without a
-/// telling effect.
+/// `DeimosTracking` marks Deimos himself. Source 8 takes the place of 6
+/// and 7 for about 2 s, only in rounds with both Deimos and Mute.
 pub fn source_name(source: u32) -> Option<&'static str> {
     Some(match source {
         0 => "JackalTracked",
@@ -142,6 +146,20 @@ pub fn source_name(source: u32) -> Option<&'static str> {
         5 => "GrimTracked",
         6 => "DeimosMarked",
         7 => "DeimosTracking",
+        8 => "TrackerJammed",
+        _ => return None,
+    })
+}
+
+/// The operator whose ability puts the markers of a source. Source 7 is on
+/// Deimos himself and 8 on either player, so they name nobody else.
+fn source_operator(source: u32) -> Option<&'static str> {
+    Some(match source {
+        0 => "Jackal",
+        1 => "Alibi",
+        3 => "Lion",
+        4 | 5 => "Grim",
+        6 => "Deimos",
         _ => return None,
     })
 }
@@ -201,10 +219,10 @@ pub struct Ping {
     pub when: When,
 }
 
-/// An operator spotted for a team. Who spotted them is not in the file.
+/// One mark of an operator spotted for a team, as the stream wrote it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Spot {
+pub struct SpotMark {
     /// The player who was spotted.
     pub username: String,
     /// The team that sees the marker.
@@ -225,6 +243,14 @@ pub struct Source {
     pub name: Option<&'static str>,
 }
 
+/// How `by` of a tracking marker was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrackBy {
+    /// The only opponent who plays the operator of the ability.
+    Operator,
+}
+
 /// How a tracking marker ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,6 +268,12 @@ pub struct Track {
     /// The player who was marked.
     pub username: String,
     pub source: Source,
+    /// Whose ability it was. Inferred, as `by_source` says how; absent when
+    /// nobody can be named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by_source: Option<TrackBy>,
     /// The team that sees the marker.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seen_by: Option<usize>,
@@ -303,7 +335,8 @@ fn hex_id<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Decoded {
     pub pings: Vec<Ping>,
-    pub spots: Vec<Spot>,
+    /// Every mark of a spotted operator; [`crate::joins`] makes the spots.
+    pub spots: Vec<SpotMark>,
     /// In the order they started.
     pub tracks: Vec<Track>,
     pub devices: Vec<DeviceMarker>,
@@ -442,6 +475,8 @@ struct Walk {
     bodies: HashMap<u64, String>,
     /// Alliance -> team index.
     teams: HashMap<u32, usize>,
+    /// `(username, team index, operator)` of each player.
+    operators: Vec<(String, usize, String)>,
     open: Vec<Open>,
     unparsed: usize,
     strangers: usize,
@@ -462,8 +497,19 @@ impl Walk {
             if let Ok(alliance) = u32::try_from(p.alliance) {
                 walk.teams.insert(alliance, p.team_index);
             }
+            let operator = p.operator.to_string();
+            (walk.operators).push((p.username.clone(), p.team_index, operator));
         }
         walk
+    }
+
+    /// The one opponent of `marked` who plays the operator of `source`.
+    fn user(&self, source: u32, marked: &str) -> Option<String> {
+        let operator = source_operator(source)?;
+        let team = self.operators.iter().find(|p| p.0 == marked)?.1;
+        let mut users = (self.operators.iter()).filter(|p| p.2 == operator && p.1 != team);
+        let user = users.next()?;
+        users.next().is_none().then(|| user.0.clone())
     }
 
     /// The events of one record, written at `when`, which is `seconds`
@@ -558,7 +604,7 @@ impl Walk {
             return;
         };
         if m.class == SPOT {
-            self.out.spots.push(Spot {
+            self.out.spots.push(SpotMark {
                 username,
                 seen_by: team,
                 position,
@@ -591,12 +637,15 @@ impl Walk {
                 start: seconds,
             });
         }
+        let by = self.user(m.source, &username);
         self.out.tracks.push(Track {
             username,
             source: Source {
                 id: m.source,
                 name: source_name(m.source),
             },
+            by_source: by.is_some().then_some(TrackBy::Operator),
+            by,
             seen_by: team,
             position,
             path: Vec::new(),
@@ -866,7 +915,38 @@ mod tests {
         for t in &out.tracks {
             assert_eq!((t.ended, t.seconds), (Some(Ended::Cleared), Some(2.0)));
         }
-        assert_eq!(out.tracks[1].source.name, None);
+        assert_eq!(out.tracks[1].source.name, Some("TrackerJammed"));
+        assert_eq!(source_name(9), None);
+    }
+
+    #[test]
+    fn a_marker_is_by_the_one_opponent_who_plays_its_operator() {
+        // The marked player of `walk` is on team 1.
+        let by = |others: &[(&str, usize, &str)], source: u32| {
+            let mut w = walk();
+            w.operators = vec![("p".into(), 1, "Mute".into())];
+            for &(name, team, operator) in others {
+                w.operators.push((name.into(), team, operator.into()));
+            }
+            feed(&mut w, 1.0, &[on_body(TRACK, source, false)]);
+            let track = w.finish(None).tracks.remove(0);
+            (track.by, track.by_source)
+        };
+        let mut others = vec![("grim", 0, "Grim"), ("deimos", 0, "Deimos")];
+        let grim = (Some("grim".to_owned()), Some(TrackBy::Operator));
+        assert_eq!(by(&others, 5), grim);
+        assert_eq!(by(&others, 4), grim);
+        assert_eq!(by(&others, 6).0.as_deref(), Some("deimos"));
+        // Nobody plays Jackal; sources 7 and 8 name no other player.
+        for source in [0, 7, 8, 9] {
+            assert_eq!(by(&others, source), (None, None), "source {source}");
+        }
+        // Two of them, or one on the marked player's own team, name nobody.
+        others.push(("other", 0, "Grim"));
+        assert_eq!(by(&others, 5), (None, None));
+        assert_eq!(by(&[("grim", 1, "Grim")], 5), (None, None));
+        let json = serde_json::to_value(TrackBy::Operator).unwrap();
+        assert_eq!(json, "operator");
     }
 
     #[test]

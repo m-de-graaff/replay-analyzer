@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 
 use crate::details::LifeEventType;
+use crate::devices::{DeviceEventType, EndKind};
 use crate::feedback::{MatchUpdate, MatchUpdateType};
 use crate::round::Round;
 
@@ -64,6 +65,34 @@ pub struct PlayerRoundStats {
     /// Y11S3: health heals gave this player.
     #[serde(skip_serializing_if = "is_zero")]
     pub healing_received: u32,
+    /// Y11S3: pings the player put on the map.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pings: u32,
+    /// Y11S3: spots of this player the other team saw.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub times_spotted: u32,
+    /// Y11S3: spots this player is named for. Who spotted is inferred (see
+    /// [`crate::joins`]), and a spot nobody is named for counts for
+    /// nobody, so this is an estimate.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spots_made: u32,
+    /// Y11S3: times the player got the points of a spot assist (inferred).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spot_assists: u32,
+    /// Y11S3: drones and cameras of the other team this player is named
+    /// for destroying. Who destroyed a device is inferred (see
+    /// [`crate::devices`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub devices_destroyed: u32,
+    /// Y11S3: drones of this player that were destroyed.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub drones_lost: u32,
+    /// Y11S3: times a jammer disabled a drone of this player.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub times_jammed: u32,
+    /// Y11S3: 1 when this player found the objective.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objective_found: u32,
     /// Seconds spent on drones (any phase, own or a teammate's).
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
@@ -98,6 +127,23 @@ pub struct PlayerMatchStats {
     pub team_kills: u32,
     #[serde(skip_serializing_if = "is_zero")]
     pub healing_given: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pings: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub times_spotted: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spots_made: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub spot_assists: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub devices_destroyed: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub drones_lost: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub times_jammed: u32,
+    /// Rounds in which this player found the objective.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub objectives_found: u32,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub drone_seconds: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
@@ -251,6 +297,53 @@ impl Round {
                 }
             }
         }
+        for p in &self.pings {
+            if let Some(i) = find(&p.username) {
+                stats[i].pings += 1;
+            }
+        }
+        for s in &self.spots {
+            if let Some(i) = find(&s.username) {
+                stats[i].times_spotted += 1;
+            }
+            if let Some(i) = s.by.as_deref().and_then(find) {
+                stats[i].spots_made += 1;
+            }
+        }
+        for a in &self.spot_assists {
+            if let Some(i) = find(&a.username) {
+                stats[i].spot_assists += 1;
+            }
+        }
+        // A device of the destroyer's own team is not one to their credit.
+        let drones = self.drones.iter().map(|d| (&d.end, true, &d.owner));
+        let cameras = self.cameras.iter().map(|c| (&c.end, false, &c.owner));
+        for (end, drone, owner) in drones.chain(cameras) {
+            let Some(end) = end.as_ref().filter(|e| e.kind == EndKind::Destroyed) else {
+                continue;
+            };
+            if let Some(i) = end.by.as_deref().and_then(find)
+                && !end.team_kill
+            {
+                stats[i].devices_destroyed += 1;
+            }
+            if let Some(i) = owner.as_deref().and_then(find).filter(|_| drone) {
+                stats[i].drones_lost += 1;
+            }
+        }
+        for e in &self.device_events {
+            let jammed = |d: &&crate::devices::Drone| d.entity == e.device;
+            let drone = (self.drones.iter()).find(jammed);
+            if let Some(i) = drone.and_then(|d| d.owner.as_deref()).and_then(find)
+                && e.kind == DeviceEventType::Jam
+            {
+                stats[i].times_jammed += 1;
+            }
+        }
+        let finder = self.objective.as_ref().and_then(|o| o.by.as_deref());
+        if let Some(i) = finder.and_then(find) {
+            stats[i].objective_found = 1;
+        }
         for o in &self.observation {
             if let Some(i) = find(&o.username) {
                 if o.tool.is_drone() {
@@ -361,6 +454,14 @@ pub fn match_stats<'a>(rounds: impl IntoIterator<Item = &'a Round>) -> Vec<Playe
             s.revives_given += p.revives_given;
             s.team_kills += p.team_kills;
             s.healing_given += p.healing_given;
+            s.pings += p.pings;
+            s.times_spotted += p.times_spotted;
+            s.spots_made += p.spots_made;
+            s.spot_assists += p.spot_assists;
+            s.devices_destroyed += p.devices_destroyed;
+            s.drones_lost += p.drones_lost;
+            s.times_jammed += p.times_jammed;
+            s.objectives_found += p.objective_found;
             s.drone_seconds += p.drone_seconds;
             s.camera_seconds += p.camera_seconds;
         }

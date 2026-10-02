@@ -112,8 +112,13 @@ const ACTION_RESET: f64 = 3.0;
 /// The name of an effect type. Inferred, not read: the file holds the
 /// number only. Each name is the operator or gadget that was in the round
 /// every time the type showed (over 174 rounds, 2415 effects) and whose
-/// use preceded it. Types seen without a telling operator (15, 21, 25, 29,
-/// 37, 51) have no name.
+/// use preceded it. Type 15 showed on defenders only, for at most 1.05 s,
+/// with the body outside the area the defenders were in during prep in 17
+/// of 24 cases checked: the warning before a defender outside is detected.
+/// Type 51 started 7.03 to 7.07 s after a Logic Bomb, as a 40-damage
+/// explosion hit that defender, and lasted until death or the end of the
+/// round (6 of 6): the phone Dokkaebi called, overloaded. Types seen
+/// without a telling operator (21, 25, 29, 37) have no name.
 pub fn effect_name(kind: u32) -> Option<&'static str> {
     Some(match kind {
         0 => "JackalTracked",
@@ -127,6 +132,7 @@ pub fn effect_name(kind: u32) -> Option<&'static str> {
         11 => "LionScan",
         13 => "ProximityAlarm",
         14 => "MelusiBanshee",
+        15 => "OutsideWarning",
         22 => "GrimSwarm",
         23 => "GrimTracked",
         26 => "FenrirMine",
@@ -140,6 +146,7 @@ pub fn effect_name(kind: u32) -> Option<&'static str> {
         39 => "ThornRazorbloom",
         43 => "SnakeRadar",
         46 => "NoorLance",
+        51 => "DokkaebiOverload",
         52 => "Burning",
         _ => return None,
     })
@@ -1841,6 +1848,8 @@ mod tests {
     fn effect_names_are_those_of_the_table() {
         assert_eq!(effect_name(2), Some("FinkaSurge"));
         assert_eq!(effect_name(35), Some("ThunderbirdHeal"));
-        assert_eq!(effect_name(15), None);
+        assert_eq!(effect_name(15), Some("OutsideWarning"));
+        assert_eq!(effect_name(51), Some("DokkaebiOverload"));
+        assert_eq!(effect_name(29), None);
     }
 }

@@ -1,5 +1,6 @@
-//! What the teams learn of each other (Y11S3): who found the objective, and
-//! when each player's operator became known to the other team.
+//! What the teams learn of each other (Y11S3): who found the objective,
+//! when each player's operator became known to the other team, and when
+//! Dokkaebi hacked a phone.
 //!
 //! Both are HUD state in the `state` stream, read the way
 //! [`crate::loadout`] reads slots.
@@ -37,7 +38,17 @@
 //! other team scores 10 in that moment (`teamBonus`), which holds for 571
 //! of 601 such reveals, and for some by a kill too. Dying reveals nobody,
 //! and the file hides nothing on its own: every operator is in the
-//! controllers from the start.
+//! controllers from the start. [`crate::joins`] adds what else the stream
+//! wrote in that moment as the `cause`.
+//!
+//! Dokkaebi's ability object links a tablet through its field `Tablet`
+//! (`b4928f1d`), and the tablet has an `EquipState` (`e5e20d29`): 0, 1, 2
+//! in the two seconds before a call, and 3 while she hacks the phone of a
+//! dead defender. A hack takes 2.52 to 2.57 s; a shorter stretch of 3 was
+//! cut off. In 31 real rounds with her, all 24 stretches start after a
+//! defender died and 22 run their full length. Whose phone it was is not
+//! in the file. The scores read here also tell [`crate::joins`] of the
+//! points a spotter gets.
 
 use std::collections::HashMap;
 
@@ -61,6 +72,16 @@ const FEED_ENTRY: Hash = [0x2B, 0x9D, 0x69, 0x47];
 const FEED_MESSAGE: Hash = [0xE3, 0x09, 0x00, 0x79];
 const FEED_KILLER: Hash = [0xAC, 0x19, 0x0F, 0x70];
 const FEED_VICTIM: Hash = [0xD9, 0x13, 0x3C, 0xBA];
+/// Field of Dokkaebi's ability object that links her tablet, and the
+/// tablet's `EquipState`.
+const TABLET: Hash = [0xB4, 0x92, 0x8F, 0x1D];
+const EQUIP_STATE: Hash = [0xE5, 0xE2, 0x0D, 0x29];
+/// The `EquipState` of a tablet that hacks a phone.
+const HACKING: u32 = 3;
+/// A hack that ran this long was completed (seconds).
+const HACK_SECONDS: f64 = 2.4;
+/// Most links between an object and the controller it hangs off.
+const MAX_DEPTH: usize = 32;
 
 /// Points for finding the objective, and for an assist.
 const FIND: i64 = 50;
@@ -135,12 +156,31 @@ pub enum Trigger {
     Identified,
 }
 
+/// What else the marker stream wrote as a player was identified, by
+/// [`crate::joins`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Cause {
+    /// A spot mark on the player.
+    Spot,
+    /// A tracking marker of an ability on the player.
+    AbilityMarker,
+    /// A spot mark on a teammate.
+    TeammateSpot,
+    /// An opponent's ping on an object.
+    Ping,
+}
+
 /// A player's operator becoming known to the other team.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Reveal {
     pub username: String,
     pub trigger: Trigger,
+    /// For `identified`: what the marker stream wrote in the same moment.
+    /// Absent when it wrote nothing that fits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
     /// Whom the player killed, for a `kill`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub victim: Option<String>,
@@ -150,11 +190,31 @@ pub struct Reveal {
     pub when: When,
 }
 
+/// Dokkaebi hacking the phone of a dead defender. `when` is the start.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneHack {
+    pub username: String,
+    /// Absent when the recording ended first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<f64>,
+    /// The hack ran its full length.
+    pub completed: bool,
+    #[serde(flatten)]
+    pub when: When,
+}
+
 /// What [`decode`] found.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Decoded {
     pub objective: Option<Objective>,
     pub reveals: Vec<Reveal>,
+    pub hacks: Vec<PhoneHack>,
+    /// Per player, each change of their score.
+    pub gains: Vec<Vec<Gain>>,
+    /// Per player, when their assist count was written, in seconds since
+    /// the recording started.
+    pub assists: Vec<Vec<f64>>,
     /// What could not be read, for `decodeStatus`.
     pub warnings: Vec<String>,
 }
@@ -190,6 +250,12 @@ struct Hud {
     discovered: Vec<Option<Write>>,
     /// Whether the class an object was last linked with is the feed's.
     entries: HashMap<u32, bool>,
+    /// The object each object was first linked from.
+    parents: HashMap<u32, u32>,
+    /// Objects linked through the field `Tablet`.
+    tablets: Vec<u32>,
+    /// Every `EquipState` written, in stream order.
+    equips: Vec<(u32, Write)>,
     /// In the order first written.
     lines: Vec<(u32, Option<u32>, Line)>,
     line_of: HashMap<(u32, Option<u32>), usize>,
@@ -240,19 +306,37 @@ impl Hud {
                     self.property(obj, hash, element, value, frame, base + at);
                 }
             }
-            Record::ParentChild(parent, _, child) => {
+            Record::ParentChild(parent, field, child) => {
                 current = Some(parent);
-                self.link(child, class(at + 21));
+                self.link(current, field, child, class(at + 21));
             }
-            Record::Child(_, child) => self.link(child, class(at + 13)),
-            Record::Element(_, _, child) => self.link(child, class(at + 17)),
+            Record::Child(field, child) => self.link(current, field, child, class(at + 13)),
+            Record::Element(field, _, child) => self.link(current, field, child, class(at + 17)),
         });
     }
 
-    fn link(&mut self, child: u32, class: Option<Hash>) {
-        if child != 0 {
-            self.entries.insert(child, class == Some(FEED_ENTRY));
+    fn link(&mut self, parent: Option<u32>, field: Hash, child: u32, class: Option<Hash>) {
+        if child == 0 {
+            return;
         }
+        self.entries.insert(child, class == Some(FEED_ENTRY));
+        if let Some(parent) = parent {
+            self.parents.entry(child).or_insert(parent);
+        }
+        if field == TABLET && !self.tablets.contains(&child) {
+            self.tablets.push(child);
+        }
+    }
+
+    /// The player whose controller `object` hangs off.
+    fn owner(&self, mut object: u32) -> Option<usize> {
+        for _ in 0..MAX_DEPTH {
+            if let Some(&player) = self.controllers.get(&object) {
+                return Some(player);
+            }
+            object = *self.parents.get(&object)?;
+        }
+        None
     }
 
     fn property(
@@ -293,6 +377,17 @@ impl Hud {
                     });
                 }
             }
+            (EQUIP_STATE, None) => {
+                // A number, or one byte of it.
+                let state = match value {
+                    &[v] => Some(u32::from(v)),
+                    _ => number(),
+                };
+                match state {
+                    Some(value) => self.equips.push((obj, Write { value, frame, at })),
+                    None => self.malformed += 1,
+                }
+            }
             (FEED_MESSAGE, Some(0)) => {
                 let line = self.line(obj, frame);
                 line.text = Some(String::from_utf8_lossy(value).into_owned());
@@ -316,12 +411,13 @@ impl Hud {
 
 /// A change of a player's score.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Gain {
+pub(crate) struct Gain {
     /// Seconds since the recording started; 0 in the opening snapshot.
-    time: f64,
-    points: i64,
-    frame: Option<u32>,
-    at: usize,
+    pub time: f64,
+    pub points: i64,
+    pub frame: Option<u32>,
+    /// Offset of the write in the data.
+    pub at: usize,
 }
 
 /// A find one of the two sources gives.
@@ -417,6 +513,7 @@ fn resolve(
                 Some(_) => Trigger::Kill,
                 None => Trigger::Identified,
             },
+            cause: None,
             victim: kill.map(|k| k.1.target.clone()),
             team_bonus: opponents.peek().is_some() && opponents.all(paid),
             when: clock.when(flag.at, flag.frame),
@@ -424,12 +521,65 @@ fn resolve(
     }
     let at = |r: &Reveal| r.when.recording_time.unwrap_or(0.0);
     out.reveals.sort_by(|a, b| at(a).total_cmp(&at(b)));
+    out.hacks = hacks(hud, players, clock);
+    // The first write of a count is the one the round started with.
+    out.assists = (hud.assists.iter())
+        .map(|writes| {
+            let later = writes.iter().filter(|w| w.frame.is_some());
+            later.map(|w| seconds(w.frame)).collect()
+        })
+        .collect();
+    out.gains = gains;
     if hud.malformed > 0 {
         out.warnings.push(format!(
-            "{} scores of another size than a number's",
+            "{} scores or states of another size than a number's",
             hud.malformed
         ));
     }
+    out
+}
+
+/// Each stretch of a tablet hacking a phone. A stretch that was on as the
+/// recording started has no start and is left out.
+fn hacks(hud: &Hud, players: &[Player], clock: &Clock) -> Vec<PhoneHack> {
+    let mut out: Vec<PhoneHack> = Vec::new();
+    for &tablet in &hud.tablets {
+        let Some(player) = hud.owner(tablet).and_then(|p| players.get(p)) else {
+            continue;
+        };
+        let mut writes = (hud.equips.iter())
+            .filter(|e| e.0 == tablet && e.1.frame.is_some())
+            .map(|e| e.1);
+        let mut start: Option<Write> = None;
+        let mut close = |start: Write, end: Option<Write>| {
+            let span = |end: Write| {
+                let (from, to) = (clock.seconds(start.frame)?, clock.seconds(end.frame)?);
+                Some(round_ms(to - from))
+            };
+            let seconds = end.and_then(span);
+            out.push(PhoneHack {
+                username: player.username.clone(),
+                seconds,
+                completed: seconds.is_some_and(|s| s >= HACK_SECONDS),
+                when: clock.when(start.at, start.frame),
+            });
+        };
+        for w in writes.by_ref() {
+            match (start, w.value == HACKING) {
+                (None, true) => start = Some(w),
+                (Some(from), false) => {
+                    close(from, Some(w));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(from) = start {
+            close(from, None);
+        }
+    }
+    let at = |h: &PhoneHack| h.when.recording_time.unwrap_or(0.0);
+    out.sort_by(|a, b| at(a).total_cmp(&at(b)));
     out
 }
 
@@ -826,6 +976,99 @@ mod tests {
         );
         assert_eq!(reveals[1].when.recording_time, Some(60.3));
         assert_eq!(reveals[0].when.phase, Phase::Prep);
+    }
+
+    /// A write of the tablet's state.
+    fn equip(f: &mut Fixture, frame: u32, tablet: u32, state: u32) {
+        let mut d = vec![];
+        set(&mut d, tablet, EQUIP_STATE, &state.to_le_bytes());
+        f.frame(frame, &d);
+    }
+
+    #[test]
+    fn a_stretch_of_the_tablet_hacking_is_a_phone_hack() {
+        const ABILITY: u32 = 0xF000_0500;
+        const TABLET_OBJECT: u32 = 0xF000_0600;
+        let mut f = Fixture::new();
+        // Player 1's controller holds the ability object, which links the
+        // tablet through `Tablet`.
+        let mut d = vec![];
+        link(&mut d, CONTROLLER + 1, ABILITY, OTHER);
+        d.push(0x1B);
+        d.extend(ABILITY.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(TABLET);
+        d.extend(TABLET_OBJECT.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(OTHER);
+        set(&mut d, TABLET_OBJECT, EQUIP_STATE, &0u32.to_le_bytes());
+        f.hud.read(&d, 0, None);
+        // A call: 1, 2, back to 0. Then a hack of 2.5 s, said twice.
+        for (frame, state) in [(500, 1), (510, 2), (530, 0), (900, 3), (910, 3), (925, 0)] {
+            equip(&mut f, frame, TABLET_OBJECT, state);
+        }
+        // One cut short, and one the recording ends in.
+        for (frame, state) in [(1000, 3), (1010, 1), (1200, 3)] {
+            equip(&mut f, frame, TABLET_OBJECT, state);
+        }
+        // The same state on an object no `Tablet` field links is not one.
+        equip(&mut f, 950, ABILITY, 3);
+        let hacks = f.resolve().hacks;
+        let told: Vec<_> = (hacks.iter())
+            .map(|h| (h.when.recording_time, h.seconds, h.completed))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                (Some(90.0), Some(2.5), true),
+                (Some(100.0), Some(1.0), false),
+                (Some(120.0), None, false),
+            ]
+        );
+        assert!(hacks.iter().all(|h| h.username == "p1"));
+        let json = serde_json::to_value(&hacks[2]).unwrap();
+        assert!(json.get("seconds").is_none());
+        assert_eq!(json["completed"], false);
+    }
+
+    #[test]
+    fn a_tablet_of_no_player_or_a_state_of_another_size_is_no_hack() {
+        let mut f = Fixture::new();
+        let mut d = vec![];
+        // Linked from an object that hangs off no controller.
+        d.push(0x1B);
+        d.extend(0xF000_0700u32.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(TABLET);
+        d.extend(0xF000_0800u32.to_le_bytes());
+        d.extend([0; 4]);
+        d.extend(OTHER);
+        set(&mut d, 0xF000_0800, EQUIP_STATE, &3u32.to_le_bytes());
+        prop(&mut d, EQUIP_STATE, &[3, 0]);
+        f.frame(100, &d);
+        // Bytes cut anywhere do not panic.
+        for cut in 0..d.len() {
+            let mut hud = Hud::new(&f.players);
+            hud.read(&d[..cut], 0, Some(1));
+        }
+        let out = f.resolve();
+        assert!(out.hacks.is_empty());
+        assert_eq!(out.warnings.len(), 1);
+    }
+
+    #[test]
+    fn the_scores_are_kept_for_the_joins() {
+        let mut f = Fixture::new();
+        f.score(100, 0, 50);
+        let mut d = vec![];
+        set(&mut d, SCOREBOARD, MATCH_SCORE, &125u32.to_le_bytes());
+        prop(&mut d, MATCH_ASSISTS, &1u32.to_le_bytes());
+        f.frame(200, &d);
+        let out = f.resolve();
+        let points: Vec<_> = out.gains[0].iter().map(|g| (g.time, g.points)).collect();
+        assert_eq!(points, [(10.0, 50), (20.0, 75)]);
+        assert_eq!(out.assists[0], [20.0]);
+        assert!(out.gains[1].is_empty() && out.assists[1].is_empty());
     }
 
     #[test]

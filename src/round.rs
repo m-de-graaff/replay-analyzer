@@ -2091,6 +2091,13 @@ impl<'a> Parser<'a> {
                     "TimerState {state} at {time:.3} s ({times} times): only 0, 1 and 3 are written in rounds without a pause, so this may be how the game marks one"
                 ));
             }
+            // Y11S3 full reads: looked for in 185 rounds and not there.
+            r.field("chat", Status::NotInVersion, 0).warn(
+                "replays hold no text chat: no stream, class or property carries text a player wrote",
+            );
+            r.field("voice", Status::NotInVersion, 0).warn(
+                "replays hold no voice: no audio and nothing that says who is talking",
+            );
         }
         if let Some(c) = round.container.as_ref().filter(|c| !c.complete) {
             let at = c.truncated_at.unwrap_or_default();

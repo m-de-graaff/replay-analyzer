@@ -326,6 +326,8 @@ fn sections(bytes: &[u8], out: &mut Record) -> Option<()> {
             out.points.push((instance, capacity, points));
         }
     }
+    // Walked and never kept: the padding of type 3 entries is memory the
+    // game did not clear, and can hold text of the recording PC.
     if mask & SOUNDS != 0 {
         for _ in 0..r.count(1)? {
             let kind = usize::from(r.u8()?);

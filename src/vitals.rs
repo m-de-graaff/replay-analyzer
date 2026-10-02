@@ -807,7 +807,7 @@ impl<'a> Tracker<'a> {
                 continue;
             };
             let before = life.score.replace(v);
-            let gained = before.is_some_and(|b| v == b + 5);
+            let gained = before.is_some_and(|b| b.checked_add(5) == Some(v));
             if let (true, true, Some(t)) =
                 (gained, self.plays(p, "Thunderbird"), self.seconds(e.frame))
             {

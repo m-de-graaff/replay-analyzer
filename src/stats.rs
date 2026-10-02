@@ -131,6 +131,22 @@ pub struct PlayerRoundStats {
     /// Seconds spent on cameras.
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub camera_seconds: f64,
+    /// Y11S3: the player left during the round, this many seconds after
+    /// prep started (see [`crate::presence`]). The round's other numbers
+    /// are those of a player who was there until then only.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "seconds_as_int"
+    )]
+    pub left_at: Option<f64>,
+}
+
+/// Emits `28` rather than `28.0`, as `elapsed` is written elsewhere.
+fn seconds_as_int<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(v) => crate::feedback::whole_number_as_int(v, s),
+        None => s.serialize_none(),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -196,6 +212,13 @@ pub struct PlayerMatchStats {
     pub drone_seconds: f64,
     #[serde(serialize_with = "crate::feedback::whole_number_as_int")]
     pub camera_seconds: f64,
+    /// Y11S3: rounds the player left during.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rounds_left: u32,
+    /// Y11S3: rounds that started without the player while a seat was
+    /// held for them. They are not among `rounds`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub rounds_missed: u32,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -456,6 +479,12 @@ impl Round {
             }
         }
 
+        for l in self.presence.iter().flat_map(|p| &p.leavers) {
+            if let Some(i) = find(&l.username) {
+                stats[i].left_at.get_or_insert(l.when.elapsed);
+            }
+        }
+
         let mut last_death = None;
         for u in &self.match_feedback {
             match u.kind {
@@ -529,7 +558,8 @@ impl Round {
 pub fn match_stats<'a>(rounds: impl IntoIterator<Item = &'a Round>) -> Vec<PlayerMatchStats> {
     let mut stats: Vec<PlayerMatchStats> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    for round in rounds {
+    let rounds: Vec<&Round> = rounds.into_iter().collect();
+    for round in &rounds {
         for p in round.player_stats() {
             let i = *index.entry(p.username.clone()).or_insert_with(|| {
                 stats.push(PlayerMatchStats {
@@ -574,6 +604,12 @@ pub fn match_stats<'a>(rounds: impl IntoIterator<Item = &'a Round>) -> Vec<Playe
             s.traps_triggered += p.traps_triggered;
             s.drone_seconds += p.drone_seconds;
             s.camera_seconds += p.camera_seconds;
+            s.rounds_left += u32::from(p.left_at.is_some());
+        }
+    }
+    for p in crate::presence::rollup(rounds) {
+        if let Some(s) = index.get(&p.username).and_then(|&i| stats.get_mut(i)) {
+            s.rounds_missed += p.rounds_missed;
         }
     }
     stats

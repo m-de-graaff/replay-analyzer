@@ -568,7 +568,8 @@ impl MatchSummary {
 
 /// Whether two rounds' entries are one player: by key (the profile id when
 /// the replay has one), else by `playerid`. A player who reconnects comes
-/// back under a new `playerid` and the same profile id.
+/// back under the same profile id, and under a new `playerid` when the
+/// game was started again.
 fn same_player(a: &Player, b: &Player) -> bool {
     (!a.key.is_empty() && a.key == b.key) || (a.id != 0 && a.id == b.id)
 }

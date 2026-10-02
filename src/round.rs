@@ -68,6 +68,10 @@ pub struct Round {
     /// Y11S3 full reads: the stretches the round may have been paused for,
     /// inferred (see [`crate::pauses`]).
     pub pauses: Option<crate::pauses::Report>,
+    /// Y11S3 full reads: who left and who came during the round, and the
+    /// seats that were not plainly a player's when it started (see
+    /// [`crate::presence`]).
+    pub presence: Option<crate::presence::Presence>,
     /// Trust level of each output field.
     pub decode: DecodeReport,
     /// Counts of every packet and field seen (only with `ReadOptions::census`).
@@ -492,6 +496,12 @@ impl Serialize for Round {
             #[serde(skip_serializing_if = "Option::is_none")]
             battl_eye: Option<&'a crate::messages::BattlEye>,
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            leavers: &'a [crate::presence::Leaver],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            reconnects: &'a [crate::presence::Reconnect],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            seats: &'a [crate::presence::Seat],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
             metal_detectors: &'a [crate::sound::MetalDetector],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             score_changes: &'a [crate::gadget_events::ScoreChange],
@@ -518,6 +528,7 @@ impl Serialize for Round {
         }
         let vitals = self.vitals.as_ref();
         let gadget_events = self.gadget_events.as_ref();
+        let presence = self.presence.as_ref();
         Output {
             header: &self.header,
             round: self.info(),
@@ -557,6 +568,9 @@ impl Serialize for Round {
             phone_hacks: &self.phone_hacks,
             system_messages: &self.system_messages,
             battl_eye: self.battl_eye.as_ref(),
+            leavers: presence.map_or(&[], |p| &p.leavers),
+            reconnects: presence.map_or(&[], |p| &p.reconnects),
+            seats: presence.map_or(&[], |p| &p.seats),
             metal_detectors: &self.metal_detectors,
             reinforcements: &self.reinforcements,
             barricades: &self.barricades,
@@ -641,10 +655,11 @@ enum Packet {
     InteractionLink,
     SlotType,
     RoundState,
+    HasLeft,
 }
 
 impl Packet {
-    const COUNT: usize = 27;
+    const COUNT: usize = 28;
 
     fn name(self) -> &'static str {
         match self {
@@ -675,11 +690,12 @@ impl Packet {
             Packet::InteractionLink => "interactionLink",
             Packet::SlotType => "slotType",
             Packet::RoundState => "roundState",
+            Packet::HasLeft => "hasLeft",
         }
     }
 }
 
-const PACKETS: [(Packet, &[u8]); 26] = [
+const PACKETS: [(Packet, &[u8]); 27] = [
     (Packet::Player, &[0x22, 0x07, 0x94, 0x9B, 0xDC]),
     (Packet::AttackerSwap, &[0x22, 0xA9, 0x26, 0x0B, 0xE4]),
     (Packet::Spawn, &[0xAF, 0x98, 0x99, 0xCA]),
@@ -705,6 +721,7 @@ const PACKETS: [(Packet, &[u8]); 26] = [
     (Packet::InteractionLink, &INTERACTION_LINK),
     (Packet::SlotType, &SLOT_TYPE),
     (Packet::RoundState, &TEAM0_ROUND_STATE),
+    (Packet::HasLeft, &HAS_LEFT),
     (Packet::Time, &[0x1F, 0x07, 0xEF, 0xC9]),
 ];
 const LEGACY_TIME: &[u8] = &[0x1E, 0xF1, 0x11, 0xAB];
@@ -843,8 +860,12 @@ const DEFUSER_STARTED: [u8; 4] = [0xFF, 0x39, 0xF4, 0x08];
 /// controller (`GameModeInteractionVM`), so plants and disables name a player.
 const INTERACTION_LINK: [u8; 4] = [0x27, 0xC0, 0x8D, 0xCA];
 /// Y11S3+ `PlayerSlotType`, on the controller: 1 while a player is in the
-/// slot, something else once they left.
-const SLOT_TYPE: [u8; 4] = [0xB6, 0xB7, 0x1D, 0xD2];
+/// slot, something else once they left (see [`crate::presence`]).
+const SLOT_TYPE: [u8; 4] = crate::presence::SLOT_TYPE;
+/// Y11S3+ `HasLeft`, on the controller, as a property that follows another
+/// of its run: it is written after the slot type. With the record's `22`
+/// no other marker ends the way this one starts.
+const HAS_LEFT: [u8; 5] = [0x22, 0xCA, 0x35, 0x43, 0x6C];
 /// Y11S3+ `Team0RoundState`, followed by `Team1RoundState`, on the round's
 /// entry in the match's round history. Written when the round is decided:
 /// 2 lost, 3 won by elimination with no plant, 4 won with the defuser
@@ -891,6 +912,12 @@ struct Parser<'a> {
     last_disabler: Option<String>,
     /// Players who left mid-round, with the tick.
     left: Vec<(String, Option<usize>)>,
+    /// Where a `PlayerSlotType` or a `HasLeft` was written, in stream
+    /// order: the blocks [`crate::presence`] reads the seats from.
+    seat_writes: Vec<usize>,
+    /// Y11S3 full reads: what did not fit of the seats and the feed's
+    /// lines about them, for `decodeStatus.presence`.
+    presence_status: Option<Vec<String>>,
     /// Tick of the latest clock gap, which a plant in the same frame undoes.
     last_gap_tick: Option<usize>,
     /// Each team's round state as written when the round was decided.
@@ -1048,6 +1075,8 @@ impl<'a> Parser<'a> {
             last_planter: None,
             last_disabler: None,
             left: Vec::new(),
+            seat_writes: Vec::new(),
+            presence_status: None,
             last_gap_tick: None,
             round_states: None,
             pick_slots: HashMap::new(),
@@ -1180,6 +1209,7 @@ impl<'a> Parser<'a> {
                 self.resolve_movement(stream);
             }
             self.resolve_objective(stream.as_ref());
+            self.resolve_presence(stream.as_ref());
             self.resolve_pauses();
         }
         self.measure_records();
@@ -1920,6 +1950,18 @@ impl<'a> Parser<'a> {
                 "feed lines that are no kills (leaves, objective found) are not decoded for this version",
             );
         }
+        // Y11S3: the seats are read and so are the lines of the feed; a
+        // change of a seat and its line are expected to come together.
+        if let (Some(warnings), Some(p)) = (&self.presence_status, &round.presence) {
+            let f = r.field(
+                "presence",
+                Status::Decoded,
+                p.leavers.len() + p.reconnects.len(),
+            );
+            for w in warnings {
+                f.at_most(Status::Partial).warn(w.clone());
+            }
+        }
 
         let won = h.teams.iter().filter(|t| t.won).count();
         let status = match () {
@@ -2141,6 +2183,10 @@ impl<'a> Parser<'a> {
             Packet::DefuserStarted => self.read_defuser_started(c),
             Packet::InteractionLink => self.read_interaction_link(c),
             Packet::SlotType => self.read_slot_type(c),
+            Packet::HasLeft => {
+                self.seat_writes.push(self.packet_at);
+                Ok(())
+            }
             Packet::RoundState => self.read_round_state(c),
             Packet::LegacyTime => self.read_legacy_time(c),
             Packet::Feedback => self.read_feedback(c),
@@ -2620,6 +2666,8 @@ impl<'a> Parser<'a> {
     /// Y11S3+: a player's slot stops holding a player: they left or lost
     /// connection. Nothing in the kill feed says so.
     fn read_slot_type(&mut self, c: &mut Cursor) -> Result<()> {
+        // Every write is kept: the seats are read where one is.
+        self.seat_writes.push(self.packet_at);
         let Some(name) = self.controller_before(c) else {
             return Ok(());
         };
@@ -3451,6 +3499,57 @@ impl<'a> Parser<'a> {
         self.round.battl_eye = Some(crate::messages::battleye(&found.lines));
         self.round.system_messages = found.lines;
         self.messages_status = Some((found.unknown_ids, found.warnings));
+    }
+
+    /// Y11S3: who left and who came during the round, and the seats that
+    /// were not plain when it started (see [`crate::presence`]): the seats
+    /// from the controllers of the state stream, where the marker scan
+    /// found one written, paired with the feed's lines. Whether a leaver
+    /// was alive is told by the kill feed and checked against their body,
+    /// and how long they had been still by the movement stream, so this
+    /// follows the messages, the round's end and the world.
+    fn resolve_presence(&mut self, stream: Option<&crate::movement::Stream>) {
+        if self.code() < version::Y11S3 || self.messages_status.is_none() {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let players = &self.round.header.players;
+        let input = crate::loadout::Input {
+            data: self.data,
+            map,
+            streams: &container.streams,
+            players,
+            clock: &clock,
+        };
+        let deaths: Vec<(&str, Option<f64>)> = (self.round.match_feedback.iter())
+            .filter_map(|u| Some((u.victim()?, u.recording_time)))
+            .collect();
+        let world = self.world.as_ref();
+        let body_deleted = |player: usize| {
+            let world = world?;
+            Some(world.get(world.body_of(player)?)?.deleted)
+        };
+        let views = &self.player_tables.views;
+        let last_input = |player: usize, frame: u32| {
+            crate::presence::last_input(stream?, views, players.get(player)?, frame)
+        };
+        let context = crate::presence::Context {
+            lines: &self.round.system_messages,
+            deaths: &deaths,
+            down_at_start: &self.round.outcome.down_at_start,
+            body_deleted: &body_deleted,
+            last_input: &last_input,
+        };
+        let found = crate::presence::decode(&input, &self.seat_writes, &context);
+        self.round.presence = Some(found.presence);
+        self.presence_status = Some(found.warnings);
     }
 
     /// Y11S3: score changes, gadget removals with who and how, statuses

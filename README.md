@@ -67,6 +67,7 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `objective`, `operatorReveals`, `phoneHacks` | Who found the objective, when each player's operator became known to the other team and what showed in that moment, and Dokkaebi's phone hacks. | Y11S3+ |
 | `systemMessages` | The lines of the feed that are no kills: players leaving, joining and reconnecting, reverse friendly fire turning on and off, the objective being found, the announcements of a phase, and any line of an id not known, kept with its raw id. See [System messages and BattlEye](#system-messages-and-battleye). | Y11S3+ |
 | `battlEye` | Whether the feed showed a line that says "BattlEye" (`flagged`), which lines, and how many lines are of a kind not known. It marks the round and repeats what the game showed; it says nothing of any player. A match folder adds `battlEye.flaggedRounds`. | Y11S3+, and before Y9S1 |
+| `leavers`, `reconnects`, `seats` | Who left during the round, when, alive or dead, and whether the feed showed the line taken to say the connection was lost (inferred); who took a seat again during it; and the seats that were not plainly a player's when it started. A match folder adds `presence`, per player who left: what they did round by round, the rounds they missed and whether they came back. See [Leavers and reconnects](#leavers-and-reconnects). | Y11S3+ |
 | `metalDetectors` | Alarms of the map's metal detectors, with the nearest player (inferred). | Y11S3+ |
 | `matchFeedback[].victimSpotted`, `victimPinged` | On kills: the killer's team had the victim spotted, or had pinged where the victim was, at most 15 seconds before. Derived. | Y11S3+ |
 | `gadgets`, `mapCameras` | Every gadget object placed or thrown: what, whose, where, when, its states, the statuses put on it, each time it went off as a trap, and how it ended, with who destroyed it where the scoreboard tells. The map's own cameras, with when each was destroyed. See [Gadgets, world and destruction](#gadgets-world-and-destruction). | Y11S3+ |
@@ -103,6 +104,8 @@ Every kill feed entry, health change, life event and observation session carries
 From Y11S3 each player has a defuser interaction object, hung off their controller, whose countdown runs from 7.000 towards 0; it starts a `DefuserPlantStart` or `DefuserDisableStart` with that player's name. The countdown does not decide anything: the game has completed a plant with 0.635 on it and abandoned one at 0.826. What does is `IsDefuserStarted` on the game-mode object, which turns 1 in the frame a plant completes (the clock switches to the defuser timer in that frame) and back to 0 when a disable completes. A plant that runs out after the round is decided leaves it at 0 and is not a plant. The round's end is `TimerState` 3 on the clock object, written in the frame the round is decided: when time ran out, or a plant was under way at `0:00`, that is up to several seconds after the clock's last reading.
 
 A match folder adds `loadoutChanges` (Y11S3+): per player, each round whose loadout differs from the player's previous round on the same side, as `username`, `round`, `previousRound`, `side` and `changes[]` of `{field, from, to}`. `field` is `operator`, `primary`, `secondary`, `gadget`, an attachment such as `primary.sight`, or `ability` for the operators who choose a gadget in that slot; `from` and `to` are `{id, name}` (null for an empty slot). Attachments are compared only on the same gun.
+
+A match folder adds `presence` (Y11S3+): one entry per player who left at some point of the match, with `events[]` round by round (`left`, `reconnected`, `joined`, `absentAtStart`, `backAtStart`), `roundsMissed`, `returned` and what the leave is likely to have been (`likely`, inferred). See [Leavers and reconnects](#leavers-and-reconnects).
 
 A match folder adds `breaks` (Y11S3+): per pair of consecutive rounds, the seconds between the two recordings, whether operators were banned or sides switched in between, and whether the break is long for the match (`pauseSuspected`, inferred). See [Pauses](#pauses).
 
@@ -831,11 +834,84 @@ An entry is written again each time the feed scrolls, so one line shown is sever
 Not recorded, or not decoded:
 
 - **The wording of an id.** Only the id and its values are in the file.
-- **Why a player left**, and whether a `playerJoined` is a new player or a returning one: the line names the player and nothing else.
-- **`round.left` and the stats do not use these lines yet.**
+- **Why a player left**: the line names the player and nothing else. `leavers[]` pairs each line with the seat it tells of (see [Leavers and reconnects](#leavers-and-reconnects)).
 
 `decodeStatus` adds `feedbackMessages`: the count of `systemMessages`, with a warning naming the ids not known. Only a line that could not be read makes it `partial`.
 
+### Leavers and reconnects
+
+Every seat of a match is a controller object, and a controller says who sits in it. Two of its properties tell of leaving:
+
+- `PlayerSlotType` (`b6b71dd2`) takes four values. What each means is not in the file; it is inferred from what else the controller holds and from what follows:
+
+| Value | `seat` | What the controller shows |
+|---|---|---|
+| 1 | | A player is in the seat. |
+| 4 | `reserved` | The seat is held for the player who left: the profile id and the `playerid` stay. Seen in Ranked (5 times during a round, 10 seats at the start of one). |
+| 2 | `opened` | The seat was emptied for another player to take: the `playerid` turns ff*8, the profile id a UUID of zeros and the platform 12; the name stays. Seen in Quick Match (4 times during a round, 2 seats at the start of one). |
+| 3 | `joining` | A player has connected and waits for the next round. The name is written empty and 0.1 to 0.4 s later in full. |
+
+- `HasLeft` (`ca35436c`) turns 1 at a leave and never back to 0. A seat at 1 with `HasLeft` 1 was vacated at some point of the match and filled again (`refilled`): 18 seats, each a player of the header. A seat at 2 with `HasLeft` 0 and no name is one nobody ever sat in (`empty`): each round of a custom match of two players has eight.
+
+When a player leaves, their controller is sent again in full. Controllers of teammates may be sent again with nothing changed, so only a value that differs from the one before is an event. The changes seen during a round are 1 to 4 (5), 1 to 2 (3), 3 to 2 (1), 4 to 3 (3, a reconnect) and 2 to 3 (1, a join). Nothing turns 1 while a round is recorded: a seat at 3 reads 1 in the snapshot that opens the next round. A seat at 2, 3 or 4 with `HasLeft` set when a round starts has no player in the header (13 of 13).
+
+The feed says the same. Every change to 2 or 4 is followed by the player's `playerLeft` line 0 to 0.4 s later (9 of 9), every change from 4 to 3 comes with a `playerReconnected` line and the one from 2 to 3 with a `playerJoined` line. A change and a line are paired when they name the same player within 0.5 s. One `playerLeft` line came with no change of a seat, 2.9 s after the last round of its match was decided and 0.03 s before the file ended: that leaver says `source: "feedOnly"`.
+
+`leavers[]` lists each leave of a round, with `time`, `phase`, `elapsed` and `recordingTime` like the kill feed:
+
+| Key | What it holds | How |
+|---|---|---|
+| `username`, `profileID`, `playerid`, `team` | Who left: the ids are the ones the controller held before the change, so an opened seat's leaver has them too. | Decoded |
+| `seat`, `slotType` | `reserved` or `opened`, and the value written. Absent for `feedOnly`. | `slotType` decoded; the names are inferred |
+| `aliveAtLeave` | The player had spawned and the kill feed has no death of theirs before the leave. The movement stream agrees in all 8 leaves of a spawned player: the body of the 4 who left alive is deleted in the frame of the change or up to 0.03 s before, the corpse of the 4 who left dead is not. | Decoded |
+| `diedSecondsBefore` | Seconds from the player's death to the leave: 6.7 to 60.7. | Decoded |
+| `neverSpawned` | The player had no body this round: they were waiting for the next one (3 to 2), or never had health. Left out when false. | Decoded |
+| `connectionLost`, `connectionLostSource` | The feed showed the `connectionLost` line just before the leave (0 to 0.04 s before the change of the seat). The key repeats what the line is taken to mean, so the source is always `inferred`. | Inferred |
+| `silentSeconds` | For a player who left alive: seconds since their body last moved or turned, or they last switched to a drone or camera. | Derived |
+| `returned` | `sameRound` when the player took the seat again before the recording ended. Absent otherwise. | Decoded |
+| `source` | `slot`, or `feedOnly` when only the line exists. | |
+
+`reconnects[]` lists each player taking a seat during a round. They play from the next round on:
+
+| Key | What it holds | How |
+|---|---|---|
+| `username`, `profileID`, `playerid`, `team` | Who came: the ids the controller held once the name was written. | Decoded |
+| `kind` | `reconnect` for a reserved seat (4 to 3), `join` for an opened one (2 to 3). | Inferred from the slot types |
+| `awaySeconds` | Seconds since the same player left the seat, when that leave is in this recording. | Decoded |
+| `leftBeforeRecording` | The seat was already reserved or opened when the recording started. Left out when false. | Decoded |
+| `newPlayerid` | For a reconnect: whether the `playerid` differs from the one the seat held. | Decoded |
+
+`seats[]` lists the seats that are not plain when the recording starts, a slot type other than 1 or `HasLeft` set: `username` (the name the controller holds: the leaver's, for a reserved or opened seat), `profileID` (absent for an opened seat, whose ids were wiped), `team`, `slotType`, `seat` (`reserved`, `opened`, `joining`, `refilled` or `empty`) and `hasLeft`. An empty seat has no `username`.
+
+A match folder adds `presence[]`, one entry per player who left at some point, keyed by profile id like the match's players:
+
+| Key | What it holds | How |
+|---|---|---|
+| `username`, `profileID`, `team` | The player. | Decoded |
+| `events[]` | In order, each with its `round` and `type`: `left` (with the time fields, `connectionLost` and `aliveAtLeave`), `reconnected` and `joined` (with the time fields and `newPlayerid`), `absentAtStart` (the first round whose header lacks the player) and `backAtStart` (the header lists them again, with `newPlayerid`). | Decoded |
+| `roundsMissed` | Rounds whose header lacks the player while a seat was reserved for them. Rounds after an opened seat are not counted: the seat is no longer theirs. | Decoded |
+| `returned` | For the last time the player was away: `sameRound`, `nextRound`, `later` or `never`, counted in rounds from the one they left in. For a player whose seat was reserved before the first recording, from the round before it. | Derived |
+| `newPlayerid` | Whether they came back with another `playerid`, the last time. | Decoded |
+| `likely`, `likelySource` | What was observed that bears on why: `connectionLost`, `gameRestarted`, `gameKeptRunning`. Always `inferred`; left out when nothing was. | Inferred |
+
+A player who took a seat someone else left is not a leaver, and neither is one who took a seat and left it again before their first round.
+
+`stats[]` gains `leftAt` for a player who left during the round: the `elapsed` of the leave. Their other numbers of that round are those of a player who was there until then only. A match's `stats[]` gains `roundsLeft` and `roundsMissed`; missed rounds are not among `rounds`. No existing number changes, and `round.left` stays what it was: the players alive at the start who left before the round was decided, which is what decides how a round ended.
+
+What tells a lost connection from a player who quit is inferred, all of it. Nothing in the file says why:
+
+- **The `connectionLost` line** came with 4 of the 9 leaves and not with the other 5. The three players who left alive with it had sent no input for 12.75, 15.5 and 91 s (`silentSeconds`), which fits a server that gave up on a client gone silent. The one who left alive without it had moved 3.6 s before. The fourth with the line had been dead for 37.6 s. Of the four others without it, three left 6.7 to 60.7 s after dying and one had never spawned.
+- **The `playerid` on return.** It is fixed for one launch of the game: other players kept theirs from one match to the next in 54 of 56 cases. A player who comes back with a new one started the game again (`gameRestarted`, 3 of 5 returns); one who comes back with the same one kept it running (`gameKeptRunning`, 2 of 5).
+- Nothing here says "crashed" or "quit". The output keeps to what was observed.
+
+Not recorded, or not decoded:
+
+- **The reason for a leave.** A player who quits and a game that crashes and closes its connection cleanly look the same.
+- **When a player left or came back between two rounds.** Neither recording has it: the next round's snapshot shows the seat (`seats[]`) and the header lists the player or not, so `absentAtStart` and `backAtStart` have a round and no time. A player who left and came back between the same two rounds shows only as a `refilled` seat.
+- **Whether a `refilled` seat holds the player who left it.** In Ranked it does; in Quick Match another player may have taken it, which shows only when the leave was recorded.
+- **A leave in prep, or in Unranked.** None is among the rounds at hand, so what the seat does there is not known.
+
+`decodeStatus` adds `presence`: `decoded`, with the count of leavers and reconnects. It is `partial`, with a warning, when a change of a seat has no line of the feed, a line has no change (other than a `playerLeft` in the last half second of a recording), a leaver is alive by the kill feed while their body stays or the other way round, `HasLeft` goes back to 0, or a slot type or a change not listed above occurs, which the warning names.
 ### Text chat and voice
 
 Neither is in a replay. `decodeStatus` says so on Y11S3 full reads: `chat` and `voice` are `notInVersion`, each with a warning that states it, and there is no `chat` key in the output.
@@ -1361,7 +1437,7 @@ How the links are made (details in `src/entities.rs`):
 - The stream is a tree of replicated objects. Besides `23`/`22` property records, `1b <parent> <field> <child>` and `1a <field> <child>` records hang child objects off a parent. Each player has one controller object under their team's object, holding the name, operator, profile id and the header `playerid`; the scoreboard, health, inventory and a profile object hang off it.
 - The profile object carries the relation to the recorder (`05c7b949`: 1 opponent, 2 teammate, 3 teammate in the recorder's party, 5 the recorder) and the party role (`af6bb287`: 0, 1 member, 2 leader). Checked on Y8S1 ranked and quick matches (a clan-tagged five-stack, a duo with randoms), Y8S2 and Y9S1.
 - Movement is sent apart from the tree. A player table links each body to a player explicitly, so the link does not depend on player order. In Y11S3 the table is a stream of its own (`aca4c435`): its snapshot is the table that opens the round and each frame record a table of what changed, per player the `playerid`, the body they move and what they look through (their drone or a camera). Every player of the round has an entry, the recorder included, so the recorder's own body is linked like any other. A player with an entry and no body never spawned: they left, or the recording ended first. `decodeStatus.movement` says so without calling it a fault. The entry layout is in `src/entities.rs`.
-- A player the header does not list (it is written before late joiners arrive) is read from their pick packet and takes the `playerid` their controller holds. A player who reconnects comes back with a new `playerid` under the same profile id, so `key` holds across the match. The controller's `HasLeft` is not output: a seat that was filled again keeps it set.
+- A player the header does not list (it is written before late joiners arrive) is read from their pick packet and takes the `playerid` their controller holds. A player who reconnects keeps their profile id, so `key` holds across the match; their `playerid` is new when the game was started again, which it was in 3 of 5 returns, and the same when it kept running. The controller's `HasLeft` is output as `seats[].hasLeft`: a seat that was filled again keeps it set (see [Leavers and reconnects](#leavers-and-reconnects)).
 
 ### Platform
 
@@ -1441,7 +1517,7 @@ Decompressed, each snapshot is a u64 length and the snapshot. The main stream ho
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.
 - **Temporary files.** A current install has an empty `DissectTmp` folder next to `MatchReplay`, and the process id and stream id in the reported `.tmprec` names match what round files hold. No `.tmprec` file was available, so their contents are unchecked.
-- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet), and on a feed entry `BackgroundColor` (`5934e58b`), `Message` (`e3090079`), `KillerName` (`d9133cba`), `VictimName` (`ac190f70`), `Index` (`0548b241`) and `Duration` (`96e2297f`), with `Messages` (`c07c7422`) the array the entries are in. The placeholders of a feed line are hashed the same way: `[PLAYER]` is `3c7fb10e`, `[STRING]` `6f56659c`.
+- **Hashes are names.** Every property, field and class hash in the stream is the CRC-32 of the game's name for it, stored little-endian: `crc32("Health")` is `0xC9762625`, written `25 26 76 c9`. Guessing a name and hashing it tests what a field is. Names found this way include `ProfileType` (`05c7b949`, the relation to the recorder), `SquadStatus` (`af6bb287`, the party role), `ClearanceLevelText`, `TeamColor`, `HeroTeam`, `BanState`, `HasLeft`, `MatchKills`, `PlayerPlatform`, `PlatformPlayerID`, `OnlinePlayerID` (the header's `playerid`), `UsesNickname`, `IsBot`, `PlayerSlotType` (1 while a player is in the slot), the classes and fields `PlayerLifeVM` (`4154dcc4`), `PlayerLoadoutVM` (`e8d1e539`), `PlayerStatsVM` (`eb219b38`), `OperatorVM` (`379e2280`), `OperatorCard` (`b62a2fc7`), `OperatorName` (`63cc188f`), `TeamVM` (`951c1650`), `GamerProfileVM` (`77b15e33`) and `GameModeInteractionVM` (`27c08dca`), the cosmetic slots (`Uniform`, `Headgear`, `WeaponSkin`, `Charm` and the rest), `LocationName` (the spawn voted for), `TimerInSeconds`, `TimerInMilliseconds` and `TimerState` on the clock object, `IsDefuserStarted`, `DefuserInteractionType`, `DefuserInteractionRemainingTime` and `HasDefuser` (who carries the defuser; not output yet), and on a feed entry `BackgroundColor` (`5934e58b`), `Message` (`e3090079`), `KillerName` (`d9133cba`), `VictimName` (`ac190f70`), `Index` (`0548b241`) and `Duration` (`96e2297f`), with `Messages` (`c07c7422`) the array the entries are in. The placeholders of a feed line are hashed the same way: `[PLAYER]` is `3c7fb10e`, `[STRING]` `6f56659c`.
 - **Skipped game time.** A recording can leave out game time without a gap in its frames: two or more players who were walking are, a tenth of a second later, metres further on than anyone can run. `timing.skips` lists each such moment with `at`, `until`, the `seconds` missing (the median of what the players' speed says) and how many `bodies` jumped; it is inferred from the bodies, and `decodeStatus.timing` is `partial` with it. 22 skips of 0.3 to 1.0 s in 12 of the 175 real rounds, none in the test rounds. Whatever is timed across one is that much shorter than it was: in the one round checked against other evidence a second is missing as action starts, a wall reinforcement that takes 4.08 s is up in 3.06 s, and two melee hits of one player are 0.76 s apart where the game allows no less than 1.02 s.
 - **Stray records.** Binary data between record runs can read as records. In one real round such a "record" covered a team object's first record and moved its properties to another object. Two rules reject them: an array record claiming an index of 65536 or more (real ones reach 64), and any record that does not name its object yet covers records that do (a `23` or `1b` and what follows) ending exactly where it ends.
 

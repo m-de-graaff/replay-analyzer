@@ -216,6 +216,13 @@ impl Match {
     pub fn breaks(&self) -> Vec<crate::pauses::Break> {
         crate::pauses::breaks(&self.rounds)
     }
+
+    /// Y11S3: every player who left at some point of the match, with what
+    /// they did round by round and whether they came back (see
+    /// [`crate::presence`]).
+    pub fn presence(&self) -> Vec<crate::presence::PlayerPresence> {
+        crate::presence::rollup(&self.rounds)
+    }
 }
 
 fn read_round(path: &Path, options: ReadOptions) -> Result<Round> {
@@ -475,6 +482,8 @@ impl Serialize for Match {
             battl_eye: Option<crate::messages::MatchBattlEye>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             breaks: Vec<crate::pauses::Break>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            presence: Vec<crate::presence::PlayerPresence>,
             rounds: &'a [Round],
             stats: Vec<PlayerMatchStats>,
         }
@@ -485,6 +494,7 @@ impl Serialize for Match {
             loadout_changes: self.loadout_changes(),
             battl_eye: self.battl_eye(),
             breaks: self.breaks(),
+            presence: self.presence(),
             rounds: &self.rounds,
             stats: self.player_stats(),
         }

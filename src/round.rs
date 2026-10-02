@@ -85,6 +85,14 @@ pub struct Round {
     pub melee_hits: Vec<crate::melee::MeleeHit>,
     /// Y11S3: shields raised, extended and put away.
     pub shield_actions: Vec<crate::melee::ShieldAction>,
+    /// Y11S3: the drones that were out, with their paths and ends.
+    pub drones: Vec<crate::devices::Drone>,
+    /// Y11S3: the cameras of the map and of the players.
+    pub cameras: Vec<crate::devices::Camera>,
+    /// Y11S3: jams, captures and offline spans of drones and cameras.
+    pub device_events: Vec<crate::devices::DeviceEvent>,
+    /// Y11S3: the cameras alive per team, after each change.
+    pub camera_counts: Vec<crate::devices::CameraCount>,
     /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
     /// every hit a player took (see [`crate::combat`]).
     pub combat: Option<crate::combat::Combat>,
@@ -284,6 +292,14 @@ impl Serialize for Round {
             melee_hits: &'a [crate::melee::MeleeHit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             shield_actions: &'a [crate::melee::ShieldAction],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            drones: &'a [crate::devices::Drone],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            cameras: &'a [crate::devices::Camera],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            device_events: &'a [crate::devices::DeviceEvent],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            camera_counts: &'a [crate::devices::CameraCount],
             hits: &'a [crate::combat::Hit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             timeline_events: &'a [crate::combat::TimelineEvent],
@@ -317,6 +333,10 @@ impl Serialize for Round {
             throws: &self.throws,
             melee_hits: &self.melee_hits,
             shield_actions: &self.shield_actions,
+            drones: &self.drones,
+            cameras: &self.cameras,
+            device_events: &self.device_events,
+            camera_counts: &self.camera_counts,
             hits: self.combat.as_ref().map_or(&[][..], |c| &c.hits),
             timeline_events: self.combat.as_ref().map_or(&[][..], |c| &c.events),
             replay: self.replay_info(),
@@ -2632,11 +2652,21 @@ impl<'a> Parser<'a> {
         let shots = crate::shots::decode(&input);
         let throws = crate::throws::decode(&input);
         let melee = crate::melee::decode(&input);
+        // Who destroyed a device is told by the shots, among others.
+        let teams = &self.round.header.teams;
+        let defense = teams.iter().position(|t| t.role == Some(TeamRole::Defense));
+        let devices = crate::devices::decode(&input, &shots.shots, defense);
+        devices.link(&mut self.round.observation);
         self.weapon_status = vec![
             ("weaponActivity", activity.len(), Vec::new()),
             ("shots", shots.shots.len(), shots.warnings),
             ("throws", throws.throws.len(), throws.warnings),
             ("melee", melee.hits.len() + melee.shields.len(), melee.warnings),
+            (
+                "devices",
+                devices.drones.len() + devices.cameras.len(),
+                devices.warnings,
+            ),
         ];
         self.round.weapon_activity = activity;
         self.round.shots = shots.shots;
@@ -2644,6 +2674,10 @@ impl<'a> Parser<'a> {
         self.round.throws = throws.throws;
         self.round.melee_hits = melee.hits;
         self.round.shield_actions = melee.shields;
+        self.round.drones = devices.drones;
+        self.round.cameras = devices.cameras;
+        self.round.device_events = devices.events;
+        self.round.camera_counts = devices.camera_counts;
         self.loadout_status = Some(decoded);
         self.round.combat = Some(crate::combat::decode(
             self.data,
@@ -3016,6 +3050,7 @@ impl<'a> Parser<'a> {
                             elapsed: at.elapsed,
                             recording_time: recorded(s.offset),
                             seconds: 0.0,
+                            device: None,
                         });
                     }
                 }

@@ -17,6 +17,7 @@ mod cursor;
 pub mod decoder;
 mod decompress;
 pub mod details;
+pub mod devices;
 pub mod entities;
 pub mod error;
 pub mod feedback;

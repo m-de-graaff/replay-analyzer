@@ -876,6 +876,10 @@ impl<'a> Tracker<'a> {
                     }
                 }
                 Raw::MaxHealth(p, v) => {
+                    // An attacker who swaps to an operator with 25 more
+                    // health gets the same rise: only a team with a Rook
+                    // has plates.
+                    let rook = self.teammate(p, "Rook").is_some();
                     let Some(l) = self.life.get_mut(p) else {
                         continue;
                     };
@@ -884,7 +888,7 @@ impl<'a> Tracker<'a> {
                     if v > 0 && l.first_max.is_none() {
                         l.first_max = Some(v);
                     }
-                    if live && before.is_some_and(|b| b > 0 && v == b + PLATE) {
+                    if live && rook && before.is_some_and(|b| b > 0 && v == b + PLATE) {
                         l.plated = Some((frame, now));
                         l.plates += 1;
                     }

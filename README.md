@@ -56,9 +56,16 @@ Besides the header, players, kill feed and scoreboard, round JSON carries:
 | `flashes` | When the recording player was flashed (player recordings only). | Y11S3+ |
 | `players[].maxHealth` | The operator's maximum health: 100, 110 or 125. Replays hold no armor rating; this is what the game has in its place. | Y11S3+ |
 | `matchFeedback[].teamKill`, `finish`, `downedBy`, `victimEffects` | On kills: the victim was a teammate; the victim was down, and who downed them; the status effects the victim was under. | Y11S3+ |
-| `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. | Y8S1+ |
-| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`. | Y8S1+ (detail Y11S3+) |
+| `observation` | Drone and camera sessions: who, whose device, tool, phase and duration. From Y11S3 `device` is the entity id of the drone or camera, as `drones` and `cameras` list it. | Y8S1+ (`device` Y11S3+) |
+| `stats[]` | Adds `damageTaken`, `downs`, `revives`, `droneSeconds` and `cameraSeconds`, summed per match too. From Y11S3 also `damageDealt` and `teamDamage` (estimates, see [Health and damage](#health-and-damage)), `downsDealt`, `finishes`, `revivesGiven`, `teamKills`, `healingGiven` and `healingReceived`, and `pings`, `timesSpotted`, `spotsMade`, `spotAssists`, `devicesDestroyed`, `dronesLost`, `timesJammed` and `objectiveFound` (see [Pings, spotting and information](#pings-spotting-and-information); `spotsMade`, `spotAssists` and `devicesDestroyed` are inferred). | Y8S1+ (detail Y11S3+) |
 | `weaponActivity`, `shots`, `bulletHits`, `throws`, `meleeHits`, `shieldActions` | What players held, fired, reloaded, threw and struck. See [Weapons and shooting](#weapons-and-shooting). | Y11S3+ |
+| `pings` | Every ping a player put on the map: who, on what kind of thing, where. | Y11S3+ |
+| `spots`, `spotAssists` | Operators spotted through a drone or camera, with the spotter where one can be inferred, and the points a spotter got for a teammate's kill of the spotted player (inferred). | Y11S3+ |
+| `abilityMarkers`, `deviceMarkers` | Tracking markers abilities put on players (Jackal, Alibi, Lion, Grim, Deimos), and the device markers of Solis. | Y11S3+ |
+| `drones`, `cameras`, `deviceEvents`, `cameraCounts` | Every drone and camera with its owner, path and end; jams, captures and offline spans; cameras alive per team. Who destroyed a device is inferred. | Y11S3+ |
+| `objective`, `operatorReveals`, `phoneHacks` | Who found the objective, when each player's operator became known to the other team and what showed in that moment, and Dokkaebi's phone hacks. | Y11S3+ |
+| `metalDetectors` | Alarms of the map's metal detectors, with the nearest player (inferred). | Y11S3+ |
+| `matchFeedback[].victimSpotted`, `victimPinged` | On kills: the killer's team had the victim spotted, or had pinged where the victim was, at most 15 seconds before. Derived. | Y11S3+ |
 | `matchFeedback[].previousOperator` | For operator swaps, the operator swapped from (`operator` is the one swapped to). | Y8S1+ |
 
 Each round also carries a `round` block with the round itself in one place:
@@ -143,7 +150,7 @@ The library equivalent is `library::scan(path, ReadMode::Header)`.
 
 - Before Y11S3, replays give a player's health and never who caused a change, so there is damage taken but no damage dealt. From Y11S3 every hit is read, and its attacker is named or inferred; see [Health and damage](#health-and-damage). `bulletHits` separately matches each bullet hit to the shot that made it; see [Weapons and shooting](#weapons-and-shooting).
 - Before Y11S3, replays sometimes skip the last health update before a kill, which makes `damageTaken` a lower bound.
-- Observation tool ids 1 (drone), 2 (camera), 6 (Black Eye), 8 (Flores drone) and 9 (shock drone) are confirmed; 3 is a second camera kind seen on defenders with a camera gadget. Others print as `ObservationTool(n)`.
+- Observation tool ids 1 (drone), 2 (camera), 6 (Black Eye), 8 (Flores drone) and 9 (shock drone) are confirmed; 3 is a second camera kind seen on defenders with a camera gadget. 5 (Evil Eye), 7 (Yokai), 10 (Kludge Drone) and 11 (a Pantheon shell of Skopos) are known from the device a session is on, but have no name in the table yet: they print as `ObservationTool(n)` and count for neither `droneSeconds` nor `cameraSeconds`. From Y11S3 `observation[].device` names the device, and `drones` and `cameras` its kind.
 - No round in the test match or the real folder ends with the defuser going off, so `DefusedBomb` is untested from Y11S3: it is given when attackers win after a plant with defenders left and the defuser timer at zero.
 - `elapsed` counts whole clock seconds, and the first second of a recording is cut short, so it can sit up to two seconds from `recordingTime` minus the prep start.
 - An attacker whose pick stays `RANDOM` in the file (3 of 50 random picks) has no spawn name; `spawnPosition` still says where the body appeared.
@@ -328,7 +335,8 @@ The count drops 0.38 s after the release (median). Grenades in free flight fit a
 
 - `ended` is the object being removed. For a grenade that is within a frame or two of it going off; for a gadget it may be minutes later.
 - No release was found for Thatcher's EMP grenade.
-- Gadgets that are placed, not thrown (barbed wire, deployable shields, breach charges, cameras on walls), are another class (`4c60869a`) and are not covered.
+- Gadgets that are placed, not thrown (barbed wire, deployable shields, breach charges, cameras on walls), are another class (`4c60869a`) and are not covered. Placed cameras are in `cameras[]`.
+- A drone thrown again after its owner picked it up has no throw: the released flag does not change, the drone only comes back into the world. 3 of 50 drone deployments in the test rounds and 15 of 429 in real ones are such. `drones[].deployments` lists every one.
 - A few pooled sub-munitions are released without ever being given an owner (8 in the real rounds); they are left out and counted in `decodeStatus.throws`.
 - Both of Capitao's bolts share one name, as do both of Zofia's grenades: which asset is which type is not known. Four assets seen in real rounds have no name.
 - Drones report the 15.9 m/s they leave the hand with.
@@ -457,20 +465,255 @@ The numbers are the game's; **the names are inferred** from which operator was i
 | `EnemyJammer`, `FriendlyJammer` | 8, 34 | `NoorLance` | 46 |
 | `LionScan` | 11 | `Burning` | 52 |
 | `ProximityAlarm` | 13 | `MelusiBanshee` | 14 |
+| `OutsideWarning` | 15 | `DokkaebiOverload` | 51 |
 
-Types 15, 21, 25, 29, 37 and 51 occur and have no name. A kill's `victimEffects` lists the named effects the victim was under.
+- `OutsideWarning` showed on defenders only, for at most 1.05 s, with the body outside the area the defenders were in during prep in 17 of 24 cases checked: the warning before a defender outside is detected. No marker follows it.
+- `DokkaebiOverload` started 7.03 to 7.07 s after a Logic Bomb, as a 40-damage explosion hit that defender, and lasted until death or the end of the round (6 of 6): the phone she called, going off.
+
+Types 21, 25, 29 and 37 occur and have no name (29 on shield operators only, 37 only in rounds with Denari). A kill's `victimEffects` lists the named effects the victim was under.
 
 What the list does not hold:
 
 - **Flashes of other players.** The flash flag is written for the player whose screen the recording shows, so `flashes[]` covers the recording player only and a spectator recording has none.
 - **Concussion, Smoke's gas, electricity and traps** have no effect entry. Gas and fire still show as `hits` with their damage type.
-- **A hacked phone** (Dokkaebi) was not identified; type 51 is the only candidate.
+- **A hacked phone** (Dokkaebi) is no effect on anyone. The hack itself is in `phoneHacks[]`, see [Phone hacks](#phone-hacks).
 
 ### Friendly fire
 
 `friendlyFire[]` lists each player whose reverse friendly fire was on in the round: `activeAtStart` when it carried over from an earlier round, and `on` and `off` with their times. It is the game's own flag (`IsReverseFriendlyFireActive`). It turned on for the killer after all 12 team kills in the real folder, and 5 times with no kill, after damage to a teammate. Team damage itself is only in `hits`, where `teamDamage` counts the hits a teammate is named for.
 
 `decodeStatus` adds `combat` (hits read) and `vitals` (players with a maximum health).
+
+## Pings, spotting and information
+
+From Y11S3, full reads of files the game finished writing carry what the teams showed and learned of each other. Every event has `time`, `phase`, `elapsed` and `recordingTime` like the kill feed. Numbers below are from 175 rounds of a real `MatchReplay` folder and the 10 test rounds.
+
+| Key | What it holds | How |
+|---|---|---|
+| `pings[]` | Every ping: who, on what kind of thing, where. | Decoded; object names inferred |
+| `spots[]` | Operators spotted through a drone or camera: who was seen, by which team, where, for how long, and who spotted. | Marks decoded; the spotter inferred |
+| `spotAssists[]` | The 50 points a spotter gets when a teammate kills the spotted player. | Inferred |
+| `abilityMarkers[]` | Tracking markers of Jackal, Alibi, Lion, Grim and Deimos on a player, with their path and end. | Decoded; ability names and `by` inferred |
+| `deviceMarkers[]` | The device markers of Solis. | Decoded; meaning inferred |
+| `drones[]`, `cameras[]` | Every drone and camera: owner, deployments, path, how it ended. | Decoded; who destroyed it inferred |
+| `deviceEvents[]`, `cameraCounts[]` | Jams, countdowns, captures and offline spans of a device, and the cameras alive per team after each change. | Decoded; who captured inferred |
+| `objective` | Whether and by whom the objective was found. | Decoded from the feed or the score in prep; inferred after prep without a feed |
+| `operatorReveals[]` | When each player's operator became known to the other team. | Decoded; `cause` inferred |
+| `phoneHacks[]` | Dokkaebi hacking the phone of a dead defender. | Layout decoded; meaning inferred |
+| `metalDetectors[]` | Alarms of the map's metal detectors. | Decoded; the player inferred |
+
+What the file does not hold, after searching every stream:
+
+- **When a ping ends.** A ping is written once and never removed (none of 3,358 real pings is). How long it showed is not in the file.
+- **Whether a ping on a gadget revealed the operator.** A ping holds a label for the kind of object, not the entity, and no flag for a reveal.
+- **Who spotted.** A spot names the spotted player and the team that sees it. `by` is inferred.
+- **Who destroyed a device.** The device says it is destroyed, not by whom. `by` is inferred from the score and the shots.
+- **Why a device went offline.** There is a flag and no cause. An EMP is not named.
+- **Which phone was hacked.** The tablet's state says a hack runs; no defender is linked to it.
+- **Caveira's interrogation.** No marker, effect or HUD property was found for it.
+- **Anything specific to Pulse, Vigil, Nokk, IQ, Zero or Skopos.** No marker or effect is theirs alone. Zero's and Skopos's cameras are in `cameras[]` like any other.
+- **An intel assist.** The kill feed is the same for a kill of a spotted player as for any other, the timeline has no such entry, and `MatchAssists` does not count it (42 of 42 unchanged).
+- **The reason for a score.** The scoreboard holds totals. Only the amounts can be compared with what else happened in that moment.
+
+### Pings
+
+The `MarkerChannel` stream (`26b9c2c1`) holds what changed among the markers in each frame. A record is two lists: `u16` count and 55-byte markers, then `u16` count and 42-byte device entries. A marker is a position, a `u64` (the pinger's `playerid`, or the marked player's body entity), a `u64` label, then `u32` class (0 ping, 1 spotted operator, 2 tracking marker), alliance, source, the pinger's place in the team and target, and three flag bytes, the first set on a removal. Every record parsed to its last byte in the 10 test rounds and in all 175 finished real rounds.
+
+| Key | What it holds | How |
+|---|---|---|
+| `username`, `team` | Who pinged, and their team from the alliance the record states. | Decoded |
+| `kind` | `location`, `locationRepeat` (the second press of a double ping), `enemyObject` or `teamObject`. | Decoded; the two object kinds were named by whose entity was nearest (188 of 194) |
+| `target` | The record's number behind `kind`: 3, 1 or 2. | Decoded |
+| `label` | `{id, name}` of the kind of object pinged. Absent on a plain location ping. | Id decoded; name inferred |
+| `position` | Map coordinates in metres, z up. | Decoded |
+
+- 138 pings in the test rounds, 3,358 in the real folder (1,737 by the recorder's team, 1,621 by the other). Every one names a player of its round, and the alliance is that player's every time.
+- A `locationRepeat` follows the same player's ping at the same place: 11 of 11 in the test rounds, 529 of 539 within 0.5 s in real ones. What the game shows for it is not known.
+- A label id occurs nowhere else in the file. 22 are named by the entity that sat within 0.5 m of the pings with that label (the drone in 46 of 47, an Entry Denial Device in 19 of 19). About 30 more have no name.
+- The stream's opening snapshot is the last marker sent before the recording began. It is left out.
+
+### Spots and spot assists
+
+A class 1 marker is a spot: the body of the spotted player, at that body's position (0.07 m off at the median), with the alliance of the team that sees it. A player of that team was on a drone or camera at 41 of 41 marks in the test rounds and 860 of 862 in real ones, which is why it is taken to be the red ping or scan. A scan that goes on writes a new mark every 1.5 to 1.9 s. Marks on one player at most 2.5 s apart are joined into one spot: 41 marks make 33 spots in the test rounds, 862 make 543 in real ones.
+
+| Key | What it holds | How |
+|---|---|---|
+| `username` | The player who was spotted. | Decoded |
+| `seenBy` | Index of the team that sees the marker. | Decoded |
+| `position` | Where the spotted player was at the first mark. | Decoded |
+| `seconds`, `marks` | From the first mark to the last, and how many marks. A single mark has 0 seconds. | Derived |
+| `by`, `bySource` | Who spotted, and the rule that named them. | Inferred |
+| `byCandidates` | When no rule names one player: the opponents who looked through a device. | Inferred |
+| `with`, `device` | `drone` or `camera`, and the entity id as `drones[]` and `cameras[]` give it: the device of `by`, or the one all candidates were on. | Inferred |
+
+`bySource` is the first of these that names a player:
+
+- `spotAssistScore`: the player who got a spot assist for this spot (below). 1 of 33 test spots, 46 of 543 real ones.
+- `onlyObserver`: one opponent of the spotted player looked through a device at the first mark, by the player tables. 6 of 33, 103 of 543.
+- `nearestFacingTool`: several looked through several devices. The device nearest to the spotted player is also the one turned most towards them, and one player was on it. 9 of 33, 134 of 543.
+- Absent (17 of 33, 260 of 543): `byCandidates` lists everyone who was on a device, or those on the nearest facing device when several were on it.
+
+Checked against the first rule on 41 real spots that have its points: `onlyObserver` named that player in 19 of 20, `nearestFacingTool` in 6 of 8, and the player was among the candidates in 13 of 13. Several players can watch one device, so the device can be right while the player is not.
+
+How long the red marker stays is not in the file: no removal is ever written for a spot.
+
+A spot itself pays nothing. The spotter gets 50 points when a teammate kills the spotted player. The score holds no reasons, so `spotAssists[]` is inferred: a +50 of one player alone, with no assist counted (`MatchAssists`), from 0.3 s before to 0.8 s after a teammate's kill of a player whose spot has a mark at most 14 s old.
+
+| Key | What it holds | How |
+|---|---|---|
+| `username` | Who got the points. | Inferred |
+| `victim`, `killer` | The kill they were paid for. | Decoded (the kill feed) |
+| `markAge` | Seconds from the newest mark on the victim to the kill. | Derived |
+
+- In the real folder 36 of 39 kills within 6 s of the newest mark came with the +50, 10 of 21 kills 6 to 14 s after it, and none of 24 later ones. The oldest mark that still paid was 13.2 s old.
+- 1 spot assist in the test rounds, 53 in the real folder. The recipient was on a device at that spot in 47 of 53.
+- Other awards are 50 too: finding the objective, a revive. The rule can miss an assist and can take another award for one.
+
+### Ability markers and device markers
+
+A class 2 marker is a tracking marker an ability put on a player. There is one per body and source. It is written again as it moves and ends with a record that has the removed flag, or with one of source 14 that clears every marker of a body as its player dies (66 of 66 such records in the test rounds match a kill).
+
+| Key | What it holds | How |
+|---|---|---|
+| `username` | The player who was marked. | Decoded |
+| `source` | `{id, name}`: 0 `JackalTracked`, 1 `AlibiTracked`, 3 `LionScan`, 4 `GrimSwarm`, 5 `GrimTracked`, 6 `DeimosMarked`, 7 `DeimosTracking`, 8 `TrackerJammed`. | Id decoded; names inferred |
+| `by`, `bySource` | Whose ability it was: the one opponent who plays that operator (`operator`). Absent when none or several do, and for sources 7 and 8. | Inferred |
+| `seenBy` | Index of the team that sees it. | Decoded |
+| `position`, `path` | Where it was first put, and each move as `[seconds since the start, x, y, z]`. | Decoded |
+| `ended`, `seconds`, `open` | `removed` or `cleared` (the player died), how long it stayed, and `open` when it was still there as the recording ended. | Decoded |
+| `pulse` | Lion's scan and Grim's swarm write a marker per pulse and never remove it: no end and no `seconds`. | Decoded |
+
+- The sources were named by the status effect on the marked player in the same moment: Jackal 10 of 10, Alibi 12 of 12, Lion 23 of 23, Grim's swarm 17 of 17, Grim's tracking 37 of 37, Deimos's target 23 of 23, Deimos himself 21 of 21.
+- Source 8 takes the place of 6 and 7 for about 2 s, only in rounds with both Deimos and Mute. `TrackerJammed` is a guess from that.
+- 48 markers in the test rounds, 37 with `by`; 228 in the real folder, 199 with `by`.
+- Dokkaebi's call, a proximity alarm, Melusi, Fenrir and the radar of Solid Snake put no marker. They show only in `effects[]`.
+
+`deviceMarkers[]` is the second list of a record: `op` (`add`, `remove`, `update`), `handle` (a counter), `target` (an entity id) and `position`. Entries occur only in rounds with Solis: 18 of 24 real ones and both test ones, and 0 of 149 rounds without her. They sit on attackers' devices and on fixed objects of the map and last 0.1 to 3 s. That they are what her SPEC-IO detects, and that an `update` is a device identified, is inferred. It is the only sign of her sensor in the file.
+
+### Drones and cameras
+
+A device is an entity of the `movement` stream whose first component class is `587f5a72`. With the class `47e5f600` it is a drone, else a camera. The cameras of the map are created in the stream's snapshot with ids that are the same in every round on a map. The device's own component holds nine asset ids, seven flag bytes (offline, disabled, destroyed, in flight, a timer, signal lost) and a position. Every update of a device was read to its last byte in the test rounds (130,733) and none was left unread in the real folder (1,616,585; 10,094 of an Evil Eye or of Skopos's body stop at a component that is not decoded).
+
+`drones[]`:
+
+| Key | What it holds | How |
+|---|---|---|
+| `entity` | The entity id in hex. `observation[].device`, `deviceEvents[].device` and `spots[].device` name it. | Decoded |
+| `kind` | `drone`, `shockDrone`, `kludgeDrone`, `yokai` or `rceRatero`. | Inferred from the entity's classes |
+| `owner`, `team` | The first player the entity names. | Decoded |
+| `deployments` | Each time it went out: thrown, thrown again after a pickup, or out as the recording started. | Decoded |
+| `pickups` | Each time its owner took it back. | Decoded |
+| `sessions` | Each stretch a player drove it: `username`, `seconds`. | Decoded |
+| `path`, `position` | `[seconds since the recording started, x, y, z]`, thinned to at most 60 points, and where it was at its end. | Decoded |
+| `end` | `kind` (`destroyed`, `pickedUp`, `expired`, `removed`), and for a destruction `by`, `bySource`, `teamKill` and `noFlag`. | Kind decoded; `by` inferred |
+
+`cameras[]` has `entity`, `kind` (`default` for a camera of the map, `blackEye`, `argus`, `bulletproof`, `evilEye`, `pantheonShell` for the body Skopos is not in, `unknown` for classes no kind has), `owner`, `team`, `position`, `placed` and `end`. A camera of the map has no owner and serves the defenders.
+
+- **Checked against the HUD.** A throw matches `throws[]` for 47 of 47 drone throws in the test rounds and 414 of 414 real ones. A destruction falls in the frame the HUD's `DroneState` turns 2 for 58 of 58 and 586 of 586. A pickup matches the HUD's `IsDeployed` for 4 of 4 and 64 of 64.
+- **Who destroyed a device is inferred.** The destroyer's `MatchScore` rises in the same moment (a teammate's falls instead: `teamKill`), and a shot of `shots[]` passes within 0.5 m of the device. `bySource` says which was found. Of 1,327 real destructions: `score+shot` 91.9%, `score` 6.0%, `shot` 0.5%, nobody named 1.7%. Of 127 in the test rounds: 124, 1, 0 and 2. Whenever a shot fitted, it was the scorer's.
+- **How it was destroyed** is not told beyond a shot fitting or not. Melee, explosives and electricity are not told apart.
+- A drone the game removes while it is in the world, with no destroyed flag, is reported destroyed with `noFlag` (4 real, 2 in the test rounds, both in rounds with Aruni).
+
+`deviceEvents[]` has `type`, `device`, the time fields and, for a span, `seconds`:
+
+| `type` | What it is | How |
+|---|---|---|
+| `jam` | A jammer disabled the device. `jammer` is its entity and `by` the player who carries that gadget. | Decoded: the component's position becomes the jammer's, to the centimetre |
+| `countdown`, `signalLost` | The device is disabled with a timer running (`timer`, seconds), and the timer ran out. Seen on devices outside. | Decoded; the cause inferred |
+| `capture` | The device changed sides. `kind` is `pest` (Mozzie) or `kludge` (Brava); `by` is who took it, with `inferred: true`. | Decoded; `by` inferred from the nearest Pest or Kludge Drone |
+| `offline` | The offline flag was set. The file gives no cause. | Decoded |
+
+- 222 jams in the real folder, each naming a Signal Disruptor and its owner; 7 of 7 in the test rounds.
+- 16 captures in the real folder, none in the test rounds: 13 by a Pest (the Pest's owner was within 3 m in 13 of 13) and 3 by a Kludge Drone (its owner within 8 m in 3 of 3).
+- 262 offline spans in the real folder, none in the test rounds. 77 fall within a jam, 2 last 15.0 s right after a Thatcher EMP, 5 last 6.0 s, and 172 are short with no cause found.
+
+`cameraCounts[]` gives, after each change, the cameras alive per team as `teams[]` of `{default, gadget}`.
+
+`observation[].device` is the entity id of the device a session is on: the view the player table (`ControllerChannel`) gave the player as the session started. 5,046 of 5,055 real sessions have one.
+
+### Objective found
+
+The game keeps no flag for the objective being found. Two things show it, both in the `state` stream:
+
+- **The feed**, in a player's recording only. A feed entry holds the text shown (`<username> has found the bombs`) and names no killer and no victim. 147 real rounds have one. An entry is told by its shape and by the attacker its text names, not by its words, which may be translated.
+- **The score**, in every recording. The finder's `MatchScore` rises by 50 in the frame of the find (146 of the 147 feed finds). When prep ends with the objective not found, every defender's rises by 100.
+
+| Key | What it holds | How |
+|---|---|---|
+| `found` | False when prep ended unfound and no find followed. | Decoded |
+| `by` | The finder. | Decoded, or inferred when `inferred` is set |
+| `source` | `feed` or `score`. | Decoded |
+| `inferred` | Set when the find is the first +50 of an attacker after prep that comes without an assist. Other awards are 50 too. | Derived |
+| `inPrep` | Found before the action phase started. | Decoded |
+
+- The score in prep named the player of the feed in 90 of 90 real rounds that have both, so it is not marked inferred. The score after prep named them in 49 of 57, so it is.
+- Of 175 real rounds: 147 found by the feed, 2 inferred from the score, 16 not found, 10 with no objective to find (Quick Match rounds, and rounds that end in prep). All 10 test rounds are spectator recordings and take the score.
+
+### Operator reveals
+
+A player's controller has `HasBeenDiscovered` (`41f2118a`, one byte). It is 0 in every snapshot and turns 1 when the other team learns which operator the player is. `operatorReveals[]` has one entry per player it turned for.
+
+| Key | What it holds | How |
+|---|---|---|
+| `username` | The player revealed. | Decoded |
+| `trigger` | `kill` when the player killed an opponent at most 0.35 s before (0.27 s at the median), else `identified`. | Derived from the kill feed |
+| `victim` | For `kill`: whom they killed. | Decoded (the kill feed) |
+| `cause` | For `identified`: what the marker stream wrote within 0.25 s. `spot` (a spot mark on the player), `abilityMarker` (a tracking marker on them), `teammateSpot` (a spot mark on a teammate) or `ping` (an opponent's ping on an object), in that order. Absent when it wrote nothing that fits. | Inferred |
+| `teamBonus` | Every player of the other team scored 10 (or 20, 30 for two or three reveals at once) in that moment. | Derived from the score |
+
+- 60 reveals in the test rounds, 1,082 in the real folder (519 by a kill).
+- Of 563 real `identified` reveals: `spot` 233, `teammateSpot` 21, `ping` 70, `abilityMarker` 24, and 215 with no cause. In the test rounds: 19, 2, 3, 3 and 11 of 38. Most reveals without a cause are defenders in prep, presumably seen by a drone without a scan.
+- Who identified the player is not in the data. The file hides nothing by itself: every operator is in the controllers from the start, and dying reveals nobody.
+
+### Phone hacks
+
+Dokkaebi's ability object links a tablet through its field `Tablet` (`b4928f1d`). The tablet has an `EquipState` (`e5e20d29`): 0, 1, 2 in the two seconds before a call, and 3 while she hacks a phone. `phoneHacks[]` has one entry per stretch of 3: `username`, `seconds` (absent when the recording ended first), `completed` (the stretch ran 2.4 s or more; a hack takes 2.52 to 2.57 s) and the time fields.
+
+- The meaning is inferred. All 24 stretches in the real folder (16 rounds) start after a defender died, 22 run their full length and 2 are cut short. 8 of 9 sessions in which an attacker then looks through a defender's camera follow a completed one.
+- The test rounds have no Dokkaebi. The decoder is tested on bytes built by hand and on the real folder.
+- Effect type 51 (`DokkaebiOverload`, see [Status effects](#status-effects)) is the phone she called going off, not the hack.
+
+### Metal detectors
+
+The `SoundChannel` stream (`63fe54d3`) is the command list of the sound engine. A record is a `u16` mask and, per set bit, a counted list: posted events, positions, orientations, switches, parameters and stops. All 60,325 records of the test rounds and 924,852 of the real folder parse to their last byte. An alarm is a posted event of kind 0 on a fixed object of the map whose owner is another object, the detector. It lasts 3.0 s.
+
+| Key | What it holds | How |
+|---|---|---|
+| `detector` | The detector's entity id in hex, the same in every round on a map. | Decoded |
+| `position` | Where the alarm sounds. | Decoded |
+| `username` | The player whose body was nearest as it started, when within 2.5 m. | Inferred |
+| `complete`, `seconds` | The posts span 2.8 s or more, and how long they span. | Decoded |
+
+- Real folder: Bank 100 alarms, Border 37, Consulate 27, Kanal 15, Nighthaven Labs 1. The other ten maps seen have none. The 10 test rounds are on Bank.
+- A body was within 2.5 m as the alarm started in 254 of 259 alarms, 1.1 m away at the median. Defenders set them off in prep too.
+- The same stream holds every player's footsteps (walking and running, with the body they belong to) and gunshots (60 to 80% of `shots[]` have one). They are not output: the movement stream and `shots[]` say the same.
+
+### On kills and in stats
+
+A kill in `matchFeedback` gains two derived fields. Both say what was on the killer's team's screen, not that it led to the kill.
+
+| Key | What it holds | How |
+|---|---|---|
+| `victimSpotted` | `{secondsAgo, by}`: the newest spot mark on the victim that the killer's team saw is at most 15 s old. `by` is the spot's inferred `by`, absent when it names nobody. | Derived; `by` inferred |
+| `victimPinged` | `{secondsAgo, by}`: a player of the killer's team put a ping within 3 m of where the victim was hit, at most 15 s before. | Derived |
+
+- The victim's position is where their body was at the hit that killed them (1,233 of 1,268 real kills have such a hit), else where a bullet struck them. A kill with neither gets no `victimPinged`.
+- Test rounds: 2 of 66 kills have `victimSpotted`, 5 have `victimPinged`. Real folder: 60 and 117 of 1,268.
+
+`stats[]` adds, each left out when 0 and summed per match too:
+
+| Key | What it holds | How |
+|---|---|---|
+| `pings` | Pings the player put on the map. | Decoded |
+| `timesSpotted` | Spots of this player. | Decoded |
+| `spotsMade` | Spots whose `by` is this player. Spots nobody is named for count for nobody. | Inferred |
+| `spotAssists` | Entries of `spotAssists[]` for this player. | Inferred |
+| `devicesDestroyed` | Drones and cameras of the other team whose `end.by` is this player. | Inferred |
+| `dronesLost` | Drones of this player that were destroyed. | Decoded |
+| `timesJammed` | Jams of a drone of this player. | Decoded |
+| `objectiveFound` | 1 when `objective.by` is this player (`objectivesFound` in the match totals). | As `objective` |
+
+`decodeStatus` adds `markers`, `devices`, `intel` and `sound`.
 
 ## Players and identity
 
@@ -576,7 +819,8 @@ block                        "CMPRV002" (stored as a u64), u32 raw size, u32 pac
 
 Decompressed, each snapshot is a u64 length and the snapshot. The main stream holds every stream's records, each a u32 frame, u32 size, u32 0 and the payload, so every packet belongs to a frame and the index gives its time. Reading only the header needs no decompression for Y8S4+ (`ReadMode::Header`); before Y8S4 everything is one zstd stream.
 
-- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`), `MarkerChannel` (`26b9c2c1`, pings), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`); `be5e4267` is always empty and unnamed. Only the first four and `TimelineChannel` are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
+- **Streams.** Most rounds have 10 (8 to 11 seen). `state` holds the clock, kill feed, health and picks; `movement` holds every entity message. Their hashes are the CRC-32 of the game's names: `HUDChannel` (`a98fdd0b`, `state`), `EntityChannel` (`20a5c4e3`, `movement`), `ControllerChannel` (`aca4c435`, the player table), `FXChannel` (`f5ee6a3d`, effects), `DecalChannel` (`5f87976f`, bullet holes and marks), `SoundChannel` (`63fe54d3`, the sound engine's commands), `MarkerChannel` (`26b9c2c1`, pings, spots and tracking markers), `TimelineChannel` (`eee42d83`, a log of kills and downs) and `WorldChannel` (`e3f6781c`, the round's timer and state); `be5e4267` is always empty and unnamed. All but `DecalChannel`, `WorldChannel` and the empty one are read. `movement` and `state` have a record at nearly every update, 35 ms apart.
+- **Layouts of the smaller streams.** `MarkerChannel`: `u16` count and 55-byte markers, then `u16` count and 42-byte device entries (see [Pings](#pings)). `SoundChannel`: a `u16` mask and, per set bit from the lowest, a `u16` count and that many entries: posted events (58 to 136 bytes), positions and orientations (24 bytes each), switches and parameters (16), two lists of unknown meaning (11 and 8) and stops (12); see [Metal detectors](#metal-detectors). It holds every player's footsteps and gunshots, which are not output. `WorldChannel`: a `u8` mask, then a `u32` timer length in milliseconds (bit 0: 45000 for prep, 180000 for action, 3000 or 2000 once the round is decided), a `u8` round index (bit 1, snapshot only) and a `u16` state (bit 2: 4 prep, 8 action, 16 round over). It parsed with nothing left over in 186 rounds and says nothing the `state` stream does not, so it is not read; it has no signal for a plant. `DecalChannel`: `u32` count and 82-byte entries (the entity struck, an asset, a position and a normal), then a `u32` 0.
 - **Recording ids.** Stream ids come from one counter per run of the game. A round takes its main id (`recordingId`) and one per stream, and the next recording starts right after, so a skipped id is a recording that was started and never saved. The folder name ends in the same run's process id.
 - **Unfinished files.** 3 of the 203 real rounds end on a block whose packed size is 0xFFFFFFFF, the game's compressor having failed on a 5 to 11 MB block. The main stream was never written and the directory holds uninitialized memory, but the frame index and snapshots survive, so the header and players still read.
 - **Rates.** The index rate follows whoever recorded. Spectator recordings (the Y11S3 test rounds) index a steady 29.4 frames a second; a player's own recording indexes every rendered frame, about 300 a second on the PC checked, 0.1 to 66 ms apart. Records arrive about 28 times a second either way. The 200 to 260 a second seen in Y8 and Y9 replays fits the second kind.

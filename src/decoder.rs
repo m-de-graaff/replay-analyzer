@@ -35,6 +35,12 @@
 //!   death written through the down state is no longer a revive, and a
 //!   kill that ends the round is no longer a down; `damageTaken` counts
 //!   hits, so the killing blow is in and an overheal wearing off is out.
+//! - Y11S3 (profile Y9S4): pings, spots with their inferred spotter, spot
+//!   assists, tracking and device markers, drones and cameras with their
+//!   ends, jams and captures, the objective found, operator reveals with
+//!   their cause, phone hacks and metal-detector alarms. A kill says
+//!   whether its victim was spotted or pinged, an observation session
+//!   names its device, and effect types 15 and 51 have names.
 
 use serde::Serialize;
 
@@ -120,7 +126,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 11,
+        revision: 12,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

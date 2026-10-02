@@ -38,6 +38,7 @@ pub mod join;
 pub mod journal;
 pub mod library;
 pub mod loadout;
+pub mod mapdata;
 pub mod markers;
 pub mod matches;
 pub mod melee;

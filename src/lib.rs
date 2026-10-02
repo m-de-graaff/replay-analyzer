@@ -8,7 +8,9 @@
 //! # Ok::<(), replay_analyzer::Error>(())
 //! ```
 
+pub mod activity;
 pub mod analytics;
+pub mod areas;
 pub mod census;
 pub mod combat;
 pub mod container;
@@ -16,6 +18,7 @@ pub mod cosmetics;
 mod cursor;
 pub mod decoder;
 mod decompress;
+pub mod destruction;
 pub mod details;
 pub mod devices;
 pub mod entities;
@@ -23,16 +26,22 @@ pub mod error;
 pub mod feedback;
 pub mod file;
 pub mod format;
+pub mod fx;
+pub mod gadgets;
+pub mod gadget_events;
 pub mod header;
 pub mod identity;
 pub mod intel;
 pub mod joins;
+pub mod join;
 pub mod library;
 pub mod loadout;
 pub mod markers;
 pub mod matches;
 pub mod melee;
+pub mod movement;
 pub mod outcome;
+pub mod panels;
 pub mod records;
 pub mod report;
 pub mod round;
@@ -45,6 +54,7 @@ pub mod timeline;
 pub mod types;
 pub mod weapons;
 pub mod vitals;
+pub mod world;
 
 pub use analytics::MatchAnalytics;
 pub use census::Census;

@@ -103,6 +103,13 @@ pub struct MatchUpdate {
     /// victim was hit, at most 15 seconds before the kill (derived).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub victim_pinged: Option<VictimKnown>,
+    /// Y11S3: the fire, gas or swarm area of `areas[]` the victim's body
+    /// was in at the kill, with `inAreaSource: derived` (see
+    /// [`crate::join`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area: Option<crate::areas::InArea>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_area_source: Option<&'static str>,
     /// Round clock as displayed in game, e.g. `2:41`.
     pub time: String,
     #[serde(serialize_with = "whole_number_as_int")]
@@ -160,6 +167,8 @@ impl MatchUpdate {
             victim_effects: Vec::new(),
             victim_spotted: None,
             victim_pinged: None,
+            in_area: None,
+            in_area_source: None,
             time: clock.display.clone(),
             time_in_seconds: clock.seconds,
             message: String::new(),

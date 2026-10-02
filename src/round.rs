@@ -8,6 +8,7 @@ use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::activity::Activity;
 use crate::census::{self, Census, PacketCount};
 use crate::container::{self, Container, DirectoryState};
 use crate::cursor::Cursor;
@@ -22,6 +23,7 @@ use crate::feedback::{Clock, MatchUpdate, MatchUpdateType, display_clock};
 use crate::file::{self, FileInfo};
 use crate::format::{self, ClockGap, FormatInfo, GameVersion, Hole, Layout, Timing};
 use crate::header::{Header, Player};
+use crate::movement::Movement;
 use crate::outcome::{ReasonSource, RoundInfo, RoundOutcome};
 use crate::records::RecordMap;
 use crate::report::{DecodeReport, Status};
@@ -93,9 +95,6 @@ pub struct Round {
     pub device_events: Vec<crate::devices::DeviceEvent>,
     /// Y11S3: the cameras alive per team, after each change.
     pub camera_counts: Vec<crate::devices::CameraCount>,
-    /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
-    /// every hit a player took (see [`crate::combat`]).
-    pub combat: Option<crate::combat::Combat>,
     /// Y11S3: the pings players put on the map (see [`crate::markers`]).
     pub pings: Vec<crate::markers::Ping>,
     /// Y11S3: operators spotted through a drone or camera, with who
@@ -119,6 +118,37 @@ pub struct Round {
     /// Y11S3 full reads: the alarms of metal detectors (see
     /// [`crate::sound`]).
     pub metal_detectors: Vec<crate::sound::MetalDetector>,
+    /// Y11S3: reinforcements of walls and hatches, and barricades.
+    pub reinforcements: Vec<crate::panels::Reinforcement>,
+    pub barricades: Vec<crate::panels::Barricade>,
+    /// Y11S3: gadget objects placed and thrown, and the map's cameras.
+    pub gadgets: Vec<crate::gadgets::Gadget>,
+    pub map_cameras: Vec<crate::gadgets::MapCamera>,
+    /// Y11S3: what damaged the map and its panels, bullets apart.
+    pub destruction: Vec<crate::destruction::Destruction>,
+    /// Y11S3: holes and patches of bullet holes, derived from the impacts.
+    pub surfaces: Vec<crate::destruction::Surface>,
+    /// Y11S3: breach devices and what became of them.
+    pub breaches: Vec<crate::destruction::Breach>,
+    /// Y11S3: smoke, fire, gas and swarm areas.
+    pub areas: Vec<crate::areas::Area>,
+    /// Y11S3: gas pipes, fire extinguishers and metal detectors set off.
+    pub environment: Vec<crate::areas::EnvironmentEvent>,
+    /// Y11S3: the light screens of R.O.U. Projector Systems.
+    pub light_screens: Vec<crate::areas::LightScreen>,
+    /// Y11S3 full reads: the round's timeline (kills, downs, revives) and
+    /// every hit a player took (see [`crate::combat`]).
+    pub combat: Option<crate::combat::Combat>,
+    /// Y11S3: who carried the defuser, plants and disables, what each
+    /// player held and what their abilities did (full reads).
+    pub activity: Option<Activity>,
+    /// Y11S3: every player's position, view and state at every update
+    /// (only with `ReadOptions::movement`).
+    pub movement: Option<Movement>,
+    /// Y11S3 full reads: score changes, and the removals, statuses and trap
+    /// triggers that are of no gadget of `gadgets` (see
+    /// [`crate::gadget_events`] and [`crate::join`]).
+    pub gadget_events: Option<crate::gadget_events::GadgetEvents>,
 }
 
 /// How far apart, in seconds, the timeline's entry for a kill, down or
@@ -179,6 +209,8 @@ pub struct ReadOptions {
     pub mode: ReadMode,
     /// Also count every packet marker and property hash in the stream.
     pub census: bool,
+    /// Also read every player's movement (full reads, Y11S3+).
+    pub movement: bool,
 }
 
 impl From<ReadMode> for ReadOptions {
@@ -186,6 +218,7 @@ impl From<ReadMode> for ReadOptions {
         ReadOptions {
             mode,
             census: false,
+            movement: false,
         }
     }
 }
@@ -323,6 +356,26 @@ impl Serialize for Round {
             device_events: &'a [crate::devices::DeviceEvent],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             camera_counts: &'a [crate::devices::CameraCount],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            reinforcements: &'a [crate::panels::Reinforcement],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            barricades: &'a [crate::panels::Barricade],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            gadgets: &'a [crate::gadgets::Gadget],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            map_cameras: &'a [crate::gadgets::MapCamera],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            destruction: &'a [crate::destruction::Destruction],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            surfaces: &'a [crate::destruction::Surface],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            breaches: &'a [crate::destruction::Breach],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            areas: &'a [crate::areas::Area],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            environment: &'a [crate::areas::EnvironmentEvent],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            light_screens: &'a [crate::areas::LightScreen],
             hits: &'a [crate::combat::Hit],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             timeline_events: &'a [crate::combat::TimelineEvent],
@@ -344,14 +397,27 @@ impl Serialize for Round {
             phone_hacks: &'a [crate::intel::PhoneHack],
             #[serde(skip_serializing_if = "<[_]>::is_empty")]
             metal_detectors: &'a [crate::sound::MetalDetector],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            score_changes: &'a [crate::gadget_events::ScoreChange],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            device_removals: &'a [crate::gadget_events::Removal],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            gadget_statuses: &'a [crate::gadget_events::Status],
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            trap_triggers: &'a [crate::gadget_events::TrapTrigger],
             replay: ReplayInfo<'a>,
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
             timing: Option<&'a Timing>,
             #[serde(skip_serializing_if = "Option::is_none")]
             census: Option<&'a Census>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            activity: Option<&'a Activity>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            movement: Option<&'a Movement>,
         }
         let vitals = self.vitals.as_ref();
+        let gadget_events = self.gadget_events.as_ref();
         Output {
             header: &self.header,
             round: self.info(),
@@ -389,10 +455,26 @@ impl Serialize for Round {
             operator_reveals: &self.operator_reveals,
             phone_hacks: &self.phone_hacks,
             metal_detectors: &self.metal_detectors,
+            reinforcements: &self.reinforcements,
+            barricades: &self.barricades,
+            gadgets: &self.gadgets,
+            map_cameras: &self.map_cameras,
+            destruction: &self.destruction,
+            surfaces: &self.surfaces,
+            breaches: &self.breaches,
+            areas: &self.areas,
+            environment: &self.environment,
+            light_screens: &self.light_screens,
+            score_changes: gadget_events.map_or(&[], |g| &g.score),
+            device_removals: gadget_events.map_or(&[], |g| &g.removals),
+            gadget_statuses: gadget_events.map_or(&[], |g| &g.statuses),
+            trap_triggers: gadget_events.map_or(&[], |g| &g.traps),
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
             census: self.census.as_ref(),
+            activity: self.activity.as_ref(),
+            movement: self.movement.as_ref(),
         }
         .serialize(s)
     }
@@ -763,6 +845,20 @@ struct Parser<'a> {
     spot_marks: Vec<crate::markers::SpotMark>,
     views: Vec<crate::devices::View>,
     poses: Vec<crate::devices::Pose>,
+    /// Y11S3 full reads: the entities and map objects of the movement
+    /// stream and the effects of the effects stream, read once for the
+    /// decoders that follow.
+    world: Option<crate::world::World>,
+    effects: Option<crate::fx::Effects>,
+    /// Y11S3: what [`crate::destruction`] found besides its events: the
+    /// surfaces to report as inferred, and each reinforcement that was
+    /// opened with the frame, for the join with the reinforcements.
+    destruction_status: Option<usize>,
+    opened_reinforcements: Vec<(u64, u32)>,
+    /// Y11S3: events of debris and props that destruction left out.
+    physics_events: usize,
+    /// Y11S3: what the join of the world decoders did, for `decodeStatus`.
+    join_status: Option<crate::join::Counts>,
 }
 
 /// An equipment slot as sent before a pick or swap packet.
@@ -855,6 +951,12 @@ impl<'a> Parser<'a> {
             records: None,
             frame_times: Vec::new(),
             loadout_status: None,
+            world: None,
+            effects: None,
+            destruction_status: None,
+            opened_reinforcements: Vec::new(),
+            physics_events: 0,
+            join_status: None,
             weapon_status: Vec::new(),
             spot_marks: Vec::new(),
             views: Vec::new(),
@@ -938,9 +1040,15 @@ impl<'a> Parser<'a> {
         if mode == ReadMode::Full {
             self.resolve_loadouts();
             self.resolve_vitals();
+            self.resolve_gadget_events();
             self.join_combat();
+            self.join_world();
             self.round_end();
             self.resolve_intel();
+            self.resolve_activity();
+            if options.movement {
+                self.resolve_movement();
+            }
         }
         self.measure_records();
         if options.census {
@@ -1258,6 +1366,54 @@ impl<'a> Parser<'a> {
                 f.warn(w.clone());
             }
         }
+        // Y11S3: surfaces are derived from the impacts, never read.
+        if let Some(surfaces) = self.destruction_status {
+            r.field("surfaces", Status::Inferred, surfaces);
+        }
+        // Y11S3: the world counts the updates read of the entities it
+        // follows. It is partial when an effects record did not read, or
+        // one in a thousand of those updates.
+        if let (Some(w), Some(e)) = (&self.world, &self.effects) {
+            let f = r.field("world", Status::Decoded, w.updates - w.unparsed);
+            if e.unparsed > 0 || w.unparsed * 1000 >= w.updates.max(1) {
+                f.at_most(Status::Partial);
+            }
+            for warning in w.warnings.iter().chain(&e.warnings) {
+                f.warn(warning.clone());
+            }
+        }
+        // Y11S3: gadget events count the removals, statuses and trap
+        // triggers, those on a gadget of `gadgets` and those listed by
+        // themselves; the score changes are a count of their own.
+        if let Some(g) = &round.gadget_events {
+            let joined = self.join_status.clone().unwrap_or_default();
+            let events = joined.removals_joined
+                + joined.statuses_joined
+                + joined.triggers_joined
+                + g.removals.len()
+                + g.statuses.len()
+                + g.traps.len();
+            let f = r.field("gadgetEvents", Status::Decoded, events);
+            for w in &g.warnings {
+                f.warn(w.clone());
+            }
+            if joined.removals_dropped > 0 {
+                f.warn(format!(
+                    "{} removals of entities that are no gadget have no known cause and are left out",
+                    joined.removals_dropped
+                ));
+            }
+            if joined.removals_folded > 0 {
+                f.warn(format!(
+                    "{} later removals of a gadget are folded into its first",
+                    joined.removals_folded
+                ));
+            }
+            let who =
+                "who destroyed a gadget is inferred from the scoreboard (`bySource`), never read";
+            f.warn(who);
+            r.field("scoreChanges", Status::Decoded, g.score.len());
+        }
         // Y11S3: vitals count the players whose life object states a maximum
         // health. One who never spawned has none, which is no fault of the
         // read.
@@ -1408,6 +1564,42 @@ impl<'a> Parser<'a> {
                         "{others} players in the player table are not in the header's player list: they joined after it was written, or were not part of the round"
                     ));
                 }
+            }
+            if let Some(a) = &round.activity {
+                r.field("defuserCarrier", Status::Decoded, a.defuser.len());
+                r.field("defuserInteractions", Status::Decoded, a.interactions.len());
+                r.field("equipped", Status::Decoded, a.equipped.len());
+                // What most ability values mean is read from a few
+                // operators' behaviour.
+                r.field("ability", Status::Inferred, a.ability.len());
+            }
+            if let Some(m) = &round.movement {
+                let tracked = m.players.iter().filter(|t| !t.time.is_empty()).count();
+                let samples: usize = m.players.iter().map(|t| t.time.len()).sum();
+                let unread: usize = m.players.iter().map(|t| t.unread).sum();
+                let f = r.field("tracks", Status::Decoded, tracked);
+                if unread > 0 {
+                    f.warn(format!(
+                        "{unread} updates of players' bodies could not be read, next to {samples} that could"
+                    ));
+                }
+                // One in a hundred lost leaves holes worth knowing about.
+                if unread * 100 > samples {
+                    f.at_most(Status::Partial);
+                }
+                // The side a player leans to is read from how the value
+                // behaves; no round has been checked against the game.
+                let leaning = m.players.iter().filter(|t| t.lean.len() > 1).count();
+                r.field("lean", Status::Inferred, leaning);
+                let f = r.field("views", Status::Decoded, m.views.len());
+                let ownerless = m.views.iter().filter(|v| !v.fixed && v.owner.is_none());
+                let ownerless = ownerless.count();
+                if ownerless > 0 {
+                    f.warn(format!(
+                        "{ownerless} sessions are on a device whose owner could not be found"
+                    ));
+                }
+                r.field("placements", Status::Decoded, m.placements.len());
             }
             let party = players.iter().filter(|p| p.party.is_some()).count();
             let f = r.field("party", Status::Decoded, party);
@@ -1629,6 +1821,13 @@ impl<'a> Parser<'a> {
             if !t.clock_gaps.is_empty() {
                 f.at_most(Status::Partial)
                     .warn(format!("{} jumps in the in-game clock", t.clock_gaps.len()));
+            }
+            if !t.skips.is_empty() {
+                let longest = t.skips.iter().map(|s| s.seconds).fold(0.0, f64::max);
+                f.at_most(Status::Partial).warn(format!(
+                    "the recording skips game time {} times, the longest about {longest:.1} s: what is timed across a skip is that much shorter than it was",
+                    t.skips.len()
+                ));
             }
             if !t.holes.is_empty() {
                 let longest = t.holes.iter().map(|h| h.seconds).fold(0.0, f64::max);
@@ -2709,8 +2908,16 @@ impl<'a> Parser<'a> {
         for a in &mut activity {
             a.died(&self.round.match_feedback, &self.round.life_events);
         }
-        let shots = crate::shots::decode(&input);
-        let throws = crate::throws::decode(&input);
+        let world = crate::world::decode(&input);
+        if let Some(timing) = self.round.timing.as_mut() {
+            timing.skips = world.skips(&self.frame_times);
+        }
+        let effects = crate::fx::decode(&input);
+        // Each player's ability and gadget as the HUD names them, read
+        // once for every decoder that names what a player holds.
+        let items = crate::loadout::hud_items(&input);
+        let shots = crate::shots::decode(&input, &effects);
+        let throws = crate::throws::decode(&input, &items);
         let melee = crate::melee::decode(&input);
         let markers = crate::markers::decode(&input);
         let marked = markers.pings.len()
@@ -2722,11 +2929,27 @@ impl<'a> Parser<'a> {
         let defense = teams.iter().position(|t| t.role == Some(TeamRole::Defense));
         let devices = crate::devices::decode(&input, &shots.shots, defense);
         devices.link(&mut self.round.observation);
+        let areas = crate::areas::decode(
+            &input,
+            &world,
+            &effects,
+            &crate::areas::Context {
+                shots: &shots.shots,
+                throws: &throws.throws,
+                loadouts: &self.round.loadouts,
+                map: self.round.header.map.0,
+            },
+        );
         self.weapon_status = vec![
             ("weaponActivity", activity.len(), Vec::new()),
             ("shots", shots.shots.len(), shots.warnings),
             ("throws", throws.throws.len(), throws.warnings),
-            ("melee", melee.hits.len() + melee.shields.len(), melee.warnings),
+            (
+                "melee",
+                melee.hits.len() + melee.shields.len(),
+                melee.warnings,
+            ),
+            ("areas", areas.areas.len(), areas.warnings),
             ("markers", marked, markers.warnings),
             (
                 "devices",
@@ -2734,6 +2957,9 @@ impl<'a> Parser<'a> {
                 devices.warnings,
             ),
         ];
+        self.round.areas = areas.areas;
+        self.round.environment = areas.environment;
+        self.round.light_screens = areas.light_screens;
         self.round.weapon_activity = activity;
         self.round.shots = shots.shots;
         self.round.bullet_hits = shots.hits;
@@ -2750,7 +2976,28 @@ impl<'a> Parser<'a> {
         self.round.cameras = devices.cameras;
         self.round.device_events = devices.events;
         self.round.camera_counts = devices.camera_counts;
+        let panels = crate::panels::decode(&input, &world);
+        let count = panels.reinforcements.len() + panels.barricades.len();
+        self.weapon_status.push(("panels", count, panels.warnings));
+        self.round.reinforcements = panels.reinforcements;
+        self.round.barricades = panels.barricades;
+        let gadgets = crate::gadgets::decode(&input, &world, &items);
+        (self.weapon_status).push(("gadgets", gadgets.gadgets.len(), gadgets.warnings));
+        self.round.gadgets = gadgets.gadgets;
+        self.round.map_cameras = gadgets.cameras;
+        let destruction = crate::destruction::decode(&input, &world, &self.round.header, &items);
+        self.physics_events = destruction.physics;
+        let found = (destruction.destruction.len(), destruction.breaches.len());
+        (self.weapon_status).push(("destruction", found.0, destruction.warnings));
+        self.weapon_status.push(("breaches", found.1, Vec::new()));
+        self.destruction_status = Some(destruction.surfaces.len());
+        self.opened_reinforcements = destruction.opened;
+        self.round.destruction = destruction.destruction;
+        self.round.surfaces = destruction.surfaces;
+        self.round.breaches = destruction.breaches;
         self.loadout_status = Some(decoded);
+        self.world = Some(world);
+        self.effects = Some(effects);
         self.round.combat = Some(crate::combat::decode(
             self.data,
             map,
@@ -2889,6 +3136,42 @@ impl<'a> Parser<'a> {
         self.round.metal_detectors = sound.alarms;
     }
 
+    /// Y11S3: score changes, gadget removals with who and how, statuses
+    /// and trap triggers (see [`crate::gadget_events`]). Who and how are
+    /// worked out from the shots, hits, effects and kill feed, so this
+    /// follows them.
+    fn resolve_gadget_events(&mut self) {
+        let (Some(world), Some(effects)) = (&self.world, &self.effects) else {
+            return;
+        };
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let input = crate::loadout::Input {
+            data: self.data,
+            map,
+            streams: &container.streams,
+            players: &self.round.header.players,
+            clock: &clock,
+        };
+        let round = &self.round;
+        let context = crate::gadget_events::Context {
+            loadouts: &round.loadouts,
+            shots: &round.shots,
+            hits: round.combat.as_ref().map_or(&[], |c| &c.hits),
+            effects: round.vitals.as_ref().map_or(&[], |v| &v.effects),
+            feedback: &round.match_feedback,
+            timeline: round.combat.as_ref().map_or(&[], |c| &c.events),
+        };
+        let decoded = crate::gadget_events::decode(&input, world, effects, &context);
+        self.round.gadget_events = Some(decoded);
+    }
+
     /// Y11S3: names who downed, finished and revived whom, from the round's
     /// timeline, and what the victim of each kill was under. The timeline
     /// and the life states are written apart, so an entry belongs to the
@@ -2989,6 +3272,126 @@ impl<'a> Parser<'a> {
                 _ => DownOutcome::DownAtEnd,
             });
         }
+    }
+
+    /// Y11S3: what the state stream says each player did (see
+    /// [`crate::activity`]).
+    fn resolve_activity(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let players = &self.round.header.players;
+        let activity = crate::activity::decode(
+            self.data,
+            map,
+            &container.streams,
+            players,
+            &self.frame_times,
+        );
+        self.round.activity = Some(activity);
+    }
+
+    /// Y11S3: every player's track, from the movement stream (see
+    /// [`crate::movement`]).
+    fn resolve_movement(&mut self) {
+        if self.code() < version::Y11S3 {
+            return;
+        }
+        let (Some(map), Some(container)) = (&self.records, &self.round.container) else {
+            return;
+        };
+        let data = self.data;
+        let blocks =
+            crate::loadout::blocks(map, &container.streams, crate::loadout::MOVEMENT_STREAM)
+                .filter_map(|(start, end, frame)| Some((data.get(start..end)?, frame)));
+        let movement = crate::movement::decode(
+            blocks,
+            &self.round.header.players,
+            &self.player_tables.views,
+            &self.frame_times,
+        );
+        self.round.movement = Some(movement);
+    }
+
+    /// Y11S3: puts what the world decoders found together (see
+    /// [`crate::join`]): a gadget's end with who and how, its statuses and
+    /// triggers; opened reinforcements; the area a victim stood in; shots
+    /// through smoke; jammers and barbed wire.
+    fn join_world(&mut self) {
+        let Some(world) = &self.world else { return };
+        let clock = crate::loadout::Clock {
+            timeline: &self.round.timeline,
+            reading_offsets: &self.reading_offsets,
+            frame_times: &self.frame_times,
+        };
+        let opened: Vec<(u64, crate::loadout::When)> = (self.opened_reinforcements.iter())
+            .map(|&(entity, frame)| (entity, world.when(&clock, Some(frame))))
+            .collect();
+        let Round {
+            header,
+            match_feedback,
+            reinforcements,
+            barricades,
+            gadgets,
+            breaches,
+            areas,
+            shots,
+            combat,
+            vitals,
+            gadget_events,
+            ..
+        } = &mut self.round;
+        let players = &header.players;
+        let team_of = |username: &str| {
+            let player = players.iter().find(|p| p.username == username);
+            player.map(|p| p.team_index)
+        };
+        let mut none = Vec::new();
+        let hits = combat.as_mut().map_or(&mut none, |c| &mut c.hits);
+        let mut counts = match gadget_events {
+            Some(events) => {
+                let effects = vitals.as_mut().map(|v| &mut v.effects);
+                crate::join::nearest_gadgets(events, effects.map_or(&mut [], |e| e), hits);
+                crate::join::gadget_events(gadgets, events, team_of)
+            }
+            None => crate::join::Counts::default(),
+        };
+        counts.opened_unmatched =
+            crate::join::panels(reinforcements, barricades, breaches, gadgets, opened);
+        let bodies = crate::join::Bodies {
+            world,
+            players,
+            frame_times: &self.frame_times,
+        };
+        (counts.area_hits, counts.area_hits_inside) =
+            crate::join::in_areas(areas, &bodies, match_feedback, hits, shots);
+        let notes = [
+            (
+                "panels",
+                counts.opened_unmatched,
+                "reinforcement entities were opened while no reinforcement of the round was on them",
+            ),
+            (
+                "destruction",
+                self.physics_events,
+                "events of debris and props colliding with the map are left out",
+            ),
+            (
+                "areas",
+                counts.area_hits - counts.area_hits_inside,
+                "fire and gas hits were taken outside every area",
+            ),
+        ];
+        for (field, count, what) in notes {
+            let status = self.weapon_status.iter_mut().find(|s| s.0 == field);
+            if let (Some(status), true) = (status, count > 0) {
+                status.2.push(format!("{count} {what}"));
+            }
+        }
+        self.join_status = Some(counts);
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes

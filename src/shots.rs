@@ -33,21 +33,10 @@
 //! stream only, so an event here takes the reading in force at the end of
 //! the state record of its frame.
 //!
-//! **The hit effect.** A record of the `FXChannel` stream (`f5ee6a3d`) is a
-//! `u8` mask and one section per bit, each a `u32` count and its entries:
-//!
-//! ```text
-//! 01 spawn  36 bytes: u64 asset, u64 parent, u32 instance, u32,
-//!                     u64 target entity, u32
-//! 04        12 bytes
-//! 08 float  12 bytes: u32 instance, hash, f32
-//! 10 vector 24 bytes: u32 instance, hash, 4 x f32
-//! ```
-//!
-//! and further sections that are not read. A bullet striking a body spawns
-//! asset `d5 6d 41 58` with the body as its target, and the vector
-//! parameter `56 95 b5 31` of that instance is where it struck, in world
-//! metres.
+//! **The hit effect.** The `FXChannel` stream spawns effects (see
+//! [`crate::fx`], which reads it). A bullet striking a body spawns asset
+//! `d5 6d 41 58` with the body as its target, and the vector parameter
+//! `56 95 b5 31` of that instance is where it struck, in world metres.
 //!
 //! **The damage block.** The update of a body that took damage ends in 24
 //! bytes, followed by up to 23 more:
@@ -90,13 +79,12 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::entities::Hash;
+use crate::fx::Effects;
 use crate::loadout::{
     Entities, Hud, Input, MOVEMENT_STREAM, Named, PRIMARY_WEAPON, SECONDARY_WEAPON, SLOT_FIELDS,
     STATE_STREAM, UPDATE, When, messages,
 };
 
-/// Name hash of the effects stream (`FXChannel`).
-const EFFECTS_STREAM: Hash = [0xF5, 0xEE, 0x6A, 0x3D];
 /// The event id of a gun firing, and the size of the event.
 const FIRE: u8 = 0x06;
 const FIRE_SIZE: usize = 63;
@@ -117,13 +105,6 @@ const SLOT_NAMES: [&str; 4] = ["primary", "secondary", "ability", "gadget"];
 const WORLD: f32 = 1.0e4;
 /// The effect a bullet spawns on the body it strikes.
 const HIT_EFFECT: u64 = 0x5841_6DD5;
-/// The vector parameter of a hit effect holding where the bullet struck.
-const HIT_POSITION: Hash = [0x56, 0x95, 0xB5, 0x31];
-/// Effect stream sections: the bit of each and the size of its entries.
-const SPAWNS: (u8, usize) = (0x01, 36);
-const INTEGERS: (u8, usize) = (0x04, 12);
-const FLOATS: (u8, usize) = (0x08, 12);
-const VECTORS: (u8, usize) = (0x10, 24);
 /// The size of a damage block, and how many bytes can follow it.
 const BLOCK_SIZE: usize = 24;
 const BLOCK_TAIL: usize = 23;
@@ -174,6 +155,11 @@ pub struct Shot {
     pub distance: f32,
     /// The same from the shooter's eye.
     pub eye_distance: f32,
+    /// The bullet's path from the muzzle to what it struck passes through
+    /// a smoke cloud of `areas[]` (see [`crate::join`]). Derived: the
+    /// cloud's radius is assumed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub through_smoke: bool,
     #[serde(flatten)]
     pub when: When,
 }
@@ -233,10 +219,6 @@ fn f32_at(d: &[u8], at: usize) -> Option<f32> {
 
 fn u32_at(d: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?))
-}
-
-fn u64_at(d: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(d.get(at..at + 8)?.try_into().ok()?))
 }
 
 fn vec3_at(d: &[u8], at: usize) -> Option<[f32; 3]> {
@@ -351,76 +333,6 @@ fn damage_block(update: &[u8]) -> Option<Block> {
     })
 }
 
-/// A hit effect of one effects record.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Effect {
-    /// The entity struck.
-    target: u64,
-    position: Option<[f32; 3]>,
-}
-
-/// The hit effects of an effects record, and whether the record held what
-/// its counts promise as far as it is read.
-fn hit_effects(record: &[u8]) -> (Vec<Effect>, bool) {
-    let Some(&mask) = record.first() else {
-        return (Vec::new(), true);
-    };
-    let mut at = 1;
-    // The entries of a section the mask names: `(start, count)`.
-    let mut section = |(bit, size): (u8, usize)| -> Option<(usize, usize)> {
-        if mask & bit == 0 {
-            return Some((at, 0));
-        }
-        let count = u32_at(record, at)? as usize;
-        let start = at + 4;
-        let end = start.checked_add(count.checked_mul(size)?)?;
-        if end > record.len() {
-            return None;
-        }
-        at = end;
-        Some((start, count))
-    };
-    let mut hits: Vec<(u32, Effect)> = Vec::new();
-    let Some((start, count)) = section(SPAWNS) else {
-        return (Vec::new(), false);
-    };
-    for at in (0..count).map(|i| start + i * SPAWNS.1) {
-        let entry = (
-            u64_at(record, at),
-            u32_at(record, at + 16),
-            u64_at(record, at + 24),
-        );
-        if let (Some(HIT_EFFECT), Some(instance), Some(target)) = entry {
-            let effect = Effect {
-                target,
-                position: None,
-            };
-            hits.push((instance, effect));
-        }
-    }
-    let effects = |hits: Vec<(u32, Effect)>| hits.into_iter().map(|h| h.1).collect();
-    if hits.is_empty() {
-        return (Vec::new(), true);
-    }
-    let vectors = section(INTEGERS)
-        .and_then(|_| section(FLOATS))
-        .and_then(|_| section(VECTORS));
-    let Some((start, count)) = vectors else {
-        return (effects(hits), false);
-    };
-    for at in (0..count).map(|i| start + i * VECTORS.1) {
-        if record.get(at + 4..at + 8) != Some(&HIT_POSITION) {
-            continue;
-        }
-        let position = vec3_at(record, at + 8).filter(|p| p.iter().all(|v| v.abs() < WORLD));
-        let instance = u32_at(record, at);
-        if let Some((_, hit)) = hits.iter_mut().find(|h| Some(h.0) == instance) {
-            hit.position = position;
-        }
-    }
-    (effects(hits), true)
-}
-
 /// A gun that fired, with who carries it.
 #[derive(Clone, Debug, Default)]
 struct Gun {
@@ -484,7 +396,9 @@ fn max_health(input: &Input) -> HashMap<u32, u32> {
     out
 }
 
-pub(crate) fn decode(input: &Input) -> Decoded {
+/// Reads the shots from the movement stream and the hits from the hit
+/// effects among `effects`.
+pub(crate) fn decode(input: &Input, effects: &Effects) -> Decoded {
     let &Input {
         data,
         players,
@@ -651,6 +565,7 @@ pub(crate) fn decode(input: &Input) -> Decoded {
                 direction: run.fire.direction,
                 distance: run.fire.distance,
                 eye_distance: run.fire.eye_distance,
+                through_smoke: false,
                 when: when(run.frame),
             }
         })
@@ -669,69 +584,64 @@ pub(crate) fn decode(input: &Input) -> Decoded {
         let object = players.get(player)?.entities.as_ref()?.health?;
         health.get(&object).copied().filter(|&h| h > 0)
     };
-    let (mut malformed, mut unplaced, mut ownerless) = (0usize, 0usize, 0usize);
-    for (start, end, frame) in input.blocks(EFFECTS_STREAM) {
-        let (Some(record), Some(frame)) = (data.get(start..end), frame) else {
+    let (mut unplaced, mut ownerless) = (0usize, 0usize);
+    // A hit effect of the snapshot struck before the recording started.
+    for effect in effects.of(HIT_EFFECT) {
+        let Some(frame) = effect.frame else {
             continue;
         };
-        // Most records spawn no hit effect.
-        if memchr::memmem::find(record, &HIT_EFFECT.to_le_bytes()).is_none() {
+        // Hit effects also spawn on what is no body.
+        let Some(&owner) = bodies.get(&effect.target) else {
             continue;
-        }
-        let (effects, whole) = hit_effects(record);
-        malformed += usize::from(!whole);
-        for effect in effects {
-            // Hit effects also spawn on what is no body.
-            let Some(&owner) = bodies.get(&effect.target) else {
-                continue;
+        };
+        let Some(victim) = owner else {
+            ownerless += 1;
+            continue;
+        };
+        let seconds = clock.seconds(Some(frame));
+        let position = (effect.position).filter(|p| p.iter().all(|v| v.abs() < WORLD));
+        unplaced += usize::from(position.is_none());
+        let mut hit = Hit {
+            victim: name(Some(victim)).unwrap_or_default(),
+            position,
+            when: when(frame),
+            ..Hit::default()
+        };
+        // The victim's bullet damage nearest in time.
+        let block = seconds.and_then(|t| {
+            (damage.get_mut(&effect.target)?.iter_mut())
+                .filter(|d| d.block.kind == BULLET && (d.seconds - t).abs() <= BLOCK_WINDOW)
+                .min_by(|a, b| (a.seconds - t).abs().total_cmp(&(b.seconds - t).abs()))
+        });
+        if let Some(d) = block {
+            hit.limb = Some(d.block.multiplier < LIMB);
+            hit.result = match d.block.state {
+                DEAD => Some(HitResult::Dead),
+                DOWN => Some(HitResult::Down),
+                _ if d.block.ratio > 0.0 => Some(HitResult::Alive),
+                _ => None,
             };
-            let Some(victim) = owner else {
-                ownerless += 1;
-                continue;
-            };
-            let seconds = clock.seconds(Some(frame));
-            unplaced += usize::from(effect.position.is_none());
-            let mut hit = Hit {
-                victim: name(Some(victim)).unwrap_or_default(),
-                position: effect.position,
-                when: when(frame),
-                ..Hit::default()
-            };
-            // The victim's bullet damage nearest in time.
-            let block = seconds.and_then(|t| {
-                (damage.get_mut(&effect.target)?.iter_mut())
-                    .filter(|d| d.block.kind == BULLET && (d.seconds - t).abs() <= BLOCK_WINDOW)
-                    .min_by(|a, b| (a.seconds - t).abs().total_cmp(&(b.seconds - t).abs()))
-            });
-            if let Some(d) = block {
-                hit.limb = Some(d.block.multiplier < LIMB);
-                hit.result = match d.block.state {
-                    DEAD => Some(HitResult::Dead),
-                    DOWN => Some(HitResult::Down),
-                    _ if d.block.ratio > 0.0 => Some(HitResult::Alive),
-                    _ => None,
-                };
-                // Pellets of one shell share a block: the first has its
-                // damage.
-                if !d.used && d.taken >= 0.0 {
-                    hit.damage = max_of(victim).map(|max| (d.taken * max as f32).round() as u32);
-                }
-                d.used = true;
+            // Pellets of one shell share a block: the first has its
+            // damage.
+            if !d.used && d.taken >= 0.0 {
+                hit.damage = max_of(victim).map(|max| (d.taken * max as f32).round() as u32);
             }
-            if let (Some(t), Some(position)) = (seconds, effect.position) {
-                let shot = ray(&runs, &spans, &carriers, effect.target, position, t);
-                if let Some(shot) = shot {
-                    hit.shot = Some(shot);
-                    hit.shooter = out.shots.get(shot).and_then(|s| s.username.clone());
-                    hit.shooter_source = hit.shooter.as_ref().map(|_| "ray");
-                }
-            }
-            out.hits.push(hit);
+            d.used = true;
         }
+        if let (Some(t), Some(position)) = (seconds, position) {
+            let shot = ray(&runs, &spans, &carriers, effect.target, position, t);
+            if let Some(shot) = shot {
+                hit.shot = Some(shot);
+                hit.shooter = out.shots.get(shot).and_then(|s| s.username.clone());
+                hit.shooter_source = hit.shooter.as_ref().map(|_| "ray");
+            }
+        }
+        out.hits.push(hit);
     }
-    if malformed > 0 {
+    if effects.unparsed > 0 {
         out.warnings.push(format!(
-            "{malformed} effect records with a bullet hit do not hold what their counts promise"
+            "{} effect records do not hold what their counts promise: bullet hits may be missing",
+            effects.unparsed
         ));
     }
     if ownerless > 0 {
@@ -930,72 +840,6 @@ mod tests {
         for cut in 0..BLOCK_SIZE + 6 {
             assert_eq!(damage_block(&good[..cut]), None, "cut at {cut}");
         }
-    }
-
-    /// An effects record: spawns of `(asset, instance, target)` and vector
-    /// parameters of `(instance, hash, xyz)`, with a float section between.
-    fn effects(spawns: &[(u64, u32, u64)], vectors: &[(u32, Hash, [f32; 3])]) -> Vec<u8> {
-        let mut d = vec![SPAWNS.0 | FLOATS.0 | VECTORS.0];
-        d.extend((spawns.len() as u32).to_le_bytes());
-        for (asset, instance, target) in spawns {
-            d.extend(asset.to_le_bytes());
-            d.extend(0u64.to_le_bytes());
-            d.extend(instance.to_le_bytes());
-            d.extend(0u32.to_le_bytes());
-            d.extend(target.to_le_bytes());
-            d.extend(2u32.to_le_bytes());
-        }
-        d.extend(1u32.to_le_bytes());
-        d.extend([7; 12]);
-        d.extend((vectors.len() as u32).to_le_bytes());
-        for (instance, hash, v) in vectors {
-            d.extend(instance.to_le_bytes());
-            d.extend(hash);
-            d.extend(v.iter().flat_map(|v| v.to_le_bytes()));
-            d.extend(1f32.to_le_bytes());
-        }
-        d
-    }
-
-    #[test]
-    fn reads_hit_effects_with_their_position() {
-        let record = effects(
-            &[
-                (9, 1, 0xF000_0001),
-                (HIT_EFFECT, 2, 0xF000_0002),
-                (HIT_EFFECT, 3, 0xF000_0003),
-            ],
-            &[
-                (2, [1, 2, 3, 4], [9.0; 3]),
-                (3, HIT_POSITION, [1.0, 2.0, 3.0]),
-                (1, HIT_POSITION, [4.0; 3]),
-            ],
-        );
-        let (hits, whole) = hit_effects(&record);
-        assert!(whole);
-        assert_eq!(hits.len(), 2);
-        assert_eq!((hits[0].target, hits[0].position), (0xF000_0002, None));
-        assert_eq!(hits[1].target, 0xF000_0003);
-        assert_eq!(hits[1].position, Some([1.0, 2.0, 3.0]));
-    }
-
-    #[test]
-    fn malformed_effect_records_are_told() {
-        let record = effects(&[(HIT_EFFECT, 2, 5)], &[(2, HIT_POSITION, [1.0; 3])]);
-        // Cut in the spawns: nothing. Cut after them: the hit, unplaced.
-        for cut in 1..record.len() {
-            let (hits, whole) = hit_effects(&record[..cut]);
-            assert!(!whole, "cut at {cut}");
-            assert_eq!(hits.len(), usize::from(cut >= 5 + 36), "cut at {cut}");
-            assert!(hits.iter().all(|h| h.position.is_none()));
-        }
-        assert_eq!(hit_effects(&[]), (vec![], true));
-        // A count the record cannot hold.
-        let mut count = record.clone();
-        count[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert_eq!(hit_effects(&count), (vec![], false));
-        // A record without spawns has no hits, whatever follows.
-        assert_eq!(hit_effects(&[FLOATS.0, 0xFF, 0xFF]), (vec![], true));
     }
 
     fn run(gun: u64, origin: [f32; 3], direction: [f32; 3], distance: f32) -> Run {

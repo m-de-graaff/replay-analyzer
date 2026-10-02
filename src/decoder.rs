@@ -41,6 +41,14 @@
 //!   their cause, phone hacks and metal-detector alarms. A kill says
 //!   whether its victim was spotted or pinged, an observation session
 //!   names its device, and effect types 15 and 51 have names.
+//! - Y11S3 (profile Y9S4): the world of the movement stream and the effects
+//!   stream: gadgets with how they ended and who destroyed them, statuses,
+//!   trap triggers, score changes, reinforcements, barricades, destruction,
+//!   surfaces, breaches, areas, environment objects and light screens;
+//!   kills, hits, shots and effects name the area, wire or jammer they
+//!   were in; gadget, panel and breach counts in the stats; skips of game
+//!   time in `timing`. A throw that stuck in its first step has no
+//!   direction.
 
 use serde::Serialize;
 
@@ -126,7 +134,7 @@ pub const PROFILES: &[Profile] = &[
     Profile {
         name: "Y9S4",
         min_build: version::Y9S4,
-        revision: 12,
+        revision: 14,
         changes: "starting scores in header; Y11S3 state-object swaps and defuser objects; endtime and property count",
     },
 ];

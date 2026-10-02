@@ -515,6 +515,7 @@ fn census_counts_known_and_unknown_fields() {
         let options = replay_analyzer::ReadOptions {
             mode: ReadMode::Full,
             census: true,
+            movement: false,
         };
         let round = Round::open(&path, options).unwrap();
         let c = round.census.as_ref().unwrap();

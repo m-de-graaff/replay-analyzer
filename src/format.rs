@@ -218,6 +218,10 @@ pub struct Timing {
     /// (Y8S4+ full and partial reads).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub holes: Vec<Hole>,
+    /// Moments the game moved on by more than the recording's clock did:
+    /// see [`Skip`] (Y11S3 full reads).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skips: Vec<Skip>,
     /// Places where the in-game clock skipped seconds.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clock_gaps: Vec<ClockGap>,
@@ -279,6 +283,28 @@ pub struct Hole {
     /// hole.
     pub at: f64,
     pub seconds: f64,
+}
+
+/// A moment the game moved on by more than the recording's clock did.
+/// Frames follow each other as always, but two or more players who were
+/// walking are suddenly metres further on, as far as they would have got
+/// in `seconds` more than passed. Whatever is timed across it comes out
+/// that much shorter than it was in the game: a reinforcement that takes
+/// 4.1 s is up in 3.1 s. Inferred from the bodies; the file has no marker
+/// for it.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Skip {
+    /// Seconds since the recording started of the last positions before
+    /// the jump, and of the first after it.
+    pub at: f64,
+    pub until: f64,
+    /// Game time missing, estimated: how long the players would have
+    /// taken for the jump at the speed they had, less the time that
+    /// passed; the median over them.
+    pub seconds: f64,
+    /// How many players jumped.
+    pub bodies: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]

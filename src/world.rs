@@ -196,6 +196,8 @@ const JUMP_STEP: f64 = 0.3;
 /// and one slower than this (metres a second) was not walking.
 const JUMP_LEAD: usize = 5;
 const WALKING: f64 = 1.0;
+/// A body further than this (metres, per axis) from where it was has moved.
+const MOVED: f32 = 0.002;
 
 /// What kind of object an [`Entity`] is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -454,6 +456,21 @@ impl World {
     pub(crate) fn body_of(&self, player: usize) -> Option<u64> {
         let owned = |id: &&u64| self.players.get(id) == Some(&player);
         self.order.iter().rev().find(owned).copied()
+    }
+
+    /// When a player's body was somewhere else than at its position kept
+    /// before, in seconds since the recording started and in order.
+    pub(crate) fn moves(&self, frame_times: &[f64]) -> Vec<f64> {
+        let mut out: Vec<f64> = (self.bodies.values())
+            .flat_map(|track| track.windows(2))
+            .filter_map(|w| {
+                let (a, b) = (w.first()?, w.get(1)?);
+                let moved = (a.1.iter().zip(&b.1)).any(|(x, y)| (x - y).abs() > MOVED);
+                frame_times.get(b.0 as usize).copied().filter(|_| moved)
+            })
+            .collect();
+        out.sort_by(f64::total_cmp);
+        out
     }
 
     /// The moments the game moved on by more than the recording's clock

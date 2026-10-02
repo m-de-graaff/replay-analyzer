@@ -233,6 +233,12 @@ pub struct Timing {
     /// offset from UTC in minutes, found from `endtime` (Y11S3+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_utc_offset_minutes: Option<i64>,
+    /// Seconds the header's `endtime` less `starttime` is longer than the
+    /// frame index: a few milliseconds, up to seconds in a recording that
+    /// skips game time, and more only when the recording stood still (see
+    /// [`crate::pauses`]; Y11S3+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header_minus_index: Option<f64>,
 }
 
 impl Timing {
@@ -253,6 +259,7 @@ impl Timing {
         // Time zones are whole quarter hours.
         self.header_utc_offset_minutes = Some((offset / 15.0).round() as i64 * 15);
         let wall = (end? - start).num_milliseconds() as f64 / 1000.0;
+        self.header_minus_index = Some(((wall - self.duration) * 1000.0).round() / 1000.0);
         ((wall - self.duration).abs() > WALL_CLOCK_TOLERANCE).then(|| {
             format!(
                 "recording spans {wall:.1}s by start/end time but {:.1}s by frame index",

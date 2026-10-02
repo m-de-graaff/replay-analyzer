@@ -104,6 +104,8 @@ From Y11S3 each player has a defuser interaction object, hung off their controll
 
 A match folder adds `loadoutChanges` (Y11S3+): per player, each round whose loadout differs from the player's previous round on the same side, as `username`, `round`, `previousRound`, `side` and `changes[]` of `{field, from, to}`. `field` is `operator`, `primary`, `secondary`, `gadget`, an attachment such as `primary.sight`, or `ability` for the operators who choose a gadget in that slot; `from` and `to` are `{id, name}` (null for an empty slot). Attachments are compared only on the same gun.
 
+A match folder adds `breaks` (Y11S3+): per pair of consecutive rounds, the seconds between the two recordings, whether operators were banned or sides switched in between, and whether the break is long for the match (`pauseSuspected`, inferred). See [Pauses](#pauses).
+
 A match folder adds `analytics`: per team attack and defense records, rounds started a player down, plants, disables and prep swaps (late ones counted apart); per site the defense win rate overall and per team; per attacker spawn and team the pick and round win rates; per operator and team rounds, win rate, kills, deaths, headshots and how often it was swapped to; and a count of rounds per end reason and winning side. `summary.rounds[]` also gains `winProbability`, `endReason` and `playersAtStart`.
 
 Every round also says where it came from and how far it can be trusted:
@@ -116,7 +118,8 @@ Every round also says where it came from and how far it can be trusted:
 | `replay.parser` | Parser version and the decoder profile and revision chosen for the build. A decoding fix bumps the revision of the profiles it touches, so stored rounds with an older `(decoder, decoderRevision)` than `--decoders` lists for their build are the ones to re-parse. `untestedBuild` flags builds newer than any the decoders were checked against (9883691, 9901603 and 9918362, all `Y11S3_Alpha04`). |
 | `replay.container` | Y8S4+: the streams the round was recorded in (id, name hash, role where known, frames covered, snapshot blocks, record count), the compressed blocks, `recordingId`, and `complete`, false when the game did not finish writing the file. See [File format notes](#file-format-notes). |
 | `decodeStatus` | Per field (`container`, `players`, `kills`, `scoreboard`, `bans`, `health`, `result`, `timing`, ...): `decoded`, `inferred`, `partial`, `missing`, `notInVersion` or `skipped`, with a count and warnings such as how many packets failed. `trusted` is false when any field is partial or missing. What this parser does not decode for a version (the feed's lines that are no kills, from Y9S1 to Y11S2: `feedbackMessages`) is `notInVersion`, and a player who never spawned has no body to link, so `trusted` marks faults: a field left unread (`skipped`: a partial read, a custom game's party) does not lower it either. From Y11S3 `feedbackMessages` counts `systemMessages`; a line with an id not known is kept and named in a warning, which does not lower the status. Of the 167 real rounds in one `MatchReplay` folder, the 6 untrusted ones were 3 unfinished files and 3 rounds that were not played out (no result). |
-| `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `skips` lists moments the game moved on by more than the recording's clock did (Y11S3; see [File format notes](#file-format-notes)). `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC) and the UTC offset of the header's local `timestamp`. |
+| `timing` | From the frame index: frame count, duration, median interval and the `sampleRate` it gives, `meanRate`, and intervals over 4x the median (`gaps`). `dataRate` is how often the game sent updates, whatever the frame rate: records per second in the state stream, about 28. `holes` are stretches over 0.5 s without a movement record, which the game writes at every update. `skips` lists moments the game moved on by more than the recording's clock did (Y11S3; see [File format notes](#file-format-notes)). `clockGaps` lists seconds the in-game clock skipped, ignoring the reset at round end and the switch to the defuser timer. From Y11S3, `startedAt` (UTC), the UTC offset of the header's local `timestamp`, and `headerMinusIndex`: seconds the header's `endtime` less `starttime` is longer than the index, a few milliseconds unless the recording skipped game time or stood still. |
+| `pauses` | Y11S3 full reads: stretches the round may have been paused for, each with `kind`, `start`, `end`, `duration`, the clock at its start and the `evidence`. Inferred from the clock and the streams; no round checked holds a pause. See [Pauses](#pauses). |
 | `census` | With `--census`: every known packet marker with seen and failed counts, known markers never seen, every header key (unknown ones listed), and every property hash seen three or more times with its value sizes and the stream it was seen in, known or not. `unknownStreams` lists streams whose role is unknown and `streamsNotSeen` known ones the replay lacks, so a stream or field added by a patch stands out. |
 | `startTime`, `endTime`, `isSpectator`, `maxPlayersPerTeam`, `matchResult` | Header keys added in Y11S3. The game writes `isspectator` only for spectators, so it reads `false` when absent. `matchResult` appears only on the round that ends the match, as the result of the team numbered 1 (`teams[].color`): 2 won, 1 lost, 7 the game ended the match with no winner. |
 
@@ -833,6 +836,54 @@ Not recorded, or not decoded:
 
 `decodeStatus` adds `feedbackMessages`: the count of `systemMessages`, with a warning naming the ids not known. Only a line that could not be read makes it `partial`.
 
+### Pauses
+
+The host of a custom match can pause it. How the game records that is not known: none of the rounds checked was paused (the 10 test rounds, a custom match recorded by a spectator, and 175 matchmaking rounds, one of them a file the game did not finish), and no property in the stream is named after a pause. So `pauses[]` is not read from the file. It is inferred from how a recording behaves, with thresholds set on unpaused rounds only, and every entry says `source: "inferred"`. A round without a finding has no `pauses` key; `decodeStatus.pauses` is `inferred` with the count, 0 included, on every Y11S3 full read, and `missing` when the round's clock was never written.
+
+What it rests on: the clock object writes `TimerInMilliseconds`, what is left of the timer that runs, every dozen frames, and `TimerState` (0, 1 for the last seconds, 3 once the round is decided), and the frame index says how many seconds into the recording each frame is. Between two writes of one timer the clock drops by as much as the recording moved on: over all 185 rounds the recording is at most 0.13 s ahead of the clock over one step and 0.53 s over a whole timer.
+
+| `kind` | What was seen | Threshold | Most in an unpaused round |
+|---|---|---|---|
+| `clockStall` | Between two clock writes of one timer the recording moved on more than the clock dropped, both values above zero, before the round was decided. | 1.0 s | 0.13 s |
+| `clockSlow` | The same, summed over the steps of one timer. | 1.5 s | 0.53 s |
+| `clockTail` | The clock was last written this long before the end of a recording whose round was not decided, with more than that left on it. | 1.0 s | none |
+| `dataHole` | No record of the movement stream, which has one at every update, before the round was decided. | 1.0 s | under 0.5 s |
+| `indexGap` | Two frames of the index this far apart. A gap inside another finding is that finding's `evidence.indexGap`. | 1.0 s | under 0.25 s |
+| `suspended` | The header's `endtime` less `starttime` is this much more than the index covers, after taking off what the clock jumped ahead. It has no `start`: where the recording stood still is not known. | 2.0 s | 0.96 s |
+
+| Key | What it holds |
+|---|---|
+| `start`, `end` | Seconds since the recording started: the two clock writes, or the two records around the hole. |
+| `duration` | How long the round stood still: the clock's lag, or the length of the hole. |
+| `startedAt`, `endedAt` | The same in UTC, when `timing.startedAt` is known. |
+| `phase`, `time`, `clockMs` | The phase and the round clock at `start`, and what was left of the timer in milliseconds. |
+| `evidence.clockLag` | Seconds the recording moved on more than the clock. |
+| `evidence.behaviour` | What the movement stream did meanwhile: `noRecords` (silent for half of `duration` or more), `frozenRecords` (records, and no player's body moved for that long) or `movingRecords`. |
+| `evidence.movementRecords` | Movement records between `start` and `end`. |
+| `evidence.headerMinusIndex`, `evidence.clockAhead` | On `suspended`: the two numbers it is the difference of. |
+
+- **What is not a pause.** A new timer: the clock rises when action starts, and at a plant `IsDefuserStarted` turns 1 between the two writes. A clock at zero: it stands at `0:00` while a plant finishes (6.0 s in the seventh test round), and the frame that decides the round writes 0 just before `TimerState` 3. Everyone standing still: in the same round nobody moves for 6.2 s while the clock runs on.
+- **Skipped game time** is the opposite sign: the clock jumps ahead of the recording (see [File format notes](#file-format-notes)). **A recording gap** is `timing.gaps` and `timing.holes`: frames or movement records missing for a moment, 0.5 s at most in the rounds checked, and only past a second do they count here. **A suspended recording** is seen from the header alone: `timing.headerMinusIndex` is 1 to 4 ms in the test rounds, up to 0.36 s in a real round without skips, and up to 4.8 s in one with them, all but 0.96 s of which the clock's jumps account for.
+- **Who paused is not recorded**, as far as is known, so an entry names nobody. Nor is there a reason or a tactical timeout to tell apart.
+- **An unknown `TimerState`.** Only 0, 1 and 3 are ever written. Any other value is listed in the warnings of `decodeStatus.pauses` with its time and count: it would be the first sign of a pause the game records itself.
+- **What is needed.** A custom match recorded with a deliberate pause of known length. It would show whether the clock stops, whether frames go on, and whether a property marks it; until then the thresholds are margins, not measurements of a pause.
+
+A match folder adds `breaks[]`, one per pair of consecutive rounds read (none across a missing round):
+
+| Key | What it holds | How |
+|---|---|---|
+| `afterRound` | The round the break follows, from 1. | Decoded |
+| `duration` | Seconds from that round's `endtime` to the next round's `starttime`. | Decoded |
+| `banPhase` | The bans in force differ between the two rounds: operators were banned in the break. Absent on a header-only read. | Decoded |
+| `sideSwitch` | The teams changed sides. | Decoded |
+| `overtime` | The round before or after is an overtime round. | Decoded |
+| `expected`, `excess` | The median of the match's breaks with no ban phase, no side switch and no overtime, and how much longer this one is. Absent when the match has fewer than three such breaks. | Inferred |
+| `pauseSuspected` | `excess` is over 20 s and the break has no ban phase and no side switch. Absent without `expected` or `banPhase`. | Inferred |
+
+- A break is the time between two recordings, not between two rounds: it holds the end-of-round replay, the operator picks, and whatever else the lobby waited for. It can say a break was long. It cannot say why, and a pause shorter than the spread of a match's breaks does not show.
+- The test match: 31.6, 28.2, 95.4, 31.7, 27.9, 180.9, 30.5, 73.1 and 59.0 s. Operators were banned after rounds 3, 6 (the side switch) and 9. The other six give 31.0 s as `expected`, and the 73.1 s after round 8 is `pauseSuspected`: nothing in the two rounds explains it, and nothing confirms a pause either.
+- Ranked bans before every round, so its breaks have no plain ones to compare with: `expected` is absent in all 148 breaks of the real folder. They are 57 to 88 s, each within 10 s or so of its match's median, 17 s once before a file the game did not finish, and 7 to 10 s shorter before overtime.
+
 ## Movement
 
 `--movement` adds a `movement` block (Y11S3+, full reads): where every player is, where they look and what their body is doing, at every update the game recorded. It is left out by default because it is large, about 3 MB of JSON a round. The library equivalent is `ReadOptions { movement: true, .. }` and `Round::movement`.
@@ -1385,7 +1436,7 @@ Decompressed, each snapshot is a u64 length and the snapshot. The main stream ho
 - **Skipped game time.** A recording can leave out game time without a gap in its frames: two or more players who were walking are, a tenth of a second later, metres further on than anyone can run. `timing.skips` lists each such moment with `at`, `until`, the `seconds` missing (the median of what the players' speed says) and how many `bodies` jumped; it is inferred from the bodies, and `decodeStatus.timing` is `partial` with it. 22 skips of 0.3 to 1.0 s in 12 of the 175 real rounds, none in the test rounds. Whatever is timed across one is that much shorter than it was: in the one round checked against other evidence a second is missing as action starts, a wall reinforcement that takes 4.08 s is up in 3.06 s, and two melee hits of one player are 0.76 s apart where the game allows no less than 1.02 s.
 - **Stray records.** Binary data between record runs can read as records. In one real round such a "record" covered a team object's first record and moved its properties to another object. Two rules reject them: an array record claiming an index of 65536 or more (real ones reach 64), and any record that does not name its object yet covers records that do (a `23` or `1b` and what follows) ending exactly where it ends.
 
-The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 2 ms of `endtime`. The header `datetime` is the recording PC's local time, not UTC.
+The index is wall-clock accurate: in Y11S3, `starttime` plus the index duration lands within 5 ms of `endtime` in the test rounds and within 0.4 s in a real round without skips. A round with skips ends up to 4.8 s later than its index says; `timing.headerMinusIndex` gives the difference. The header `datetime` is the recording PC's local time, not UTC.
 
 ## Benchmarks
 

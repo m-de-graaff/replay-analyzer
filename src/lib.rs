@@ -44,6 +44,7 @@ pub mod movement;
 pub mod objective;
 pub mod outcome;
 pub mod panels;
+pub mod pauses;
 pub mod records;
 pub mod report;
 pub mod round;

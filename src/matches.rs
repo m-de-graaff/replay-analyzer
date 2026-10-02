@@ -210,6 +210,12 @@ impl Match {
     pub fn loadout_changes(&self) -> Vec<LoadoutChange> {
         crate::loadout::changes(&self.rounds)
     }
+
+    /// Y11S3: the break between each two consecutive rounds, and whether
+    /// it is longer than the match's breaks are (see [`crate::pauses`]).
+    pub fn breaks(&self) -> Vec<crate::pauses::Break> {
+        crate::pauses::breaks(&self.rounds)
+    }
 }
 
 fn read_round(path: &Path, options: ReadOptions) -> Result<Round> {
@@ -467,6 +473,8 @@ impl Serialize for Match {
             loadout_changes: Vec<LoadoutChange>,
             #[serde(rename = "battlEye", skip_serializing_if = "Option::is_none")]
             battl_eye: Option<crate::messages::MatchBattlEye>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            breaks: Vec<crate::pauses::Break>,
             rounds: &'a [Round],
             stats: Vec<PlayerMatchStats>,
         }
@@ -476,6 +484,7 @@ impl Serialize for Match {
             analytics: self.analytics(),
             loadout_changes: self.loadout_changes(),
             battl_eye: self.battl_eye(),
+            breaks: self.breaks(),
             rounds: &self.rounds,
             stats: self.player_stats(),
         }

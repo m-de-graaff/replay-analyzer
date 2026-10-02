@@ -65,6 +65,9 @@ pub struct Round {
     pub container: Option<Container>,
     /// Recording rate and holes, from the frame index and the clock.
     pub timing: Option<Timing>,
+    /// Y11S3 full reads: the stretches the round may have been paused for,
+    /// inferred (see [`crate::pauses`]).
+    pub pauses: Option<crate::pauses::Report>,
     /// Trust level of each output field.
     pub decode: DecodeReport,
     /// Counts of every packet and field seen (only with `ReadOptions::census`).
@@ -502,6 +505,8 @@ impl Serialize for Round {
             decode_status: &'a DecodeReport,
             #[serde(skip_serializing_if = "Option::is_none")]
             timing: Option<&'a Timing>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            pauses: &'a [crate::pauses::Pause],
             #[serde(skip_serializing_if = "Option::is_none")]
             census: Option<&'a Census>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -570,6 +575,7 @@ impl Serialize for Round {
             replay: self.replay_info(),
             decode_status: &self.decode,
             timing: self.timing.as_ref(),
+            pauses: self.pauses.as_ref().map_or(&[], |p| &p.pauses),
             census: self.census.as_ref(),
             activity: self.activity.as_ref(),
             movement: self.movement.as_ref(),
@@ -1174,6 +1180,7 @@ impl<'a> Parser<'a> {
                 self.resolve_movement(stream);
             }
             self.resolve_objective(stream.as_ref());
+            self.resolve_pauses();
         }
         self.measure_records();
         if options.census {
@@ -2062,6 +2069,28 @@ impl<'a> Parser<'a> {
         };
         if !skipped && self.packet_counts[clock as usize].0 == 0 {
             f.at_most(Status::Partial).warn("no clock packets found");
+        }
+        // Y11S3: pauses are never read, only inferred; a round without
+        // one counts none. A `TimerState` no unpaused round has written
+        // would be the first sign of a pause the game records.
+        if let Some(p) = &round.pauses {
+            let f = r.field("pauses", Status::Inferred, p.pauses.len());
+            if p.clock_writes == 0 {
+                f.at_most(Status::Missing).warn(
+                    "the round clock was never written: no clock track to look for pauses in",
+                );
+            }
+            let mut seen: Vec<u32> = Vec::new();
+            for &(time, state) in &p.unknown_states {
+                if seen.contains(&state) {
+                    continue;
+                }
+                seen.push(state);
+                let times = p.unknown_states.iter().filter(|s| s.1 == state).count();
+                f.warn(format!(
+                    "TimerState {state} at {time:.3} s ({times} times): only 0, 1 and 3 are written in rounds without a pause, so this may be how the game marks one"
+                ));
+            }
         }
         if let Some(c) = round.container.as_ref().filter(|c| !c.complete) {
             let at = c.truncated_at.unwrap_or_default();
@@ -3702,6 +3731,42 @@ impl<'a> Parser<'a> {
             frame_times: &self.frame_times,
         });
         self.round.objective_state = Some(objective);
+    }
+
+    /// Y11S3: where the round may have been paused, from the clock track
+    /// of the activity, the frame index, the movement stream's records and
+    /// the header's times (see [`crate::pauses`]).
+    fn resolve_pauses(&mut self) {
+        let (Some(activity), Some(map)) = (&self.round.activity, &self.records) else {
+            return;
+        };
+        let times = &self.frame_times;
+        let stream = map
+            .stream_index(crate::loadout::MOVEMENT_STREAM)
+            .and_then(|i| map.streams.get(i));
+        let movement: Vec<f64> = (stream.iter())
+            .flat_map(|s| &s.frames)
+            .filter_map(|&f| times.get(f as usize).copied())
+            .collect();
+        let moves = self.world.as_ref().map(|w| w.moves(times));
+        let spans = self.round.timeline.spans();
+        let phases: Vec<(f64, Phase)> = (spans.iter())
+            .filter_map(|s| Some((s.recording_start?, s.phase)))
+            .collect();
+        let h = &self.round.header;
+        // The start as `Timing::calibrate` takes it.
+        let length = times.first().zip(times.last()).map_or(0.0, |(a, b)| b - a);
+        let length = chrono::Duration::milliseconds((length * 1000.0).round() as i64);
+        let wall = h.start_time.zip(h.end_time).map(|(start, end)| end - start);
+        self.round.pauses = Some(crate::pauses::detect(&crate::pauses::Input {
+            clock: &activity.clock,
+            frame_times: times,
+            movement: &movement,
+            moves: moves.as_deref().unwrap_or_default(),
+            phases: &phases,
+            header_seconds: wall.map(|w| w.num_milliseconds() as f64 / 1000.0),
+            started: h.start_time.or(h.end_time.map(|end| end - length)),
+        }));
     }
 
     /// Record counts per stream, the rate the game sent updates at, and holes

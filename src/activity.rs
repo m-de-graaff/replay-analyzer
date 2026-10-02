@@ -375,6 +375,9 @@ pub struct Activity {
     /// recording says.
     #[serde(skip)]
     pub planted_bomb: Option<u32>,
+    /// Every write of the round clock, for [`crate::pauses`].
+    #[serde(skip)]
+    pub clock: crate::pauses::ClockTrack,
 }
 
 /// What an object is to a player.
@@ -424,6 +427,13 @@ struct Reader<'a> {
     /// The timer written in this frame, and whether the round is decided.
     timer: Option<u32>,
     decided: bool,
+    /// The block being read is the opening snapshot, not a frame's record.
+    snapshot: bool,
+    /// The latest `TimerState`, those written in this frame, and whether
+    /// this frame wrote `IsDefuserStarted` 1.
+    timer_state: Option<u32>,
+    states_written: Vec<u32>,
+    plant_written: bool,
 
     /// The latest value of everything else, to tell changes from resends.
     equipped: HashMap<usize, u32>,
@@ -593,6 +603,7 @@ impl<'a> Reader<'a> {
                     self.turned = Some(started);
                 }
                 self.defuser_written = true;
+                self.plant_written |= started;
             }
             PLANTED_BOMB if wide => {
                 if self.started == Some(true) && number != 0 {
@@ -600,7 +611,11 @@ impl<'a> Reader<'a> {
                 }
             }
             TIMER if wide => self.timer = Some(number),
-            TIMER_STATE if wide => self.decided = number == DECIDED,
+            TIMER_STATE if wide => {
+                self.decided = number == DECIDED;
+                self.timer_state = Some(number);
+                self.states_written.push(number);
+            }
             REINFORCEMENTS_LEFT if wide => {
                 if self.owner(obj).is_some_and(|l| l.2 == REINFORCEMENT_POOL)
                     && self.pools.insert(obj, number) != Some(number)
@@ -699,6 +714,24 @@ impl<'a> Reader<'a> {
     fn end_frame(&mut self, time: f64) {
         let turned = self.turned.take();
         self.records += 1;
+        // The clock track: what the frames wrote. The snapshot only gives
+        // the state the round starts in.
+        let plant = std::mem::take(&mut self.plant_written);
+        let states: Vec<u32> = std::mem::take(&mut self.states_written);
+        if !self.snapshot {
+            let clock = &mut self.out.clock;
+            clock.states.extend(states.into_iter().map(|s| (time, s)));
+            if plant {
+                clock.plants.push(time);
+            }
+            if let Some(ms) = self.timer {
+                clock.writes.push(crate::pauses::ClockWrite {
+                    time,
+                    ms,
+                    state: self.timer_state,
+                });
+            }
+        }
         // The timer is the defuser's from the frame of the plant, whatever
         // the order the two are written in, until the round is decided.
         if let (Some(left), Some(true), false) = (self.timer.take(), self.started, self.decided) {
@@ -826,6 +859,7 @@ pub(crate) fn decode(
             .copied()
             .unwrap_or(0.0);
         if let Some(block) = data.get(start..end) {
+            reader.snapshot = frame.is_none();
             reader.read(block, (seconds * 1000.0).round() / 1000.0);
         }
     }
